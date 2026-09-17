@@ -106,6 +106,7 @@ extern "C" int cudaProfilerStop();
 #include "op/scan/gpu_ingestible.hpp"
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "pin_table.hpp"
+#include "scan/bound_schema.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -286,7 +287,9 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
   auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
   return_types     = std::move(bind_result.return_types);
   names            = std::move(bind_result.names);
-  return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows);
+  auto schema      = std::make_shared<const sirius::scan::bound_schema>(
+    std::vector<std::string>(names.begin(), names.end()), return_types);
+  return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows, std::move(schema));
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the
@@ -304,6 +307,13 @@ void SiriusReadParquetFunction(ClientContext&, TableFunctionInput&, DataChunk&)
 }
 
 }  // namespace
+
+bool SiriusReadParquetBindData::Equals(FunctionData const& other_p) const
+{
+  auto const* other = dynamic_cast<const SiriusReadParquetBindData*>(&other_p);
+  return other && uri == other->uri && total_num_rows == other->total_num_rows &&
+         (schema == other->schema || (schema && other->schema && schema->equals(*other->schema)));
+}
 
 unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
                                                         FunctionData const* bind_data_p)

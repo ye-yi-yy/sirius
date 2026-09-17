@@ -19,10 +19,10 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "helper/type_conversions.hpp"
 #include "sirius/exception.hpp"
 
 #include <string>
+#include <utility>
 
 namespace sirius::exec {
 
@@ -49,11 +49,11 @@ duckdb::unique_ptr<duckdb::FunctionData> stream_source_bind(
   auto const stream_id = static_cast<stream_id_t>(signed_id);
 
   // Undeclared id = bind error (not a silent empty scan).
-  auto const& binding = catalog_for(context)->get(stream_id);
-
-  names        = duckdb::vector<std::string>(binding.names.begin(), binding.names.end());
-  return_types = sirius::to_duckdb_vec(binding.types);
-  return duckdb::make_uniq<stream_source_bind_data>(stream_id);
+  auto declaration         = catalog_for(context)->get_declaration(stream_id);
+  const auto& column_names = declaration->schema->names();
+  names                    = duckdb::vector<std::string>(column_names.begin(), column_names.end());
+  return_types             = declaration->schema->types();
+  return duckdb::make_uniq<stream_source_bind_data>(std::move(declaration));
 }
 
 /// Never runs: plan generator replaces this scan with STREAMING_SOURCE.

@@ -112,14 +112,32 @@ streaming_fragment::streaming_fragment(duckdb::ClientContext& context, fragment_
 
 streaming_fragment::~streaming_fragment()
 {
-  // Drop only the ids this fragment declared. clear() would wipe the whole per-connection
-  // catalog, including a peer fragment's declarations; swallow in dtor.
-  try {
-    auto catalog = catalog_for(_context);
-    for (const auto& [id, _] : _spec.inputs) {
-      catalog->erase(id);
+  // Session borrows operators; operators retain declarations. Release in that order.
+  release_plan();
+  if (_catalog) {
+    for (const auto& [id, generation] : _declared_inputs) {
+      try {
+        _catalog->erase(id, generation);
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+      }
     }
-  } catch (...) {  // NOLINT(bugprone-empty-catch)
+  }
+}
+
+void streaming_fragment::release_plan() noexcept
+{
+  _session = stream_session{};
+  _engine.reset();
+  _iface.reset();
+  _sink_types.clear();
+}
+
+void streaming_fragment::erase_declarations()
+{
+  while (!_declared_inputs.empty()) {
+    const auto it = _declared_inputs.begin();
+    _catalog->erase(it->first, it->second);
+    _declared_inputs.erase(it);
   }
 }
 
@@ -127,72 +145,82 @@ void streaming_fragment::build(sirius::query_id_t query_id)
 {
   if (_built) { throw sirius::invalid_input_exception("streaming_fragment: already built"); }
 
-  auto catalog = catalog_for(_context);
-  // Same reason as the destructor: erase our own ids so a rebuild is idempotent without
-  // discarding declarations that belong to another fragment on this connection.
-  for (const auto& [id, _] : _spec.inputs) {
-    catalog->erase(id);
-  }
+  try {
+    release_plan();
+    erase_declarations();
+    _catalog = catalog_for(_context);
 
-  // Declare before planning: bind resolves schema; create_plan reads repo + senders.
-  for (const auto& [id, input] : _spec.inputs) {
-    catalog->declare(
-      id,
-      stream_input_binding{
-        input.names, input.types, _input_repos.at(id), input.expected_senders, nullptr});
-  }
-
-  auto logical_plan = _spec.plan_source(_context);
-  if (!logical_plan) {
-    throw sirius::invalid_input_exception("streaming_fragment: plan source produced no plan");
-  }
-
-  sirius::planner::sirius_physical_plan_generator generator(_context);
-  auto subtree = generator.create_plan(std::move(logical_plan));
-
-  // STREAMING_SINK is a normal unary: subtree in children[] (unlike RESULT_COLLECTOR).
-  auto types       = subtree->types;
-  auto cardinality = subtree->estimated_cardinality;
-  _sink_types      = types;  // snapshot before types is moved into the sink constructor
-
-  std::vector<std::shared_ptr<cucascade::shared_data_repository>> sink_repos;
-  sink_repos.reserve(_spec.outputs.size());
-  for (auto id : _spec.outputs) {
-    sink_repos.push_back(_output_repos.at(id));
-  }
-
-  duckdb::unique_ptr<op::sirius_physical_streaming_sink> sink;
-  if (_spec.partitioning.has_value()) {
-    normalize_key_cast_types(*_spec.partitioning, types);
-    sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
-      std::move(types), cardinality, std::move(sink_repos), *_spec.partitioning);
-  } else {
-    sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
-      std::move(types), cardinality, sink_repos.front());
-  }
-  sink->children.push_back(std::move(subtree));
-
-  // Engine owns the plan; fragment owns the engine so the sink stays pullable after run().
-  _iface = std::make_unique<sirius::sirius_interface>(
-    _context, std::optional<std::string>(kFragmentQueryLabel));
-  _engine = std::make_unique<sirius::sirius_engine>(_context, *_iface, query_id);
-  _engine->initialize(std::move(sink));
-
-  auto& sink_ref = _engine->sirius_physical_plan->Cast<op::sirius_physical_streaming_sink>();
-
-  _session.add_sink(_spec.outputs, sink_ref);
-  for (const auto& [id, _] : _spec.inputs) {
-    auto* built = catalog->get(id).built;
-    if (built == nullptr) {
-      // Declared but unread = hang; fail loudly.
-      throw sirius::invalid_input_exception("streaming_fragment: input stream " +
-                                            std::to_string(id) +
-                                            " was declared but the plan does not read it");
+    // Declare before planning; remember only generations actually published by this fragment.
+    for (const auto& [id, input] : _spec.inputs) {
+      auto& generation = _declared_inputs[id];
+      generation       = _catalog->declare(id,
+                                     stream_input_binding{input.names,
+                                                          input.types,
+                                                          _input_repos.at(id),
+                                                          input.expected_senders,
+                                                          nullptr,
+                                                          input.schema});
     }
-    _session.add_source(id, *built);
-  }
 
-  _built = true;
+    auto logical_plan = _spec.plan_source(_context);
+    if (!logical_plan) {
+      throw sirius::invalid_input_exception("streaming_fragment: plan source produced no plan");
+    }
+
+    sirius::planner::sirius_physical_plan_generator generator(_context);
+    auto subtree = generator.create_plan(std::move(logical_plan));
+
+    // STREAMING_SINK is a normal unary: subtree in children[] (unlike RESULT_COLLECTOR).
+    auto types       = subtree->types;
+    auto cardinality = subtree->estimated_cardinality;
+    _sink_types      = types;  // snapshot before types is moved into the sink constructor
+
+    std::vector<std::shared_ptr<cucascade::shared_data_repository>> sink_repos;
+    sink_repos.reserve(_spec.outputs.size());
+    for (auto id : _spec.outputs) {
+      sink_repos.push_back(_output_repos.at(id));
+    }
+
+    duckdb::unique_ptr<op::sirius_physical_streaming_sink> sink;
+    if (_spec.partitioning.has_value()) {
+      normalize_key_cast_types(*_spec.partitioning, types);
+      sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
+        std::move(types), cardinality, std::move(sink_repos), *_spec.partitioning);
+    } else {
+      sink = duckdb::make_uniq<op::sirius_physical_streaming_sink>(
+        std::move(types), cardinality, sink_repos.front());
+    }
+    sink->children.push_back(std::move(subtree));
+
+    // Engine owns the plan; fragment owns the engine so the sink stays pullable after run().
+    _iface = std::make_unique<sirius::sirius_interface>(
+      _context, std::optional<std::string>(kFragmentQueryLabel));
+    _engine = std::make_unique<sirius::sirius_engine>(_context, *_iface, query_id);
+    _engine->initialize(std::move(sink));
+
+    auto& sink_ref = _engine->sirius_physical_plan->Cast<op::sirius_physical_streaming_sink>();
+
+    _session.add_sink(_spec.outputs, sink_ref);
+    for (const auto& [id, _] : _spec.inputs) {
+      auto* built = _catalog->get_built(id, _declared_inputs.at(id));
+      if (built == nullptr) {
+        // Declared but unread = hang; fail loudly.
+        throw sirius::invalid_input_exception("streaming_fragment: input stream " +
+                                              std::to_string(id) +
+                                              " was declared but the plan does not read it");
+      }
+      _session.add_source(id, *built);
+    }
+
+    _built = true;
+  } catch (...) {
+    release_plan();
+    try {
+      erase_declarations();
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+    }
+    throw;
+  }
 }
 
 void streaming_fragment::run()

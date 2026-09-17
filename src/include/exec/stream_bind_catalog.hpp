@@ -19,8 +19,9 @@
 #include "duckdb/main/client_context_state.hpp"
 #include "exec/batch_stream.hpp"
 #include "exec/stream_session.hpp"
-#include "op/sirius_physical_streaming_source.hpp"
+#include "scan/bound_schema.hpp"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,58 +31,106 @@
 
 namespace sirius::exec {
 
-/// Schema + provenance for one input stream. Caller-supplied; never inferred.
+/// Caller-supplied declaration, or a detached catalog snapshot returned by get().
 struct stream_input_binding {
   std::vector<std::string> names;
   duckdb::vector<sirius::logical_type> types;
   std::shared_ptr<cucascade::shared_data_repository> repository;
   std::set<sender_id_t> expected_senders;
-
-  /// Back-pointer into the engine-owned plan; filled during planning for session registration.
+  /// Observational back-pointer only. declare() never accepts a pre-built operator.
   op::sirius_physical_streaming_source* built = nullptr;
+  /// Full DuckDB schema when available at the caller's binding boundary.
+  scan::bound_schema_ptr schema = nullptr;
 };
 
-/// Per-connection declared input streams. ClientContextState so DuckDB bind can resolve schema
-/// before physical planning. Multiple fragments may share one connection at once (e.g. chained
-/// via relay_from), each owning a disjoint set of ids — see clear() vs erase() below.
+/// One immutable declaration. Logical bindings and runtime attachments retain this exact owner.
+class stream_declaration {
+ public:
+  const std::uint64_t catalog_instance;
+  const stream_id_t stream_id;
+  const std::uint64_t generation;
+  const scan::bound_schema_ptr schema;
+  const duckdb::vector<sirius::logical_type> types;
+  const std::shared_ptr<cucascade::shared_data_repository> repository;
+  const std::set<sender_id_t> expected_senders;
+
+ private:
+  friend class stream_bind_catalog;
+  stream_declaration(std::uint64_t catalog_instance,
+                     stream_id_t id,
+                     std::uint64_t generation,
+                     stream_input_binding binding);
+};
+
+using stream_declaration_ptr = std::shared_ptr<const stream_declaration>;
+
+/// Per-connection catalog. The mutable operator attachment is separate from immutable metadata.
+/// Replacing/removing a declaration with live binding or runtime handles is an error.
 class stream_bind_catalog : public duckdb::ClientContextState {
  public:
   static constexpr const char* kStateKey = "sirius_stream_catalog";
 
-  /// Overwrites any previous declaration for the same id.
-  /// @throws sirius::invalid_input_exception on null repository, names/types size mismatch, or
-  ///         empty names.
-  void declare(stream_id_t id, stream_input_binding binding);
+  stream_bind_catalog();
 
-  /// Drop every declaration on this connection. Only safe when the caller owns the whole
-  /// catalog; a fragment sharing a connection must use erase() so it cannot wipe a peer's ids.
+  /// Validate and publish a new generation; never reuse a generation, including after erase().
+  /// @throws sirius::invalid_input_exception on malformed input or stream_binding_in_use.
+  std::uint64_t declare(stream_id_t id, stream_input_binding binding);
+
+  /// All-or-nothing: reject if any declaration has live handles.
   void clear();
-
-  /// Drop one declaration. No-op when `id` was never declared, so teardown paths can call it
-  /// unconditionally.
   void erase(stream_id_t id);
+  /// Erase only a generation owned by this caller. A different/current generation is untouched.
+  void erase(stream_id_t id, std::uint64_t generation);
 
   [[nodiscard]] bool contains(stream_id_t id) const;
+  /// Detached snapshot: no reference into a map unlocked before its caller uses it.
+  [[nodiscard]] stream_input_binding get(stream_id_t id) const;
+  [[nodiscard]] stream_declaration_ptr get_declaration(stream_id_t id) const;
 
-  /// @throws sirius::invalid_input_exception when `id` was never declared.
-  [[nodiscard]] const stream_input_binding& get(stream_id_t id) const;
-
-  /// @throws sirius::invalid_input_exception when `id` was never declared, or when it already
-  ///         has a built operator (the same declared stream read by more than one plan leaf —
-  ///         fan-out reads of a single declared stream are not supported).
+  /// Register one plan leaf. Generation-aware callers must use the declaration overload.
   void set_built(stream_id_t id, op::sirius_physical_streaming_source* built);
+  void set_built(const stream_declaration& declaration,
+                 op::sirius_physical_streaming_source* built);
+  void clear_built(const stream_declaration& declaration,
+                   op::sirius_physical_streaming_source* built) noexcept;
+  [[nodiscard]] op::sirius_physical_streaming_source* get_built(stream_id_t id,
+                                                                std::uint64_t generation) const;
 
   [[nodiscard]] std::vector<stream_id_t> declared_streams() const;
 
  private:
+  struct entry {
+    stream_declaration_ptr declaration;
+    op::sirius_physical_streaming_source* built = nullptr;
+  };
+
+  static void require_unused(const entry& value);
+  static void attach(entry& value, op::sirius_physical_streaming_source* built);
+
+  const std::uint64_t _instance;
+  std::uint64_t _last_generation{0};
   mutable std::mutex _mutex;
-  std::map<stream_id_t, stream_input_binding> _entries;
+  std::map<stream_id_t, entry> _entries;
 };
 
-/// The catalog registered on `context`, or an error explaining that the fragment never declared
-/// its inputs. Shared by the three places that need it — the bind function, the fragment, and the
-/// plan generator — so they cannot drift on the message or the exception type.
-/// @throws sirius::invalid_input_exception when no catalog is registered on the connection.
+/// Plan-owned attachment. Its destructor only clears its own generation/operator pair.
+class stream_source_attachment {
+ public:
+  stream_source_attachment(duckdb::shared_ptr<stream_bind_catalog> catalog,
+                           stream_declaration_ptr declaration,
+                           op::sirius_physical_streaming_source* source);
+  ~stream_source_attachment();
+
+  stream_source_attachment(const stream_source_attachment&)            = delete;
+  stream_source_attachment& operator=(const stream_source_attachment&) = delete;
+
+ private:
+  duckdb::shared_ptr<stream_bind_catalog> _catalog;
+  stream_declaration_ptr _declaration;
+  op::sirius_physical_streaming_source* _source;
+};
+
+/// The catalog registered on the binding context, or an explanatory error.
 duckdb::shared_ptr<stream_bind_catalog> catalog_for(duckdb::ClientContext& context);
 
 }  // namespace sirius::exec

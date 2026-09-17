@@ -65,43 +65,29 @@ runs** — the physical plan generator replaces every `sirius_stream_source` sca
 Substrait or SQL plan sees an ordinary-looking view name (`stream_view_name(id)` gives callers that
 exact string).
 
-Bind time and plan time are far apart — DuckDB binds a table function long before physical planning
-runs — so both sides need a shared place to look up a declared stream's schema. That place is
-`stream_bind_catalog`, a `duckdb::ClientContextState` registered per-connection:
+Bind time and plan time share an immutable declaration owned by the per-connection
+`stream_bind_catalog`. The declaration records catalog instance, stream ID,
+generation, full schema, repository and expected senders. Bind data and its copies
+retain that declaration; planning never resolves a newer declaration by ID.
 
 ```cpp
-class stream_bind_catalog : public duckdb::ClientContextState {
- public:
-  static constexpr const char* kStateKey = "sirius_stream_catalog";
-
-  void declare(stream_id_t id, stream_input_binding binding);  // overwrites same-id entry
-  void clear();                                                 // drop every declaration
-  void erase(stream_id_t id);                                   // drop one; no-op if absent
-
-  const stream_input_binding& get(stream_id_t id) const;        // @throws if undeclared
-  void set_built(stream_id_t id, op::sirius_physical_streaming_source* built);
-};
-
-// Shared by every call site that needs "the catalog on this connection, or a clear error why not".
-duckdb::shared_ptr<stream_bind_catalog> catalog_for(duckdb::ClientContext& context);
+auto generation = catalog->declare(id, binding);
+auto declaration = catalog->get_declaration(id);  // retained by FunctionData
+// Physical lowering consumes declaration and installs a plan-owned attachment.
+auto* built = catalog->get_built(id, generation);
+session.add_source(id, *built);
+// After releasing session and plan:
+declaration.reset();
+catalog->erase(id, generation);  // leaves a newer generation untouched
 ```
 
-The round trip:
+`get(id)` returns a detached observational snapshot. It does not borrow catalog
+storage or replace a retained binding handle. `set_built()` records the mutable
+operator attachment separately from immutable metadata. Its plan-owned attachment
+clears only the matching declaration/operator pair when destroyed.
 
-```
-declare_input_column(id, name, type) × N   ── caller-side, before build() ──►  stream_bind_catalog::declare(id, ...)
-                                                                                          │
-stream_source_bind()  (DuckDB bind, resolves the CREATE VIEW's schema)  ◄── catalog_for(context)->get(id)
-                                                                                          │
-create_streaming_source_plan()  (physical planning, builds STREAMING_SOURCE)  ◄── catalog_for(context)->get(id)
-                                                                                          │
-                                                                                catalog->set_built(id, source.get())
-                                                                                          │
-streaming_fragment::build() / Fragment::build()  ── reads catalog->get(id).built ──►  session().add_source(id, *built)
-```
-
-`set_built()` is how the physical operator (created deep inside `create_plan()`, which does not
-otherwise return anything the fragment layer can see) gets back to the session that wires it up.
+See [Shared Scan Binding Ownership](shared-scan-framework.md) for schema identity,
+full nested metadata and the remaining R1 scope.
 
 ### Contracts
 
@@ -109,9 +95,13 @@ otherwise return anything the fragment layer can see) gets back to the session t
   several live `Fragment` objects — that is the whole point of `relay_from()` chaining several
   fragments together. `clear()` drops *every* declaration on the connection and is only safe for a
   caller that owns the whole catalog outright; a fragment that shares a connection with a peer must
-  use `erase()`, which touches only the ids it declared itself. Both `streaming_fragment` (its
-  destructor and the start of `build()`, for idempotent rebuilds) and `sirius::ffi::Fragment::Impl`
-  follow this discipline — neither ever calls `clear()`.
+  use `erase(id, generation)`, which touches only the generation it declared itself. Both
+  `streaming_fragment` and `sirius::ffi::Fragment::Impl` release their sessions and plans before
+  erasing their own generations on teardown or failed build. Neither calls `clear()`.
+- **Live declarations cannot be replaced or removed.** Retained bind data and runtime attachments
+  block replacement, erase and clear with `stream_binding_in_use`. Clear validates every entry
+  before removing any. Binding copies retain the original generation, including its schema.
+  Generation numbers never wrap or get reused.
 - **A declared stream may be read by at most one plan leaf.** `set_built()` rejects a second bind
   for an id that already has one, instead of silently overwriting the pointer. Without this guard,
   a plan that reads the same declared stream twice (a self-join, or two independent scans of one
@@ -145,8 +135,8 @@ is required (a fragment with none is not this class's job — see the FFI's *res
 and more than one output requires a `partitioning` mode (a bare `N`-output gather sink would leave
 `N-1` streams permanently empty with no way to tell a caller why).
 
-**`build(query_id)`** erases (not clears — see above) this fragment's own catalog ids, redeclares
-them so a rebuild after a caught, corrected failure is idempotent, runs `plan_source` to get a
+**`build(query_id)`** releases a failed attempt's sessions/plans and erases only its owned
+generations before redeclaring, so a rebuild after a caught, corrected failure is idempotent, runs `plan_source` to get a
 bound `LogicalOperator`, lowers it to a physical plan, and roots that plan in one
 `sirius_physical_streaming_sink`:
 
@@ -157,7 +147,7 @@ bound `LogicalOperator`, lowers it to a physical plan, and roots that plan in on
   `SMALLINT`/`INTEGER` normalize to `INT64`; `BIGINT`/`BOOLEAN`/`VARCHAR` need no cast (`EMPTY`);
   `DECIMAL` normalizes to `FLOAT64`; anything else throws. A key column outside the sink's own
   column range throws before any cast is even attempted.
-- Every declared input is checked against the catalog's `built` pointer after planning: a stream
+- Every declared input is checked against the catalog's generation-checked `built` pointer after planning: a stream
   declared but never read by the plan throws immediately (a silent hang otherwise — nothing would
   ever close it).
 - The engine owns the plan and the fragment owns the engine, so the sink (and its output

@@ -21,25 +21,30 @@
 #include "duckdb/main/database.hpp"
 #include "exec/stream_bind_catalog.hpp"
 
+#include <utility>
+
 namespace sirius::exec {
 
 inline constexpr const char* kStreamSourceFunctionName = "sirius_stream_source";
 
 /// Bind data for sirius_stream_source(stream_id). Schema comes from stream_bind_catalog.
 struct stream_source_bind_data : public duckdb::FunctionData {
-  explicit stream_source_bind_data(stream_id_t stream_id) : stream_id(stream_id) {}
+  explicit stream_source_bind_data(stream_declaration_ptr declaration)
+    : declaration(std::move(declaration))
+  {
+  }
 
-  stream_id_t stream_id;
+  const stream_declaration_ptr declaration;
 
   duckdb::unique_ptr<duckdb::FunctionData> Copy() const override
   {
-    return duckdb::make_uniq<stream_source_bind_data>(stream_id);
+    return duckdb::make_uniq<stream_source_bind_data>(declaration);
   }
 
   bool Equals(duckdb::FunctionData const& other_p) const override
   {
-    auto const& other = other_p.Cast<stream_source_bind_data>();
-    return stream_id == other.stream_id;
+    auto const* other = dynamic_cast<const stream_source_bind_data*>(&other_p);
+    return other && declaration && declaration == other->declaration;
   }
 };
 

@@ -583,12 +583,12 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet& op)
 {
   auto const* bind = dynamic_cast<sirius::exec::stream_source_bind_data const*>(op.bind_data.get());
-  if (bind == nullptr) {
+  if (bind == nullptr || !bind->declaration) {
     throw duckdb::InternalException("sirius_stream_source is missing its stream bind data");
   }
 
   auto catalog        = sirius::exec::catalog_for(context);
-  auto const& binding = catalog->get(bind->stream_id);
+  auto const& binding = *bind->declaration;
 
   // Projection pushdown is off; a narrowed column list here would disagree with the binder.
   auto column_ids = op.GetColumnIds();
@@ -603,8 +603,8 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
   auto source = duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(
     binding.types, op.EstimateCardinality(context), binding.repository, binding.expected_senders);
 
-  // Plan owns op; catalog.built back-pointer for session registration.
-  catalog->set_built(bind->stream_id, source.get());
+  // Lower the retained binding; never resolve a possibly newer declaration by stream ID.
+  source->attach_binding(std::move(catalog), bind->declaration);
   return source;
 }
 

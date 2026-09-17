@@ -231,6 +231,7 @@ struct Fragment::Impl {
     // If the caller dropped a Fragment between build() and run(), close the lifecycle so the
     // engine's mutex doesn't wedge every subsequent statement on this connection.
     end_lifecycle();
+    release_build();
   }
 
   Context::Impl& ctx;
@@ -250,6 +251,7 @@ struct Fragment::Impl {
 
   // Resolved at build() time; kept for relay_from() schema validation.
   std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec> resolved_inputs;
+  std::map<sirius::exec::stream_id_t, std::uint64_t> declared_generations;
 
   // Intermediate fragment (has output streams).
   std::unique_ptr<sirius::exec::streaming_fragment> fragment;
@@ -290,11 +292,13 @@ struct Fragment::Impl {
     for (const auto& [id, declared] : inputs) {
       sirius::exec::stream_input_spec spec;
       spec.names = declared.names;
-      spec.types.reserve(declared.type_names.size());
+      duckdb::vector<duckdb::LogicalType> full_types;
+      full_types.reserve(declared.type_names.size());
       for (const auto& type_name : declared.type_names) {
-        spec.types.push_back(
-          sirius::from_duckdb(duckdb::TransformStringToLogicalType(type_name, *ctx.conn->context)));
+        full_types.push_back(duckdb::TransformStringToLogicalType(type_name, *ctx.conn->context));
       }
+      spec.schema = std::make_shared<const sirius::scan::bound_schema>(spec.names, full_types);
+      spec.types  = sirius::from_duckdb_vec(full_types);
       spec.expected_senders = declared.expected_senders;
       if (spec.expected_senders.empty()) { spec.expected_senders.insert(0); }
       resolved.emplace(id, std::move(spec));
@@ -308,17 +312,17 @@ struct Fragment::Impl {
   void declare_streams(
     const std::map<sirius::exec::stream_id_t, sirius::exec::stream_input_spec>& resolved)
   {
-    // declare() overwrites any prior entry for the same id, so there is nothing of this
-    // fragment's own to pre-clear. Must NOT call catalog.clear() here: this catalog is shared
-    // by every Fragment on the same Context (e.g. fragments chained via relay_from), and
-    // clear() would wipe a peer fragment's still-live declarations.
+    // Declarations are shared by the connection. Keep generation tokens so failed setup and
+    // teardown cannot remove a declaration subsequently published by another fragment.
     auto& catalog = *ctx.stream_catalog;
     for (const auto& [id, spec] : resolved) {
       auto repository = std::make_shared<cucascade::shared_data_repository>();
       if (is_result()) { result_input_repos[id] = repository; }
-      catalog.declare(id,
-                      sirius::exec::stream_input_binding{
-                        spec.names, spec.types, repository, spec.expected_senders, nullptr});
+      auto& generation = declared_generations[id];
+      generation       = catalog.declare(
+        id,
+        sirius::exec::stream_input_binding{
+          spec.names, spec.types, repository, spec.expected_senders, nullptr, spec.schema});
     }
   }
 
@@ -334,6 +338,22 @@ struct Fragment::Impl {
       auto res = ctx.conn->Query(sql);
       if (res->HasError()) { res->ThrowError(); }
     }
+  }
+
+  // Called after the query window has drained, on failed build and destruction.
+  void release_build() noexcept
+  {
+    result_session = sirius::exec::stream_session{};
+    result_plan.reset();
+    fragment.reset();
+    result_input_repos.clear();
+    for (const auto& [id, generation] : declared_generations) {
+      try {
+        ctx.stream_catalog->erase(id, generation);
+      } catch (...) {  // NOLINT(bugprone-empty-catch)
+      }
+    }
+    declared_generations.clear();
   }
 
   // Idempotent; called from run() and ~Impl().
@@ -427,15 +447,15 @@ void Fragment::build(const std::string& substrait_plan)
     impl_->transaction_open = false;
   } catch (...) {
     impl_->end_lifecycle();
+    impl_->release_build();
     throw;
   }
 
   // Open lifecycle (StandaloneQueryScope acquires the slot and begins the window).
-  auto& client     = *impl_->ctx.conn->context;
-  impl_->lifecycle = std::make_unique<duckdb::SiriusContext::StandaloneQueryScope>(
-    *impl_->ctx.context, client, kQueryLabel);
-
+  auto& client = *impl_->ctx.conn->context;
   try {
+    impl_->lifecycle = std::make_unique<duckdb::SiriusContext::StandaloneQueryScope>(
+      *impl_->ctx.context, client, kQueryLabel);
     // A routing mode needs at least two destinations to mean anything: with 0 or 1 declared
     // outputs every row goes to the same place either way, so accepting it here would hide a
     // fan-out that never happened. Checked before the is_result()/else split below so it also
@@ -458,7 +478,7 @@ void Fragment::build(const std::string& substrait_plan)
         std::move(lowered.prepared), std::move(physical_plan));
 
       for (const auto& [id, _] : impl_->inputs) {
-        auto* built = impl_->ctx.stream_catalog->get(id).built;
+        auto* built = impl_->ctx.stream_catalog->get_built(id, impl_->declared_generations.at(id));
         if (built == nullptr) {
           throw sirius::invalid_input_exception("Fragment: input stream " + std::to_string(id) +
                                                 " was declared but the plan does not read it");
@@ -490,6 +510,7 @@ void Fragment::build(const std::string& substrait_plan)
     impl_->built = true;
   } catch (...) {
     impl_->end_lifecycle();
+    impl_->release_build();
     throw;
   }
 }

@@ -296,6 +296,7 @@ set(EXTENSION_SOURCES
     src/exec/admission_control.cpp
     src/exec/batch_stream.cpp
     src/exec/stream_session.cpp
+    src/scan/bound_schema.cpp
     src/exec/stream_bind_catalog.cpp
     src/exec/stream_plan_bindings.cpp
     src/exec/streaming_fragment.cpp

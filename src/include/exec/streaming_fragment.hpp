@@ -43,6 +43,8 @@ struct stream_input_spec {
   duckdb::vector<sirius::logical_type> types;
   /// Sender-set EOS: stream ends only once all have closed.
   std::set<sender_id_t> expected_senders;
+  /// Preserve full bind metadata when supplied by a DuckDB-facing caller.
+  scan::bound_schema_ptr schema = nullptr;
 };
 
 /// Bound, optimized DuckDB logical plan (Substrait bytes, SQL, …).
@@ -105,8 +107,13 @@ class streaming_fragment {
     stream_id_t id) const;
 
  private:
+  void release_plan() noexcept;
+  void erase_declarations();
+
   duckdb::ClientContext& _context;
   fragment_spec _spec;
+  duckdb::shared_ptr<stream_bind_catalog> _catalog;
+  std::map<stream_id_t, std::uint64_t> _declared_inputs;
 
   // Declaration order IS the lifetime contract (destroyed in reverse): repositories outlive
   // the engine, the engine owns the plan, and the session (borrowing operators) is torn down first.

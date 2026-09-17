@@ -37,6 +37,7 @@ SELECT l_returnflag, SUM(l_quantity) FROM lineitem GROUP BY l_returnflag;
 | [Scan](scan.md) | Scan subsystem: unified GPU scan operator, `gpu_ingestible` (parquet + DuckDB-native + iceberg), scan manager, pinned tables, DuckDB-native decode, iceberg deletes and deletion vectors, row-group pruning, Sirius IO layer (uring/REST/kvikio + prefetching cache) |
 | [Memory Management](memory-management.md) | cuCascade tiers, reservations, downgrade executor |
 | [Data Management](data-management.md) | Data batches, repositories, ports, barrier semantics |
+| [Shared Scan Binding Ownership](shared-scan-framework.md) | Initial #1796 package: full schema snapshots, immutable stream declarations and generation-safe teardown; remaining R1 gates |
 | [Streaming Sessions](streaming-sessions.md) | Fragment boundaries for distributed queries: `exec::batch_stream`, streaming source/sink, the id-addressed `stream_session` |
 | [Streaming Fragments](streaming-fragments.md) | Building and running one fragment: `stream_bind_catalog`, `exec::streaming_fragment`, the cross-language `sirius::ffi::Fragment`/`Context` lifecycle |
 | [Data Size Estimation](data-size-estimation.md) | Runtime projection of the total bytes that will reach an operator's input port |

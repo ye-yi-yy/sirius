@@ -26,6 +26,12 @@
 #include <optional>
 #include <set>
 
+namespace sirius::exec {
+class stream_bind_catalog;
+class stream_declaration;
+class stream_source_attachment;
+}  // namespace sirius::exec
+
 namespace sirius::op {
 
 /// Plan leaf over a batch_stream. Repository IS the queue; sender-set EOS; task-protocol glue.
@@ -41,6 +47,12 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
     std::size_t estimated_cardinality,
     std::shared_ptr<cucascade::shared_data_repository> input_repository,
     std::set<exec::sender_id_t> expected_senders);
+
+  ~sirius_physical_streaming_source() override;
+
+  /// Retain the binding chosen by DuckDB and attach this operator to that exact generation.
+  void attach_binding(duckdb::shared_ptr<exec::stream_bind_catalog> catalog,
+                      std::shared_ptr<const exec::stream_declaration> declaration);
 
   /// Wire EOS → update_pipeline_status(false); on_data → schedule(head) (self-nomination).
   /// Without on_data, a WAITING source stays dropped until a task completes — which never happens.
@@ -93,6 +105,7 @@ class sirius_physical_streaming_source : public sirius_physical_operator {
     const input_stats& stats) const override;
 
  private:
+  std::unique_ptr<exec::stream_source_attachment> _binding;
   /// Shared so producer threads co-own the stream past this operator.
   std::shared_ptr<exec::batch_stream> _input;
 };

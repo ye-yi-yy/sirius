@@ -21,11 +21,15 @@
 #include "duckdb/storage/statistics/node_statistics.hpp"
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <utility>
 
 namespace sirius {
 struct sirius_config;
+namespace scan {
+class bound_schema;
+}  // namespace scan
 }  // namespace sirius
 
 namespace duckdb {
@@ -38,24 +42,24 @@ struct DBConfig;
 // optimizer sees a real cardinality estimate via the registered cardinality
 // callback instead of falling back to "unknown table function output".
 struct SiriusReadParquetBindData : public FunctionData {
-  SiriusReadParquetBindData(std::string uri, std::size_t total_num_rows)
-    : uri(std::move(uri)), total_num_rows(total_num_rows)
+  SiriusReadParquetBindData(std::string uri,
+                            std::size_t total_num_rows,
+                            std::shared_ptr<const sirius::scan::bound_schema> schema = nullptr)
+    : uri(std::move(uri)), total_num_rows(total_num_rows), schema(std::move(schema))
   {
   }
 
-  std::string uri;
-  std::size_t total_num_rows{0};
+  const std::string uri;
+  const std::size_t total_num_rows;
+  // Null denotes metadata-only/incomplete binding, not a complete zero-column schema.
+  const std::shared_ptr<const sirius::scan::bound_schema> schema;
 
   unique_ptr<FunctionData> Copy() const override
   {
-    return make_uniq<SiriusReadParquetBindData>(uri, total_num_rows);
+    return make_uniq<SiriusReadParquetBindData>(uri, total_num_rows, schema);
   }
 
-  bool Equals(FunctionData const& other_p) const override
-  {
-    auto const& other = other_p.Cast<SiriusReadParquetBindData>();
-    return uri == other.uri && total_num_rows == other.total_num_rows;
-  }
+  bool Equals(FunctionData const& other_p) const override;
 };
 
 // Cardinality callback for sirius_read_parquet. Returns the footer row count

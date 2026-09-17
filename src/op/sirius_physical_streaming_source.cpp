@@ -17,6 +17,7 @@
 #include "op/sirius_physical_streaming_source.hpp"
 
 #include "creator/task_creator.hpp"
+#include "exec/stream_bind_catalog.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius/exception.hpp"
 
@@ -42,6 +43,17 @@ sirius_physical_streaming_source::sirius_physical_streaming_source(
   }
   _input =
     std::make_shared<exec::batch_stream>(std::move(input_repository), std::move(expected_senders));
+}
+
+sirius_physical_streaming_source::~sirius_physical_streaming_source() = default;
+
+void sirius_physical_streaming_source::attach_binding(
+  duckdb::shared_ptr<exec::stream_bind_catalog> catalog,
+  std::shared_ptr<const exec::stream_declaration> declaration)
+{
+  if (_binding) { throw sirius::invalid_input_exception("stream source already has a binding"); }
+  _binding = std::make_unique<exec::stream_source_attachment>(
+    std::move(catalog), std::move(declaration), this);
 }
 
 void sirius_physical_streaming_source::set_pipeline(
