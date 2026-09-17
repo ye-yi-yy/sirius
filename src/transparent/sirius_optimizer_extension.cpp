@@ -16,6 +16,7 @@
 
 #include "transparent/sirius_optimizer_extension.hpp"
 
+#include "scan/binding_audit.hpp"
 #include "sirius_context.hpp"
 
 #include <duckdb/common/enums/optimizer_type.hpp>
@@ -226,6 +227,10 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   auto conn_state = duckdb::get_sirius_connection_state(input.context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
 
+  // TODO(R1 D3): enforce qualified original-binding observations when DuckDB exposes them.
+  // The compatibility adapter currently reports unproven and preserves legacy derivation.
+  if (scan::capture_planning_repeat_audit(input.context).observed_unsafe()) { return; }
+
   // Optimizer hooks must not throw: a failed derivation only costs the pushdown, never the query.
   try {
     derive_join_dependent_filters_recursive(*plan);
@@ -252,6 +257,9 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!ctx || !ctx->is_initialized()) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
+
+  // Unavailable original-binding observations are not proof that plan copying is repeat-safe.
+  if (scan::capture_planning_repeat_audit(context).observed_unsafe()) { return; }
 
   // Copy the optimized plan into THIS connection's per-connection state,
   // stamped with the current planning generation. OnFinalizePrepare will

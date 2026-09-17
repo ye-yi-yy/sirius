@@ -59,18 +59,6 @@ class LogicalCTERef;
 
 namespace sirius::planner {
 
-/// Resolved parquet file set identifying a parquet-family scan
-/// ("parquet_scan" / "read_parquet" / "sirius_read_parquet"), derived exactly
-/// as the scan's ingestible_table_info derives it — so a plan-time cache probe
-/// and the prepare-time cache match see the same identity. Returns empty when
-/// the identity cannot be resolved (non-parquet function, missing bind data,
-/// empty file list, or a missing/NULL sirius_read_parquet URI parameter);
-/// callers treat empty as "no identity", never as an error.
-[[nodiscard]] std::vector<std::string> resolve_parquet_scan_file_paths(
-  std::string_view function_name,
-  duckdb::FunctionData const* bind_data,
-  duckdb::vector<duckdb::Value> const& parameters);
-
 //! The physical plan generator generates a physical execution plan from a
 //! logical query plan
 class sirius_physical_plan_generator {
@@ -149,12 +137,6 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalFilter& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalGet& op);
 
-  //! Builds the STREAMING_SOURCE a `sirius_stream_source(id)` read stands for, wired to the
-  //! repository and expected sender set the fragment declared for that id on this connection.
-  //! Records the built operator back into the catalog so the fragment can register it with its
-  //! stream_session once the plan tree owns it.
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_streaming_source_plan(
-    duckdb::LogicalGet& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalLimit& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOrder& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalTopN& op);

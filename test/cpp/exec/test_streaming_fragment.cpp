@@ -86,10 +86,11 @@ struct fragment_fixture {
     REQUIRE(result);
     REQUIRE_FALSE(result->HasError());
 
-    // sirius_stream_source's bind resolves its schema here; the transparent path does not
-    // register a catalog, so the fragment supplies one for this connection.
-    catalog = duckdb::make_shared_ptr<stream_bind_catalog>();
-    con->context->registered_state->Insert(stream_bind_catalog::kStateKey, catalog);
+    // Binding, runtime attachment and teardown must use the connection's same catalog owner.
+    // Insert does not replace an existing state; a separate catalog would observe no declarations.
+    catalog =
+      con->context->registered_state->Get<stream_bind_catalog>(stream_bind_catalog::kStateKey);
+    REQUIRE(catalog != nullptr);
   }
 
   std::unique_ptr<duckdb::Connection> con;

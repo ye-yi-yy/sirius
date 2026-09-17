@@ -48,6 +48,9 @@ struct stream_source_bind_data : public duckdb::FunctionData {
   }
 };
 
+/// The actual factory shared by registration and verified source lookup.
+duckdb::TableFunction stream_source_function_descriptor();
+
 /// Register sirius_stream_source(id). Bind reads stream_bind_catalog; body never runs
 /// (replaced by STREAMING_SOURCE).
 void register_stream_source_function(duckdb::DatabaseInstance& instance);

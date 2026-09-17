@@ -162,22 +162,54 @@ TEST_CASE("stream_bind_catalog CAT-5b: erase drops only the named stream", "[str
 }
 
 // ============================================================================
-// CAT-6: redeclaring an id replaces it rather than keeping the old schema
+// CAT-6: only an unused declaration may be replaced
 // ============================================================================
 
-TEST_CASE("stream_bind_catalog CAT-6: a redeclared id is replaced", "[stream_bind_catalog]")
+TEST_CASE("stream_bind_catalog CAT-6: replacement respects live declaration owners",
+          "[stream_bind_catalog]")
 {
-  stream_bind_catalog catalog;
-  catalog.declare(1, make_binding());
-  catalog.set_built(1, reinterpret_cast<sirius::op::sirius_physical_streaming_source*>(0x1234));
+  auto catalog                   = duckdb::make_shared_ptr<stream_bind_catalog>();
+  const auto original_generation = catalog->declare(1, make_binding());
+  const auto replacement         = [] {
+    auto binding  = make_binding();
+    binding.names = {"renamed"};
+    return binding;
+  };
 
-  auto replacement  = make_binding();
-  replacement.names = {"renamed"};
-  catalog.declare(1, std::move(replacement));
+  SECTION("a retained logical binding prevents replacement and removal")
+  {
+    auto declaration = catalog->get_declaration(1);
+    stream_source_bind_data bound(declaration);
+    auto copied = bound.Copy();
+    declaration.reset();
+    REQUIRE_THROWS_WITH(catalog->declare(1, replacement()),
+                        Catch::Contains("stream_binding_in_use"));
+    REQUIRE_THROWS_WITH(catalog->erase(1), Catch::Contains("stream_binding_in_use"));
+    REQUIRE_THROWS_WITH(catalog->clear(), Catch::Contains("stream_binding_in_use"));
+    REQUIRE(catalog->get(1).names[0] == "a");
+    REQUIRE(copied->Equals(bound));
+  }
 
-  REQUIRE(catalog.get(1).names[0] == "renamed");
-  // The stale back-pointer must not survive: it refers to an operator from the previous plan.
-  REQUIRE(catalog.get(1).built == nullptr);
+  SECTION("a runtime attachment blocks mutation until its owner is destroyed")
+  {
+    auto* fake = reinterpret_cast<sirius::op::sirius_physical_streaming_source*>(0x1234);
+    {
+      stream_source_attachment attachment(catalog, catalog->get_declaration(1), fake);
+      REQUIRE(catalog->get_built(1, original_generation) == fake);
+      REQUIRE_THROWS_WITH(catalog->declare(1, replacement()),
+                          Catch::Contains("stream_binding_in_use"));
+      REQUIRE(catalog->get(1).built == fake);
+    }
+    REQUIRE(catalog->get(1).built == nullptr);
+  }
+
+  // Each section has now released all binding/runtime owners. Replacement publishes a
+  // different generation; stale teardown must not erase it.
+  const auto next_generation = catalog->declare(1, replacement());
+  REQUIRE(next_generation > original_generation);
+  catalog->erase(1, original_generation);
+  REQUIRE(catalog->get(1).names[0] == "renamed");
+  REQUIRE(catalog->get(1).built == nullptr);
 }
 
 // ============================================================================

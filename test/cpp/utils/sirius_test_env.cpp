@@ -24,7 +24,7 @@ shared_test_env* g_shared_env           = nullptr;
 shared_test_env* g_integration_env      = nullptr;
 shared_test_env* g_integration_env_2gpu = nullptr;
 
-shared_test_env::shared_test_env(const std::filesystem::path& config_path)
+shared_test_env::shared_test_env(const std::filesystem::path& config_path, bool start_paused)
   : config_path_(config_path)
 {
   // Save the current SIRIUS_CONFIG_FILE value so we can restore it on destruction
@@ -34,7 +34,7 @@ shared_test_env::shared_test_env(const std::filesystem::path& config_path)
     original_config_env_     = current;
   }
 
-  create_db();
+  if (!start_paused) { create_db(); }
 }
 
 shared_test_env::~shared_test_env()

@@ -22,6 +22,8 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
 #include "expression_evaluator/expression_evaluator_strategy.hpp"
+#include "scan/source_factories.hpp"
+#include "scan/source_registry.hpp"
 
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/types.hpp>
@@ -322,6 +324,19 @@ unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
   auto const* typed = dynamic_cast<SiriusReadParquetBindData const*>(bind_data_p);
   if (typed == nullptr) { return nullptr; }
   return make_uniq<NodeStatistics>(typed->total_num_rows, typed->total_num_rows);
+}
+
+TableFunction sirius_parquet_scan_function()
+{
+  TableFunction function("sirius_read_parquet",
+                         {LogicalType::VARCHAR},
+                         SiriusReadParquetFunction,
+                         SiriusReadParquetBind);
+  function.cardinality         = SiriusReadParquetCardinality;
+  function.projection_pushdown = true;
+  function.filter_pushdown     = true;
+  function.filter_prune        = true;
+  return function;
 }
 
 struct SiriusTableFunctionData : public TableFunctionData {
@@ -2481,15 +2496,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   // Sirius's footer-only S3 path instead of DuckDB's native read_parquet.
   // Registered so the rewrite's output binds, but INTERNAL — not a public
   // surface: users query S3 Parquet with read_parquet('s3://...'), not this.
-  TableFunction sirius_read_parquet("sirius_read_parquet",
-                                    {LogicalType::VARCHAR},
-                                    SiriusReadParquetFunction,
-                                    SiriusReadParquetBind);
-  sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
-  sirius_read_parquet.projection_pushdown = true;
-  sirius_read_parquet.filter_pushdown     = true;
-  sirius_read_parquet.filter_prune        = true;
-  CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
+  CreateTableFunctionInfo sirius_read_parquet_info(sirius_parquet_scan_function());
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 
   TableFunction set_query_label("sirius_set_query_label",
@@ -3627,6 +3634,7 @@ static void LoadInternal(ExtensionLoader& loader)
   // per-connection options register with.
   SiriusExtension::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
   SiriusExtension::RegisterGPUFunctions(db);
+  sirius::scan::source_registry::get(db);
 
   // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds
   // by reading the parquet footer through Sirius's routed REST ioctx. This makes

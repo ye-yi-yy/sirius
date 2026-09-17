@@ -108,7 +108,7 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<std::string> names,
   duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
-  bool cpu_plan_reads_s3,
+  scan::source_policy cpu_source_policy,
   duckdb::idx_t estimated_cardinality)
   : duckdb::PhysicalOperator(
       physical_plan, PhysicalSiriusExecution::TYPE, std::move(types), estimated_cardinality),
@@ -116,7 +116,7 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
     query_sql_(std::move(query_sql)),
     result_names_(std::move(names)),
     cpu_fallback_prepared_(std::move(cpu_fallback_prepared)),
-    cpu_plan_reads_s3_(cpu_plan_reads_s3)
+    cpu_source_policy_(cpu_source_policy)
 {
 }
 
@@ -282,24 +282,18 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // A pre-existing-unavailable error on an S3 query keeps its stable typed
       // message — the S3 branch below must not rewrite it (S3 has no CPU
       // fallback either way, so propagate as-is).
-      if (runtime_unavailable_error &&
-          (cpu_plan_reads_s3_ || sirius::references_sirius_owned_s3_parquet(query_sql_))) {
+      if (runtime_unavailable_error && (!cpu_source_policy_.permits_source_replay() ||
+                                        sirius::references_sirius_owned_s3_parquet(query_sql_))) {
         gpu_error.Throw();
       }
 
-      // S3 is GPU-only: DuckDB's CPU read_parquet cannot serve Sirius-owned s3://,
-      // so surface a clear error instead of a fallback that would fail anyway.
-      if (cpu_plan_reads_s3_ || sirius::references_sirius_owned_s3_parquet(query_sql_)) {
-        throw duckdb::ExecutorException(
-          "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, "
-          "and Sirius has no CPU fallback for S3 data sources. Underlying GPU error: " +
-          gpu_msg);
-      }
+      cpu_source_policy_.require_source_replay(query_sql_, gpu_msg);
 
       // Fallback disabled, or no CPU plan stashed: surface the GPU error. Sanitize
       // INTERNAL/FATAL types (which would invalidate the whole database/session)
       // down to a plain ExecutorException; preserve other types.
-      if (!cpu_fallback_prepared_ || !duckdb::duckdb_fallback_enabled(context.client)) {
+      if (!cpu_fallback_prepared_ || !cpu_fallback_prepared_->properties.IsReadOnly() ||
+          !duckdb::duckdb_fallback_enabled(context.client)) {
         if (gpu_error.Type() == duckdb::ExceptionType::INTERNAL ||
             gpu_error.Type() == duckdb::ExceptionType::FATAL) {
           throw duckdb::ExecutorException("Sirius GPU execution failed: " + gpu_msg);

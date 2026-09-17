@@ -297,6 +297,17 @@ set(EXTENSION_SOURCES
     src/exec/batch_stream.cpp
     src/exec/stream_session.cpp
     src/scan/bound_schema.cpp
+    src/scan/source_registry.cpp
+    src/scan/source_adapter.cpp
+    src/scan/adapters/adapter_support.cpp
+    src/scan/adapters/native_source_adapter.cpp
+    src/scan/adapters/parquet_source_adapter.cpp
+    src/scan/adapters/owned_parquet_source_adapter.cpp
+    src/scan/adapters/stream_source_adapter.cpp
+    src/scan/adapters/iceberg_source_adapter.cpp
+    src/scan/source_policy.cpp
+    src/scan/bound_read_view.cpp
+    src/scan/binding_audit.cpp
     src/exec/stream_bind_catalog.cpp
     src/exec/stream_plan_bindings.cpp
     src/exec/streaming_fragment.cpp

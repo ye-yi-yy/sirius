@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/sirius_physical_operator.hpp"
+#include "scan/source_policy.hpp"
 
 #include <duckdb/common/enums/physical_operator_type.hpp>
 #include <duckdb/execution/physical_operator.hpp>
@@ -46,7 +47,7 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
                           duckdb::vector<duckdb::LogicalType> types,
                           duckdb::vector<std::string> names,
                           duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
-                          bool cpu_plan_reads_s3,
+                          scan::source_policy cpu_source_policy,
                           duckdb::idx_t estimated_cardinality);
 
   // Source operator interface
@@ -90,10 +91,8 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   /// const source state can keep it alive across the nested run.
   duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared_;
 
-  /// Whether the CPU fallback plan reads s3:// data. S3 is GPU-only (DuckDB's CPU
-  /// read_parquet cannot serve Sirius-owned s3://), so a runtime GPU failure on an
-  /// s3 query surfaces a clear error instead of falling back to CPU.
-  bool cpu_plan_reads_s3_ = false;
+  /// Immutable source policy captured from the original CPU plan before any candidate replan.
+  const scan::source_policy cpu_source_policy_;
 };
 
 }  // namespace sirius::transparent

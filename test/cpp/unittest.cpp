@@ -24,8 +24,6 @@
 #include "utils/s3_container.hpp"
 #include "utils/sirius_test_env.hpp"
 
-#include <cuda_runtime.h>
-
 #include <algorithm>
 #include <cstdlib>
 #include <exception>
@@ -103,6 +101,9 @@ int main(int argc, char* argv[])
   // Keep test-only DuckDB options out of normal Sirius builds and sessions. This process opts in
   // before constructing the shared databases used by the runtime-fallback integration tests.
   setenv("SIRIUS_ENABLE_TEST_OPTIONS", "1", 1);
+  // Isolated CPU tests must not initialize GPU resources before Catch selects tests.
+  // Shared environments explicitly enable Sirius when the listener resumes them.
+  setenv("SIRIUS_DISABLE", "1", 1);
 
   // Install the crash backtrace handler up front so it covers the whole test
   // run, independent of when (or whether) the extension's LoadInternal runs.
@@ -126,14 +127,12 @@ int main(int argc, char* argv[])
   // Only one environment can be active at a time.
   auto scan_config_path =
     std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "scan" / "memory.yaml";
-  sirius::test::shared_test_env scan_env(scan_config_path);
-  scan_env.pause();
+  sirius::test::shared_test_env scan_env(scan_config_path, true);
   sirius::test::g_shared_env = &scan_env;
 
   auto integration_config_path = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" /
                                  "integration" / "integration.yaml";
-  sirius::test::shared_test_env integration_env(integration_config_path);
-  integration_env.pause();
+  sirius::test::shared_test_env integration_env(integration_config_path, true);
   sirius::test::g_integration_env = &integration_env;
 
   // 2-GPU integration env (TEST-01/02 v1.2). Starts paused; TEST_CASE bodies
@@ -142,14 +141,9 @@ int main(int argc, char* argv[])
   // around each call to compare_gpu_vs_cpu.
   auto integration_config_2gpu_path = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" /
                                       "integration" / "integration-2gpu.yaml";
-  int _dev_count = 0;
-  cudaGetDeviceCount(&_dev_count);
-  std::optional<sirius::test::shared_test_env> integration_env_2gpu_holder;
-  if (_dev_count >= 2) {
-    integration_env_2gpu_holder.emplace(integration_config_2gpu_path);
-    integration_env_2gpu_holder->pause();
-    sirius::test::g_integration_env_2gpu = &(*integration_env_2gpu_holder);
-  }
+  // Device availability is checked by acquire_integration_env_for(2), only when needed.
+  sirius::test::shared_test_env integration_env_2gpu(integration_config_2gpu_path, true);
+  sirius::test::g_integration_env_2gpu = &integration_env_2gpu;
 
   // Bring up the S3 test backend (MinIO via testcontainers) once, when the [s3]
   // suite is run with SIRIUS_TEST_S3_AUTO=1; a no-op otherwise. Doing it here

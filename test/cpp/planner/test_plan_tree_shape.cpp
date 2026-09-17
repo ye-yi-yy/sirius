@@ -1423,27 +1423,24 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan generation rejects an untranslatable pushed-down table filter",
                  "[plan_tree_shape][table_filter][isolated_context]")
 {
-  duckdb::TableFunction function;
-  function.name                = "seq_scan";
-  function.projection_pushdown = true;
-  function.filter_pushdown     = true;
-
-  auto get = duckdb::make_uniq<duckdb::LogicalGet>(
-    0,
-    std::move(function),
-    nullptr,
-    duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::BIGINT},
-    duckdb::vector<duckdb::string>{"id"});
-  get->SetColumnIds({duckdb::ColumnIndex(0)});
-  get->projection_ids        = {0};
-  get->estimated_cardinality = 1;
-  get->table_filters.filters[0] =
+  // The source registry rejects a name-only seq_scan stub before examining filters.
+  // Use a real binding so this case continues to exercise the filter translation boundary.
+  con->BeginTransaction();
+  auto logical = con->ExtractPlan("SELECT id FROM big_left");
+  REQUIRE(logical != nullptr);
+  auto* source = logical.get();
+  while (source->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
+    REQUIRE(source->children.size() == 1);
+    source = source->children[0].get();
+  }
+  auto& get = source->Cast<duckdb::LogicalGet>();
+  get.table_filters.filters[0] =
     duckdb::make_uniq<duckdb::ExpressionFilter>(untranslatable_table_filter_expression());
 
-  duckdb::unique_ptr<duckdb::LogicalOperator> logical = std::move(get);
   sirius::planner::sirius_physical_plan_generator generator(*con->context);
   CHECK_THROWS_WITH(generator.create_plan(std::move(logical)),
                     Catch::Contains("Unsupported filter predicate on column 'id'"));
+  con->Rollback();
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,

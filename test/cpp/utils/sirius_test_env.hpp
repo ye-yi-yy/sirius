@@ -28,8 +28,9 @@ namespace sirius::test {
 /**
  * @brief Shared test environment that holds a single DuckDB instance and SiriusContext.
  *
- * The constructor sets SIRIUS_CONFIG_FILE and creates a DuckDB instance, which triggers
- * the extension callback to create a SiriusContext.
+ * An active constructor sets SIRIUS_CONFIG_FILE and creates a DuckDB instance, which triggers
+ * the extension callback to create a SiriusContext. With start_paused=true the first resume()
+ * does this instead, so selecting an isolated test does not initialize any shared GPU resources.
  * All tests in the "shared" phase get connections to this DuckDB instance, avoiding
  * the overhead of repeated SiriusContext creation/destruction.
  *
@@ -39,7 +40,7 @@ namespace sirius::test {
  */
 class shared_test_env {
  public:
-  explicit shared_test_env(const std::filesystem::path& config_path);
+  explicit shared_test_env(const std::filesystem::path& config_path, bool start_paused = false);
   ~shared_test_env();
 
   shared_test_env(const shared_test_env&)            = delete;

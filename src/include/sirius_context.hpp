@@ -39,6 +39,7 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <atomic>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -90,7 +91,7 @@ class SiriusConnectionState : public ClientContextState {
   /// SiriusContext, which returns true.
   bool CanRequestRebind() final
   {
-    begin_planning_attempt();
+    if (!is_internal_query_active()) { begin_planning_attempt(); }
     return false;
   }
 
@@ -114,10 +115,15 @@ class SiriusConnectionState : public ClientContextState {
   uint64_t next_query_ordinal() noexcept { return ++query_ordinal_; }
   [[nodiscard]] uint64_t current_query_ordinal() const noexcept { return query_ordinal_; }
 
+  [[nodiscard]] uint64_t planning_generation() const noexcept { return planning_generation_; }
+
   /// \brief Start a new planning attempt: advance the generation and clear any
   /// stale capture from a previous attempt.
-  void begin_planning_attempt() noexcept
+  void begin_planning_attempt()
   {
+    if (planning_generation_ == std::numeric_limits<uint64_t>::max()) {
+      throw InvalidInputException("Sirius planning generation exhausted");
+    }
     ++planning_generation_;
     captured_plan_.reset();
   }
