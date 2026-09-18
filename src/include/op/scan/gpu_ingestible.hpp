@@ -27,6 +27,7 @@
 
 // rmm
 #include "io/io_context.hpp"
+#include "scan/scan_contract.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -83,6 +84,16 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   using metadata_scan_task_t = std::function<std::unique_ptr<scan_info>()>;
 
   virtual ~gpu_ingestible() = default;
+  void set_scan_contract(sirius::scan::bound_table_scan_ptr contract)
+  {
+    if (_scan_contract) { throw std::runtime_error("scan contract already frozen"); }
+    _scan_contract = std::move(contract);
+  }
+  const sirius::scan::bound_table_scan_ptr& scan_contract() const noexcept
+  {
+    return _scan_contract;
+  }
+  virtual void validate_dependencies() const {}
 
   gpu_ingestible(gpu_ingestible const&)            = delete;
   gpu_ingestible& operator=(gpu_ingestible const&) = delete;
@@ -269,6 +280,9 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
 
  protected:
   gpu_ingestible() noexcept = default;
+
+ private:
+  sirius::scan::bound_table_scan_ptr _scan_contract;
 };
 
 }  // namespace scan

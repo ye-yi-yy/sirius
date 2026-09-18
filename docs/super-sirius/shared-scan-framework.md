@@ -2,7 +2,8 @@
 
 The binding ownership package is committed as Sirius `63af08a8`, based on
 DuckDB `3ff87f1ec7282ef44727e0e1d84237e88dd9a7b5`. Subsequent staging adds
-source adapters, read-view representation and original-plan source policy. The DuckDB submodule remains at that revision without local source
+source adapters, original/candidate comparison, window-owned scan contracts,
+slice certificates, checkpoint leases and original-plan source policy. The DuckDB submodule remains at that revision without local source
 patches. Standard Parquet and Iceberg use explicit unverified compatibility
 adapters; unavailable binding observations retain unproven verdicts.
 
@@ -88,6 +89,7 @@ Each adapter provides:
 - `verify_binding`: recognition of the implementation and its bind payload.
 - `try_capture_bound_view`: source identity from the retained binding, without binding or I/O.
 - `preflight_source`: existing source-specific planning gates and cache residency evidence.
+- `declare_resources`: attached native storage and transactions needed before protection.
 - `create_scan_runtime`: the existing ingestible or direct source operator.
 - `inspect_source`: byte-source facts for the original-plan fallback policy.
 
@@ -162,8 +164,10 @@ identity for supported schemas and verified profiles:
 
 Cardinality, projection, filters and transaction IDs do not enter the view.
 The typed selector encoder reads already evaluated values without evaluating
-expressions. Original binder publication and finalize/execution comparison
-remain unwired. No Parquet or Iceberg read view is completed by enumerating
+expressions. Hook evidence is retained before template copying, including when
+copying fails. Physical-original capture walks unique `GetChildren()` nodes.
+Finalize and execution rebuild each compare their own candidate against the
+preserved generation. No Parquet or Iceberg read view is completed by enumerating
 files or inferring the missing reader options.
 
 ## Binding-audit compatibility
@@ -215,62 +219,153 @@ This centralizes existing source vetoes, not the complete R1 replay predicate.
 Non-expanding discovery, original statement safety observations, consumer/window
 ownership and failed-drain qualification are still required.
 
-## Remaining R1 work and enablement
+## Candidate correspondence and runtime windows
 
-Supported DuckDB D1/D2/D3 bridges and the actual Iceberg provider bridge are
-deferred. Complete operation qualification and observation coverage, lineage
-and occurrence comparison, transaction preflight/sealing, fresh native
-checkpoint leases, scan tickets and slice certificates remain unfinished.
-Counters, plan-dump evidence and the complete exit/drain audit also remain.
+Verified source views are compared as multisets, preserving independent duplicate
+occurrences. `original_copy_chain` requires a bijection to hook occurrences by
+`table_index`; SQL replans require a single source or an empty correspondence.
+Copying a replan-derived template preserves its origin. Required evaluated
+selectors are compared against the same-generation hook partner, and candidate
+output types must match the retained CPU plan before lowering.
 
-Compatibility paths deliberately preserve existing execution without claiming
-R1 qualification. Complete coverage and qualified operation profiles are
-required before enabling R1 comparison/admission. R0 prerequisites, provider
-qualification and the eligibility/performance matrices are separate gates.
+Compatibility providers remain explicitly unproven. Their occurrence counts
+and function names are checked without claiming file/option/selector equality.
+The requested compatibility path also retains existing multi-source replans
+when a Standard Parquet or Iceberg source is present. Remove this exception
+when D1/D2/D3 can qualify the real provider path.
+
+Each validation or execution build receives a fresh registry and process-wide,
+monotonic, non-wrapping 64-bit handles. Immutable tickets retain the source,
+generation, window, output layouts, required columns, projection, static
+filters and materializer. Filters are copied before lowering consumes them.
+Stream receives a ticket without creating file splits. Registry membership and
+active-window checks reject expired or foreign consumers.
+
+Validation contracts and leases die before installing the reusable transparent
+operator. Execution rebuild captures and compares again with fresh contracts.
+The registry never publishes `admission_supported` while D3 remains unproven.
+
+## Construction, native leases and drain
+
+Adapters declare resources before the construction seal. All existing
+SQL-dependent provider preparation finishes before the window acquires native
+checkpoint readers. Native preflight uses a temporary reader for its existing
+storage probes; runtime layout capture uses one shared checkpoint lease per
+actual AttachedDatabase, acquired in database order. Transactions start before
+leases. Pin population records its checkpoint iteration under its own scoped
+lease.
+
+A protected window rejects new internal-query brackets and metadata-connection
+creation until drain releases its leases. Iceberg metadata uses an explicit
+read-only transaction. This is a construction restriction, not D3 evidence or
+permission for arbitrary provider callbacks. Supporting new internal SQL lanes
+under a lease still requires separate qualification.
+
+Native prepare, metadata walks, staging and decode revalidate the attached
+database, block manager, iteration and layout association. The engine, plan,
+storage, pin runtime and fragment declarations are retained through mandatory
+drain. Cleanup stops metadata issuance, drains task creation, execution,
+device work and I/O, then closes registries and releases leases. Failed drain
+retains owners until runtime teardown and prohibits CPU replay. Buffered results
+and idle prepared plans do not retain active leases.
+
+## Certified slices and diagnostics
+
+Fresh Parquet slices retain a runtime inventory occurrence (including duplicate
+paths), footer, selected row groups, reader options/plan and datasource owner.
+Iceberg slices additionally retain the existing delete-data owner. This runtime
+inventory is not original-binding D2 evidence. Native slices retain the exact
+row-group/segment descriptor snapshot, lease, storage, datasource and staging
+owners. Insert-delta staging remains shared while each consuming scan receives
+its own certificates.
+
+Coalescing preserves constituent certificates and rejects mixed consumers.
+Connector enqueue, prefetch and materialization validate live membership and
+per-slice range/dependency associations before decode. Resident pinned batches
+continue through their existing identity/MVCC/layout checks. Empty results
+retain the dependencies still used by their existing materializer.
+
+The source registry owns `read_view_mismatches`, `certificate_mismatches` and
+`checkpoint_revalidation_failures`. Plan dumps include a bounded ticket/window,
+source, identity hash, correspondence and evidence/replay classification, with
+no paths, selectors or predicate values. Safety/admission remain explicitly
+unproven. This adds runtime enforcement, not physical byte-version guarantees.
+
+Iceberg delete-data memoization uses a typed key containing database instance,
+connection, query ordinal, planning generation, transaction, exact table path,
+snapshot and the effective version-guessing setting. It remains query-local and
+never supplies missing original evidence.
+
+## Remaining external qualification
+
+D1/D2 bridges for actual Standard Parquet/Iceberg providers and DuckDB D3
+original-binding observations remain deferred. The compatibility adapters and
+audit TODOs describe the external changes needed before full admission can be
+enabled. R0 provenance, real-provider compatibility, performance/concurrency
+matrices and the complete R1 acceptance qualification are still required.
+R2a-R4 statement certification, byte-version contracts and new reader/runtime
+implementations are outside this change.
 
 ## Validation
 
-The existing CAT-6 expectation was corrected: live bindings and runtime
-attachments prevent declaration replacement/removal; after release, a new
-generation can be published and stale teardown cannot erase it. The fragment
-fixture now uses the connection's actual catalog. The unsupported-filter case
-uses a real native binding: a name-only seq_scan stub is rejected earlier by
-the new implementation contract. No new Catch test cases were added.
+The release build of `duckdb`, `sirius_loadable_extension` and `sirius_unittest`
+passes with the current runtime-contract changes (2026-09-18), including the
+device fence in `SiriusContext`. Formatting/static hooks and whitespace checks
+pass. DuckDB tracked source and the submodule revision are unchanged. Pixi
+activation now preserves an already-correct CMakePresets symlink.
 
-The test runner creates shared environments in a truly paused state and
-initializes GPU resources only for selected tests which need them. Previously
-it created and destroyed the shared databases before Catch selected tests.
-The stream catalog and owned-Parquet metadata suites then passed all 16 cases
-and 63 assertions without initializing shared GPU environments.
+Runtime verification exposed and fixed two implementation issues:
 
-The adapter refactor builds the DuckDB executable, loadable Sirius extension
-and sirius_unittest against the unchanged submodule. Formatting and
-static hooks passed, and DuckDB's tracked working tree and index have no diff.
-No test cases were added or changed as part of removing the source patches
-or moving source behavior into adapters.
+- Logical-plan copies do not preserve resolved output types. Candidate type
+  resolution now precedes evidence capture, avoiding false
+  `output_schema_mismatch` refusals for supported queries.
+- Schema-only Parquet files have no row-group column chunks. Byte accounting
+  skips those absent chunks while the empty split retains its schema and
+  dependency certificates.
 
-Existing suites passed in separate processes:
+Only existing tests were adapted to the new contract; no test cases were added.
+Operator-only plan-tree fixtures now supply the construction window normally
+installed by `create_plan`; a missing window produces an explicit error instead
+of dereferencing null. Lifecycle AC-6 now permits the CPU fallback it expects
+when the optimizer is disabled and no current logical capture/SQL candidate
+exists. It still verifies that the old generation is not consumed and the new
+binding returns the correct result.
 
-- Plan-tree shapes: 18 cases, 1,211 assertions.
-- Stream catalog/session, owned-Parquet metadata and Iceberg batch layouts:
-  34 cases, 171 assertions. Three live S3 metadata cases returned early because
-  S3 credentials/fixtures were not configured; their provider behavior was not tested.
+Existing-suite results:
 
-A combined invocation exited during shared integration-environment startup,
-without a Catch assertion report. The integration configuration requests 32 GB
-of host memory on this roughly 15 GB machine. Separate invocations passed;
-the combined process remains unqualified.
+- Plan-tree shapes: 18 cases, 1,211 assertions passed.
+- Stream catalog/session/batches, owned-Parquet metadata and Iceberg
+  layout/delete/Puffin helpers: 71 cases, 379 assertions passed. Provider checks
+  that return early without S3 fixtures do not qualify live S3 behavior.
+- Streaming fragments: 5 cases, 83 assertions passed, including output surviving
+  window cleanup, two-fragment chains, Parquet scans and multiple batches.
+- Local transparent runtime fallback: 6 cases passed, covering own uncommitted
+  writes, snapshot stability across a concurrent commit, fallback-disabled
+  errors and subsequent recovery. The broader selector reported 31 cases and
+  110 assertions; its S3/child-runner early returns are not provider validation.
+- Query lifecycle: 11 cases, 78 assertions passed, including unconsumed/pending
+  results, concurrent execution/preparation, pin-state changes, stale capture
+  rejection, unavailable runtime and planning-error recovery.
+- Cancelled-waiter gate: 1 case, 6 assertions passed. Cancellation does not enter
+  a later execution window or trigger replay; a follow-up query succeeds.
+- Scan/scan-manager selection: 298 of 300 cases passed together. The CPU-only
+  `any_uncheckpointed_appends` case encountered a default-size GPU allocation
+  failure in the combined process and passed independently (27 assertions).
+  The remaining default-config case fails because WSL reports unknown capacity
+  for NUMA node -1; it does not exercise the shared scan contract.
 
-Twelve manual SQL result checks passed after the adapter refactor on temporary
-data with the minimal config: native scans and filters, both Parquet aliases,
-glob expansion, duplicate file paths, Hive partition columns, a mixed
-native/Parquet join, planning fallback, native/Parquet runtime fallback
-under injected GPU failures, and GPU execution after recovery. Supported
-scans ran with CPU fallback disabled; both runtime fallback banners were
-observed. These checks do not qualify volatile selector repeat safety.
+Fourteen manual SQL CPU/GPU comparisons passed with fallback disabled on the
+supported GPU paths: native filters/projections/self-join/empty results,
+Parquet aliases/duplicates/globs/empty and pruned files, owned Parquet, Hive
+partition projection, mixed native/Parquet joins, and a pinned native self-join
+over insert deltas. `FORCE CHECKPOINT` completed after normal queries and after
+unpinning, checking that query-scoped leases had been released.
 
-The streaming-fragment integration fixture was corrected and compiled, but its
-full integration suite was not run: the checked-in integration configuration
-reserves 32 GB of host memory, exceeding this machine's available memory.
-Actual-provider Iceberg end-to-end/ABI qualification and R1 performance and
-concurrency matrices remain outstanding. Full R1 qualification is not claimed.
+The integration suites above used their original configuration. Its 32 GB host
+capacity is a budget, not an immediate 32 GB allocation; the initial host pools
+allocate about 5 GiB. The earlier assumption that this capacity alone prevented
+running the suites was incorrect.
+
+Local command output is retained under `build/r1-validation/`. Live S3 and
+actual-provider Iceberg end-to-end/ABI qualification remain unverified. Full R1
+acceptance, performance and concurrency qualification are still not claimed.

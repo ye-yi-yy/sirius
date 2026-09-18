@@ -126,6 +126,7 @@ void canonicalize_scan_file_paths(std::vector<std::string>& paths);
  */
 class parquet_split_info : public scan_info {
  public:
+  void validate_slices(const sirius::scan::bound_table_scan_ptr&) const override;
   /// Row-group slices for this batch — possibly across multiple parquet
   /// files when the per-file row groups don't fill the byte budget.
   std::vector<row_group_slice> rg_slices;
@@ -192,6 +193,8 @@ class parquet_split_info : public scan_info {
  */
 class parquet_file_scan_info : public scan_info {
  public:
+  std::shared_ptr<const sirius::scan::parquet_file_certificate> certificate;
+  void validate_slices(const sirius::scan::bound_table_scan_ptr&) const override;
   /// A single pruned row group with the byte accounting the coalescer chunks on.
   /// @c output_bytes estimates the decoded size of projected data columns before
   /// row filtering, while @c decode_working_bytes also includes columns decoded
@@ -294,6 +297,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   explicit parquet_gpu_ingestible(std::unique_ptr<parquet_ingestible_table_info> info);
 
   ~parquet_gpu_ingestible() override;
+  virtual std::shared_ptr<const void> visibility_dependencies() const { return {}; }
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const override;
 
@@ -343,7 +347,8 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// per-row-group byte accounting. Returns a single @c parquet_file_scan_info.
   /// Runs on a scan-manager dispatcher thread (the task returned by
   /// @ref next_split_provider).
-  std::unique_ptr<scan_info> build_file_scan_info(std::string const& file_path,
+  std::unique_ptr<scan_info> build_file_scan_info(std::size_t occurrence,
+                                                  std::string const& file_path,
                                                   std::shared_ptr<io::sirius_ioctx> const& io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
@@ -391,7 +396,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   // the predicate has no such conjunct.
   std::vector<null_prune_predicate> _null_prune_predicates;
 
-  std::vector<std::string> _file_paths;
+  std::shared_ptr<const std::vector<std::string>> _file_paths;
 
   // Per-file metadata-scan cursor. next_split_provider hands out one file index
   // per claim; the coalescer downstream batches files and chunks row groups.

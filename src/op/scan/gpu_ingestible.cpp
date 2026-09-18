@@ -33,6 +33,11 @@ filtered_table gpu_ingestible::materialize_table(
   bool like_swar_fastpath,
   std::shared_ptr<const like_multiliteral_cache> like_cache)
 {
+  validate_dependencies();
+  if (scan_contract()) {
+    scan_contract()->validate();
+    if (split.has_scan_metadata()) { split.get_scan_info().validate_slices(scan_contract()); }
+  }
   auto* mem_space = split.gpu_memory_space;
   if (split.has_scan_metadata()) [[likely]] {
     split.prefetch(io::cache::prefetching_stage::disposable);

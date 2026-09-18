@@ -160,8 +160,14 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
 
   bind_prepared_statement_parameters(statement, parameters);
 
-  duckdb::unique_ptr<sirius_engine> temp =
-    duckdb::make_uniq<sirius_engine>(context, *this, query_id);
+  auto temp    = std::make_shared<sirius_engine>(context, *this, query_id);
+  auto runtime = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (runtime) {
+    auto scans = statement_p->sirius_physical_plan->scan_registry;
+    runtime->retain_until_query_drain(query_id, temp, [scans] {
+      if (scans) { scans->close(); }
+    });
+  }
   auto prop                   = temp->context.GetClientProperties();
   sirius_active_query->engine = std::move(temp);
   auto& engine                = get_sirius_engine();

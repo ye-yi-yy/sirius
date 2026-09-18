@@ -1149,6 +1149,8 @@ void run_ac6_capture_generation(duckdb::Connection& connection,
                                 fs::path const& output_path,
                                 slot_watchdog_result& out)
 {
+  // With the optimizer disabled, Prepare has no current logical capture or SQL
+  // candidate. The shared scan contract requires permission to retain CPU execution.
   if (!set_gpu_execution(connection, false, out.error) ||
       !run_statement(connection, "CREATE SCHEMA old_scope;", "CREATE old_scope", out.error) ||
       !run_statement(connection, "CREATE SCHEMA new_scope;", "CREATE new_scope", out.error) ||
@@ -1158,8 +1160,8 @@ void run_ac6_capture_generation(duckdb::Connection& connection,
       !run_statement(
         connection, "SET search_path='old_scope';", "SET old search_path", out.error) ||
       !run_statement(connection,
-                     "SET enable_duckdb_fallback=false;",
-                     "SET enable_duckdb_fallback=false",
+                     "SET enable_duckdb_fallback=true;",
+                     "SET enable_duckdb_fallback=true",
                      out.error) ||
       !set_gpu_execution(connection, true, out.error) ||
       !run_statement(connection, "BEGIN TRANSACTION;", "BEGIN TRANSACTION", out.error)) {

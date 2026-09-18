@@ -120,7 +120,8 @@ class streaming_fragment {
   std::map<stream_id_t, std::shared_ptr<cucascade::shared_data_repository>> _input_repos;
   std::map<stream_id_t, std::shared_ptr<cucascade::shared_data_repository>> _output_repos;
   std::unique_ptr<sirius::sirius_interface> _iface;
-  std::unique_ptr<sirius::sirius_engine> _engine;
+  std::shared_ptr<sirius::sirius_engine> _engine;
+  std::shared_ptr<int> _plan_lifetime;
   stream_session _session;
 
   bool _built{false};

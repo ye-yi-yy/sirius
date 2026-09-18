@@ -18,6 +18,7 @@
 
 #include "log/logging.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "scan/binding_audit.hpp"
 #include "sirius_context.hpp"
 #include "sirius_interface.hpp"
 #include "sirius_sql_rewrite.hpp"
@@ -34,6 +35,8 @@
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
+#include <duckdb/transaction/meta_transaction.hpp>
+#include <duckdb/transaction/transaction_context.hpp>
 
 namespace sirius::transparent {
 
@@ -109,6 +112,8 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
   duckdb::vector<std::string> names,
   duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
   scan::source_policy cpu_source_policy,
+  std::shared_ptr<const scan::original_plan_evidence> originals,
+  scan::candidate_origin origin,
   duckdb::idx_t estimated_cardinality)
   : duckdb::PhysicalOperator(
       physical_plan, PhysicalSiriusExecution::TYPE, std::move(types), estimated_cardinality),
@@ -116,7 +121,9 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
     query_sql_(std::move(query_sql)),
     result_names_(std::move(names)),
     cpu_fallback_prepared_(std::move(cpu_fallback_prepared)),
-    cpu_source_policy_(cpu_source_policy)
+    cpu_source_policy_(cpu_source_policy),
+    originals_(std::move(originals)),
+    origin_(origin)
 {
 }
 
@@ -161,6 +168,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     // result — is captured in gpu_error and routed to the CPU fallback below. The
     // result is fully materialized before the first Fetch, so falling back here
     // cannot duplicate rows.
+    const auto transaction_id = context.client.ActiveTransaction().global_transaction_id;
+    const auto replay_audit   = originals_ ? originals_->audit : scan::planning_repeat_audit{};
     duckdb::ErrorData gpu_error;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
@@ -191,6 +200,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // fall back to re-parsing + re-binding the unbound SQL statement, which
       // exercises the same bind path the very first run did.
       duckdb::unique_ptr<duckdb::LogicalOperator> fresh_plan;
+      auto origin = origin_;
       if (logical_plan_) {
         try {
           fresh_plan = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
@@ -201,6 +211,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         }
       }
       if (!fresh_plan) {
+        origin = scan::candidate_origin::sql_replan;
         // Suppress the optimizer hooks for this nested replan (the guard is a
         // no-op when Sirius has no per-connection state registered).
         duckdb::SiriusContext::InternalQueryGuard guard(context.client);
@@ -216,7 +227,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         fresh_plan = optimizer.Optimize(std::move(duckdb_planner.plan));
       }
       sirius::planner::sirius_physical_plan_generator planner(context.client);
-      auto sirius_plan = planner.create_plan(std::move(fresh_plan));
+      auto sirius_plan = planner.create_plan(std::move(fresh_plan), originals_, origin);
 
       auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
         std::move(prepared), std::move(sirius_plan));
@@ -292,7 +303,13 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // Fallback disabled, or no CPU plan stashed: surface the GPU error. Sanitize
       // INTERNAL/FATAL types (which would invalidate the whole database/session)
       // down to a plain ExecutorException; preserve other types.
-      if (!cpu_fallback_prepared_ || !cpu_fallback_prepared_->properties.IsReadOnly() ||
+      const bool same_transaction =
+        context.client.transaction.HasActiveTransaction() &&
+        context.client.ActiveTransaction().global_transaction_id == transaction_id;
+      // TODO(R1 D3): require a safe verdict once original-binding observations are available.
+      // The explicitly requested compatibility path preserves unproven, never overrides unsafe.
+      if (!same_transaction || replay_audit.cpu_replay == scan::audit_verdict::unsafe ||
+          !cpu_fallback_prepared_ || !cpu_fallback_prepared_->properties.IsReadOnly() ||
           !duckdb::duckdb_fallback_enabled(context.client)) {
         if (gpu_error.Type() == duckdb::ExceptionType::INTERNAL ||
             gpu_error.Type() == duckdb::ExceptionType::FATAL) {

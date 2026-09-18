@@ -1445,6 +1445,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   for (auto const& scan_op : query.get_scan_operators()) {
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
+    if (op->scan_contract) { op->scan_contract->validate(); }
+    op->get_ingestible().validate_dependencies();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
     _metadata_processor->register_pipeline(op, round_robin);
     // On a pinned-cache hit the coalescer serves this operator from a cached
@@ -1479,8 +1481,18 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
 
   _checkpoint_locks.reserve(_pending_mvcc_mask_jobs.size());
   for (auto const& request : _pending_mvcc_mask_jobs) {
-    _checkpoint_locks.push_back(
-      duckdb::DuckTransactionManager::Get(request.storage->GetAttached()).SharedCheckpointLock());
+    bool protected_by_window = false;
+    for (const auto* scan_op : _scan_op_order) {
+      if (scan_op->scan_registry) {
+        scan_op->scan_registry->lease_for(*request.storage);
+        protected_by_window = true;
+        break;
+      }
+    }
+    if (!protected_by_window) {
+      _checkpoint_locks.push_back(
+        duckdb::DuckTransactionManager::Get(request.storage->GetAttached()).SharedCheckpointLock());
+    }
   }
 
   // A manual CHECKPOINT can replace DuckDB's on-disk base while the pinned
@@ -1622,6 +1634,11 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                                duckdb_info->projected_cols,
                                                io_ctx->open_datasource(duckdb_info->db_path),
                                                sf_bm);
+        auto& native =
+          dynamic_cast<op::scan::duckdb_native_gpu_ingestible&>(assignment.op->get_ingestible());
+        for (auto& split : delta_splits) {
+          native.certify(*split.info);
+        }
         SIRIUS_LOG_INFO(
           "[sirius_scan_manager] operator '{}' serves {} insert-delta split(s) of pinned entry "
           "'{}' ({} delta row(s))",
@@ -1866,13 +1883,23 @@ std::shared_ptr<sirius::io::sirius_ioctx> sirius_scan_manager::ioctx_for_path(st
   return it->second;
 }
 
+void sirius_scan_manager::stop_query_issuance()
+{
+  if (_dispatcher) { _dispatcher->request_stop(); }
+}
+
+void sirius_scan_manager::drain_query_issuance()
+{
+  // Join producers without releasing dependency owners. Device work is drained by the
+  // execution window before reset drops providers and staging.
+  _prefetcher.reset();
+  _dispatcher->wait_for_all();
+}
+
 void sirius_scan_manager::reset()
 {
-  // Stop the prefetcher first: it holds shared_ptrs to the operators'
-  // connectors and must not convert batches while per-query state is torn down.
-  _prefetcher.reset();
-  _dispatcher->request_stop();
-  _dispatcher->wait_for_all();
+  stop_query_issuance();
+  drain_query_issuance();
   _scan_op_order.clear();
   _providers_by_op.clear();
   _pending_mvcc_mask_jobs.clear();

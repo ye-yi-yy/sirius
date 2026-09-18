@@ -272,6 +272,9 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // Plan-copy failures make the query ineligible for GPU execution. Optimizer
   // hooks must not throw, so log a readable message and decline the plan.
   try {
+    // Preserve original evidence even if serialization below fails.
+    conn_state->original_scans = scan::capture_logical_plan(
+      context, *plan, conn_state->planning_generation(), scan::capture_origin::logical_original);
     conn_state->set_captured_plan(copy_logical_plan(*plan, context));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is

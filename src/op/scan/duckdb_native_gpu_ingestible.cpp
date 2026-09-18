@@ -31,8 +31,11 @@
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 
 // duckdb
+#include "scan/source_registry.hpp"
+
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_manager.hpp>
+#include <duckdb/transaction/duck_transaction.hpp>
 
 // cudf
 #include <cudf/table/table.hpp>
@@ -74,8 +77,27 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
   {
     std::vector<std::unique_ptr<scan_info>> emitted;
     auto* scan_info = dynamic_cast<duckdb_native_scan_info*>(info.get());
-    if (scan_info == nullptr) { return emitted; }
+    if (scan_info == nullptr) {
+      throw std::runtime_error("Native coalescer received non-native metadata");
+    }
+    if (scan_info->consumer) {
+      scan_info->validate_slices(scan_info->consumer);
+      if (_consumer && _consumer != scan_info->consumer) {
+        sirius::scan::certificate_failure(_consumer, "coalescing_consumers");
+      }
+      _consumer = scan_info->consumer;
+      _lease    = scan_info->checkpoint_lease;
+    } else if (_consumer) {
+      sirius::scan::certificate_failure(_consumer, "missing_consumer");
+    }
 
+    // Each metadata task may open a distinct byte-source object for the same file.
+    // Keep each certificate attached to the object used by its resulting split.
+    if (_have_template && _datasource && scan_info->datasource &&
+        &_datasource->io_object() != &scan_info->datasource->io_object()) {
+      if (!_acc.empty()) { emitted.push_back(emit_current()); }
+      _have_template = false;
+    }
     if (!_have_template) {
       _datasource    = scan_info->datasource;
       _block_manager = scan_info->block_manager;
@@ -121,10 +143,12 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     // turns an empty row-group list into a schema-correct 0-row table. Without this,
     // zero splits mean zero tasks and the pipeline-completion signal never fires.
     if (!_produced_any && _have_template) {
-      auto split           = std::make_unique<duckdb_native_scan_info>();
-      split->datasource    = _datasource->duplicate();
-      split->block_manager = _block_manager;
-      _produced_any        = true;
+      auto split              = std::make_unique<duckdb_native_scan_info>();
+      split->datasource       = _datasource->duplicate();
+      split->block_manager    = _block_manager;
+      split->consumer         = _consumer;
+      split->checkpoint_lease = _lease;
+      _produced_any           = true;
       out.push_back(std::move(split));
     }
     return out;
@@ -133,10 +157,12 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
  private:
   std::unique_ptr<scan_info> emit_current()
   {
-    auto split           = std::make_unique<duckdb_native_scan_info>();
-    split->row_groups    = std::move(_acc);
-    split->datasource    = _datasource->duplicate();
-    split->block_manager = _block_manager;
+    auto split              = std::make_unique<duckdb_native_scan_info>();
+    split->consumer         = _consumer;
+    split->checkpoint_lease = _lease;
+    split->row_groups       = std::move(_acc);
+    split->datasource       = _datasource->duplicate();
+    split->block_manager    = _block_manager;
     _acc.clear();
     _acc_bytes = 0;
     std::fill(_col_bytes.begin(), _col_bytes.end(), 0);
@@ -144,6 +170,8 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     return split;
   }
 
+  sirius::scan::bound_table_scan_ptr _consumer;
+  std::shared_ptr<sirius::scan::native_checkpoint_lease> _lease;
   const std::size_t _cap;
   const std::vector<bool> _is_varchar;
   const bool _any_varchar;
@@ -180,6 +208,16 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
     throw std::invalid_argument(
       "[duckdb_native_gpu_ingestible] projected_cols and projected_types must be parallel");
   }
+
+  _info->storage_owner = bind.storage->shared_from_this();
+  _info->context_owner = bind.context->shared_from_this();
+  if (!_info->checkpoint_lease) {
+    // Direct native pin population uses the same scoped protection.
+    duckdb::DuckTransaction::Get(*bind.context, bind.storage->GetAttached());
+    _info->checkpoint_lease = std::make_shared<sirius::scan::native_checkpoint_lease>(
+      *bind.storage, 0, sirius::scan::source_registry::get(*bind.context->db).counters);
+  }
+  _info->checkpoint_lease->validate(*bind.storage);
 
   // Phase 1 (serial): PartitionStatistics,
   //                   projected-type gate, and
@@ -264,6 +302,7 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
   auto io_ctx = resolve(_info->db_path);
   // Runs on a scan-manager dispatcher thread:
   return [this, rg_begin, rg_end, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+    validate_dependencies();
     auto range = walk_duckdb_native_row_group_range(_plan, rg_begin, rg_end);
     if (!range.viable) {
       throw std::runtime_error("duckdb-native scan rejected query (range [" +
@@ -274,6 +313,7 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
     split->row_groups    = std::move(range.row_groups);
     split->datasource    = io_ctx->open_datasource(_info->db_path);
     split->block_manager = _block_manager;
+    certify(*split);
     return split;
   };
 }
@@ -281,6 +321,86 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 //===----------------------------------------------------------------------===//
 // materialize_table
 //===----------------------------------------------------------------------===//
+namespace {
+bool same_segments(const std::vector<duckdb_segment_descriptor>& a,
+                   const std::vector<duckdb_segment_descriptor>& b)
+{
+  if (a.size() != b.size()) { return false; }
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const auto& x = a[i];
+    const auto& y = b[i];
+    if (x.block_id != y.block_id || x.segment_start != y.segment_start ||
+        x.segment_count != y.segment_count || x.compression != y.compression ||
+        x.additional_blocks != y.additional_blocks || x.host_ptr != y.host_ptr ||
+        x.bytes_size != y.bytes_size || x.max_string_length != y.max_string_length ||
+        x.all_null != y.all_null || x.segment_stats != y.segment_stats ||
+        (x.block_id >= 0 && x.block_offset != y.block_offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+bool same_native_range(const duckdb_row_group_metadata& a, const duckdb_row_group_metadata& b)
+{
+  if (a.row_group_index != b.row_group_index || a.row_group_start != b.row_group_start ||
+      a.row_count != b.row_count || a.columns.size() != b.columns.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < a.columns.size(); ++i) {
+    const auto& x = a.columns[i];
+    const auto& y = b.columns[i];
+    if (x.is_rowid != y.is_rowid || x.is_array != y.is_array) { return false; }
+    if (x.is_rowid) { continue; }
+    if (x.column_id != y.column_id || !same_segments(x.data_segments, y.data_segments) ||
+        !same_segments(x.validity_segments, y.validity_segments) ||
+        !same_segments(x.array_child_data_segments, y.array_child_data_segments) ||
+        !same_segments(x.array_child_validity_segments, y.array_child_validity_segments)) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
+void duckdb_native_gpu_ingestible::certify(duckdb_native_scan_info& split) const
+{
+  validate_dependencies();
+  split.consumer         = scan_contract();
+  split.checkpoint_lease = _info->checkpoint_lease;
+  if (!split.consumer) { return; }  // Direct pin population has no query consumer.
+  for (auto& group : split.row_groups) {
+    if (group.certificate) { sirius::scan::certificate_failure(split.consumer, "recertification"); }
+    group.certificate = std::make_shared<const sirius::scan::native_slice_certificate>(
+      sirius::scan::native_slice_certificate{
+        split.consumer,
+        split.checkpoint_lease,
+        _info->storage_owner,
+        std::make_shared<const duckdb_row_group_metadata>(group),
+        split.datasource,
+        split.staging_keepalive});
+  }
+}
+
+void duckdb_native_scan_info::validate_slices(
+  const sirius::scan::bound_table_scan_ptr& expected) const
+{
+  sirius::scan::validate_consumer(expected, consumer);
+  if (!checkpoint_lease || checkpoint_lease->block_manager() != block_manager) {
+    sirius::scan::certificate_failure(expected, "native_lease");
+  }
+  checkpoint_lease->validate();
+  for (const auto& group : row_groups) {
+    const auto& cert = group.certificate;
+    if (!cert || cert->consumer != expected || cert->lease != checkpoint_lease || !cert->storage ||
+        !cert->layout || !same_native_range(group, *cert->layout) ||
+        (cert->datasource &&
+         (!datasource || &cert->datasource->io_object() != &datasource->io_object()))) {
+      sirius::scan::certificate_failure(expected, "native_range_or_dependencies");
+    }
+    cert->lease->validate(*cert->storage);
+  }
+}
+
 filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   scan_info const& info,
   ::cucascade::memory::memory_space const& mem_space,
@@ -288,6 +408,8 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   bool /*like_swar_fastpath*/,
   std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
 {
+  validate_dependencies();
+  if (scan_contract()) { info.validate_slices(scan_contract()); }
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
   if (!split.datasource && !split.host_backed_only) {
     throw std::runtime_error("[duckdb_native_gpu_ingestible] scan_info has no datasource");

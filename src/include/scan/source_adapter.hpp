@@ -36,6 +36,7 @@ struct pinned_entry;
 }  // namespace sirius
 
 namespace sirius::scan {
+class query_scan_registry;
 
 struct binding_ref {
   duckdb::DatabaseInstance& database;
@@ -73,6 +74,7 @@ struct runtime_build_request {
                std::reference_wrapper<op::sirius_physical_table_scan>>
     binding;
   const operator_params* params = nullptr;
+  std::shared_ptr<query_scan_registry> window;
 
   duckdb::LogicalGet& logical() const;
   op::sirius_physical_table_scan& physical() const;
@@ -103,9 +105,14 @@ struct source_policy_evidence {
 
 /// Sirius-owned, database-lifetime adapter. Requests are borrowed for one call only.
 /// Verification/capture never bind or perform I/O. Compatibility preflight/runtime retain
-/// existing source behavior; this interface does not claim the deferred R1 barriers/leases.
+/// existing source behavior. The window orders provider preparation before protected construction.
 class scan_source_adapter {
  public:
+  virtual void declare_resources(query_scan_registry&,
+                                 duckdb::ClientContext&,
+                                 const binding_ref&) const
+  {
+  }
   virtual ~scan_source_adapter()                                                          = default;
   virtual const source_profile& profile() const noexcept                                  = 0;
   virtual binding_verification verify_binding(const binding_ref&) const                   = 0;

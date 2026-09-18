@@ -37,6 +37,7 @@
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "scan/binding_audit.hpp"
+#include "scan/plan_evidence.hpp"
 #include "scan/source_policy.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/batch_telemetry.hpp"
@@ -413,6 +414,14 @@ void SiriusContext::begin_execution_window(ClientContext& context,
   // GPU admission runs later, in sirius_engine::initialize_internal().
 }
 
+void SiriusContext::retain_until_query_drain(sirius::query_id_t id,
+                                             std::shared_ptr<void> owner,
+                                             std::function<void()> after_drain)
+{
+  std::lock_guard lock(drain_owners_mutex_);
+  drain_owners_[sirius::value_of(id)].push_back({std::move(owner), std::move(after_drain)});
+}
+
 void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag)
 {
   // Observability inside the cleanup is best-effort: only the mandatory steps
@@ -423,15 +432,15 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   } catch (...) {
   }
 
+  if (scan_manager_) { scan_manager_->stop_query_issuance(); }
+
   // Drop this query's task_creator state FIRST: queued creation requests hold raw operator
   // pointers, and in-flight creation lambdas dereference them. reset() drains those requests and
   // joins that work before returning. Only this query's is touched; other in-flight queries keep
   // creating tasks.
   //
-  // Note the plan those pointers target is ALREADY gone by the time this runs: sirius_engine
-  // owns sirius_owned_plan and is destroyed in sirius_interface::cleanup_internal, which runs
-  // before this window's finish(). So this is not "clean up before the plan dies" — it is
-  // "stop touching a plan that has died".
+  // The engine and its scan window remain in drain_owners_ until the final drain below.
+  // Operator/storage borrows and native leases therefore outlive every queued producer.
   if (task_creator_) { task_creator_->reset(query_id); }
 
   // With the producer stopped, drop whatever it already queued for this query, for the same
@@ -442,6 +451,20 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // tasks hold shared_ptr<data_batch> references to batches we're about to destroy.
   for (auto& executor : downgrade_executors_) {
     executor->drain();
+  }
+
+  if (scan_manager_) { scan_manager_->drain_query_issuance(); }
+  // All launchers have stopped. Join device work before providers, staging and leases can
+  // be released. A failed fence is a mandatory-drain failure and retains those owners.
+  if (memory_manager_) {
+    for (const auto* space :
+         memory_manager_->get_memory_spaces_for_tier(cucascade::memory::Tier::GPU)) {
+      rmm::cuda_set_device_raii device{rmm::cuda_device_id{space->get_device_id()}};
+      const auto status = cudaDeviceSynchronize();
+      if (status != cudaSuccess) {
+        throw ExecutorException("Sirius device drain failed: %s", cudaGetErrorString(status));
+      }
+    }
   }
 
   // Close out batch placements still alive (un-consumed repo contents,
@@ -482,6 +505,22 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // cleared above, so downstream data_batches that referenced sliced
   // host_data_representation are gone before the providers go away.
   if (scan_manager_) { scan_manager_->reset(); }
+  {
+    std::vector<drain_owner> retired;
+    {
+      std::lock_guard lock(drain_owners_mutex_);
+      auto it = drain_owners_.find(sirius::value_of(query_id));
+      if (it != drain_owners_.end()) {
+        retired = std::move(it->second);
+        drain_owners_.erase(it);
+      }
+    }
+    // Destroy runtime/leases outside the map lock, after producers, GPU work and I/O drained.
+    for (auto& entry : retired) {
+      if (entry.after_drain) { entry.after_drain(); }
+    }
+    retired.clear();
+  }
 
   // NOTE: task_creator_->reset(query_id) already ran at the top of this function. That reset is
   // what drops duckdb_scan_task_global_state, which transitively owns a
@@ -964,6 +1003,7 @@ void SiriusContext::terminate()
   cudaDeviceSynchronize();
 
   scan_manager_.reset();
+  drain_owners_.clear();
 
   // Free pinned cuVS indexes and release their GPU reservations while the
   // memory manager is still alive. The device was synchronized just above, so
@@ -1364,8 +1404,24 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   // whose bind_data isn't serializable so plan->Copy() failed), re-plan from
   // the unbound SQL statement — this is what gpu_execution(...) does
   // internally and it works even when LogicalGet::Copy can't.
+  auto originals   = std::make_shared<sirius::scan::original_plan_evidence>();
+  originals->audit = sirius::scan::capture_planning_repeat_audit(context);
+  if (conn_state) { originals->hook = std::move(conn_state->original_scans); }
+  const auto generation = conn_state ? conn_state->planning_generation() : 1;
+  if (prepared.physical_plan) {
+    try {
+      originals->physical =
+        sirius::scan::capture_physical_plan(context, prepared.physical_plan->Root(), generation);
+    } catch (InterruptException&) {
+      throw;
+    } catch (std::exception&) {
+      SIRIUS_LOG_INFO("Scan contract refused: reason=original_capture_incomplete stage=capture");
+    }
+  }
   unique_ptr<LogicalOperator> logical_plan;
   if (conn_state) { logical_plan = conn_state->take_captured_plan_if_current(); }
+  const auto candidate_origin = logical_plan ? sirius::scan::candidate_origin::original_copy_chain
+                                             : sirius::scan::candidate_origin::sql_replan;
   // Try to capture the SQL string while the active query context is alive —
   // PreparedStatementData::unbound_statement isn't populated until *after*
   // OnFinalizePrepare returns (see ClientContext::PrepareInternal in DuckDB).
@@ -1387,7 +1443,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     return RebindQueryInfo::DO_NOT_REBIND;
   };
   // Missing D3 observations keep legacy copy/replan behavior; they do not prove repeat safety.
-  if (sirius::scan::capture_planning_repeat_audit(context).observed_unsafe()) {
+  if (originals->audit.observed_unsafe()) {
     return decline_without_candidate(
       "planning_repeat_unsafe: original binding observed a volatile or modifying operation");
   }
@@ -1468,12 +1524,12 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       plan_is_copyable = false;
     }
     if (plan_is_copyable) {
-      planner.create_plan(std::move(validation_plan));
+      planner.create_plan(std::move(validation_plan), originals, candidate_origin);
     } else {
       // Validate by consuming the freshly re-planned logical_plan; the
       // PhysicalSiriusExecution operator will re-plan again at execute time
       // using the SQL string we cached above.
-      planner.create_plan(std::move(logical_plan));
+      planner.create_plan(std::move(logical_plan), originals, candidate_origin);
       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
     }
 
@@ -1497,6 +1553,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                                                                             prepared.names,
                                                                             cpu_fallback,
                                                                             original_source_policy,
+                                                                            originals,
+                                                                            candidate_origin,
                                                                             0);
     new_physical_plan->SetRoot(sirius_op);
 

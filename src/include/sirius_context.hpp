@@ -25,6 +25,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
+#include "scan/plan_evidence.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
 #include "telemetry/telemetry_context.hpp"
@@ -39,7 +40,9 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <atomic>
+#include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -96,9 +99,13 @@ class SiriusConnectionState : public ClientContextState {
   }
 
   /// A new query on this connection invalidates any leftover capture.
-  void QueryBegin(ClientContext& context) final { captured_plan_.reset(); }
+  void QueryBegin(ClientContext& context) final { clear_captured_plan(); }
 
-  void QueryEnd() final { pinned_update_guard_.reset(); }
+  void QueryEnd() final
+  {
+    pinned_update_guard_.reset();
+    clear_captured_plan();
+  }
 
   [[nodiscard]] bool has_pinned_update_guard() const noexcept
   {
@@ -125,7 +132,7 @@ class SiriusConnectionState : public ClientContextState {
       throw InvalidInputException("Sirius planning generation exhausted");
     }
     ++planning_generation_;
-    captured_plan_.reset();
+    clear_captured_plan();
   }
 
   /// \brief Store the optimizer-hook capture, stamped with the current
@@ -150,7 +157,14 @@ class SiriusConnectionState : public ClientContextState {
 
   /// \brief Drop the capture without touching the generation (used by
   /// OnFinalizePrepare's not-taking-over early-outs).
-  void clear_captured_plan() noexcept { captured_plan_.reset(); }
+  void clear_captured_plan() noexcept
+  {
+    captured_plan_.reset();
+    original_scans.reset();
+  }
+  std::shared_ptr<const sirius::scan::plan_evidence> original_scans;
+  // Context-thread construction guard. Provider SQL must finish before native leases.
+  std::size_t protected_scan_windows = 0;
 
   void set_pending_query_label(std::string label) { pending_query_label_ = std::move(label); }
   [[nodiscard]] std::optional<std::string> take_pending_query_label()
@@ -322,6 +336,10 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Initialize the Sirius context with the given configuration.
   void initialize(const sirius::sirius_config& config);
+  // Register before work starts. Failed mandatory drain retains owners until runtime shutdown.
+  void retain_until_query_drain(sirius::query_id_t id,
+                                std::shared_ptr<void> owner,
+                                std::function<void()> after_drain = {});
 
   /**
    * @brief Suppress QueryBegin/QueryEnd side-effects for internal DuckDB connections.
@@ -336,10 +354,16 @@ class SiriusContext : public ClientContextState {
    * state (Sirius not registered) makes the guard a no-op.
    */
   struct InternalQueryGuard {
-    explicit InternalQueryGuard(ClientContext& context) noexcept
+    explicit InternalQueryGuard(ClientContext& context)
       : state_(get_sirius_connection_state(context))
     {
-      if (state_) { state_->enter_internal_query(); }
+      if (state_) {
+        if (state_->protected_scan_windows != 0) {
+          throw ExecutorException(
+            "Sirius scan contract: internal SQL while native leases are held");
+        }
+        state_->enter_internal_query();
+      }
     }
     ~InternalQueryGuard() noexcept
     {
@@ -727,6 +751,12 @@ class SiriusContext : public ClientContextState {
   std::optional<rmm::host_device_async_resource_ref> prev_pinned_mr_{};
   std::size_t prev_pinned_threshold_{0};
   std::shared_ptr<const sirius::telemetry::telemetry_context> telemetry_context_;
+  std::mutex drain_owners_mutex_;
+  struct drain_owner {
+    std::shared_ptr<void> owner;
+    std::function<void()> after_drain;
+  };
+  std::map<std::uint64_t, std::vector<drain_owner>> drain_owners_;
   /// One data repository manager per in-flight query, keyed by query_id.
   sirius::data::data_repository_manager_registry data_repository_registry_;
   // task_creator_ and downgrade_executors_ borrow this scheduler. terminate() stops their threads

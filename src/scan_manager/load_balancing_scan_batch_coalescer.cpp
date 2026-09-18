@@ -31,7 +31,8 @@ load_balancing_scan_batch_coalescer::register_pipeline(op::scan::sirius_gpu_scan
 {
   if (!scan_op) return nullptr;
 
-  auto connector   = scan_op->get_split_connector().shared_from_this();
+  auto connector = scan_op->get_split_connector().shared_from_this();
+  connector->bind_consumer(scan_op->scan_contract);
   auto ingestible  = scan_op->get_ingestible().shared_from_this();
   auto coalescer   = ingestible->create_batch_coalescer();
   auto uid         = scan_op->get_operator_id();
@@ -95,6 +96,7 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 
   // Balance one coalesced batch onto a GPU and hand it to the connector.
   auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
+    if (batch->consumer) { batch->validate_slices(batch->consumer); }
     auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
     auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
     if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
@@ -191,6 +193,7 @@ void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provid
         // splits fold filter costs into their own estimates. Same fadvise +
         // opportunistic prefetch as the walk path; host-backed splits have
         // no file ranges, so the hints no-op.
+        if (next.scan_info->consumer) { next.scan_info->validate_slices(next.scan_info->consumer); }
         auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.scan_info));
         split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
         std::optional<int> device;

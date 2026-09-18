@@ -27,6 +27,9 @@
 #include <memory>
 
 namespace sirius {
+namespace op::scan {
+class gpu_ingestible;
+}
 namespace op {
 
 class sirius_dynamic_filter_set;
@@ -76,6 +79,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
                              duckdb::vector<duckdb::Value> parameters,
                              duckdb::virtual_column_map_t virtual_columns);
 
+  std::shared_ptr<scan::gpu_ingestible> prepared_runtime;
   //! The table function
   duckdb::TableFunction function;
   //! Bind data of the function

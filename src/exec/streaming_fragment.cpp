@@ -32,6 +32,23 @@ namespace sirius::exec {
 namespace {
 
 constexpr const char* kFragmentQueryLabel = "sirius_streaming_fragment";
+struct fragment_drain_owner {
+  std::shared_ptr<sirius::sirius_engine> engine;
+  duckdb::shared_ptr<stream_bind_catalog> catalog;
+  std::map<stream_id_t, std::uint64_t> declarations;
+  std::weak_ptr<int> lifetime;
+  ~fragment_drain_owner()
+  {
+    engine.reset();
+    if (!lifetime.expired()) { return; }
+    for (const auto& [id, generation] : declarations) {
+      try {
+        catalog->erase(id, generation);
+      } catch (...) {
+      }
+    }
+  }
+};
 
 // Derive a per-key cuDF cast type so independently-planned senders always hash identically.
 // Different planners may bind the same logical column to different native widths (e.g. INT32 vs
@@ -127,6 +144,7 @@ streaming_fragment::~streaming_fragment()
 void streaming_fragment::release_plan() noexcept
 {
   _session = stream_session{};
+  _plan_lifetime.reset();
   _engine.reset();
   _iface.reset();
   _sink_types.clear();
@@ -173,6 +191,7 @@ void streaming_fragment::build(sirius::query_id_t query_id)
     // STREAMING_SINK is a normal unary: subtree in children[] (unlike RESULT_COLLECTOR).
     auto types       = subtree->types;
     auto cardinality = subtree->estimated_cardinality;
+    auto scan_window = subtree->scan_registry;
     _sink_types      = types;  // snapshot before types is moved into the sink constructor
 
     std::vector<std::shared_ptr<cucascade::shared_data_repository>> sink_repos;
@@ -195,7 +214,7 @@ void streaming_fragment::build(sirius::query_id_t query_id)
     // Engine owns the plan; fragment owns the engine so the sink stays pullable after run().
     _iface = std::make_unique<sirius::sirius_interface>(
       _context, std::optional<std::string>(kFragmentQueryLabel));
-    _engine = std::make_unique<sirius::sirius_engine>(_context, *_iface, query_id);
+    _engine = std::make_shared<sirius::sirius_engine>(_context, *_iface, query_id);
     _engine->initialize(std::move(sink));
 
     auto& sink_ref = _engine->sirius_physical_plan->Cast<op::sirius_physical_streaming_sink>();
@@ -212,6 +231,17 @@ void streaming_fragment::build(sirius::query_id_t query_id)
       _session.add_source(id, *built);
     }
 
+    if (auto runtime = _context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+      _plan_lifetime      = std::make_shared<int>(0);
+      auto owner          = std::make_shared<fragment_drain_owner>();
+      owner->engine       = _engine;
+      owner->catalog      = _catalog;
+      owner->declarations = _declared_inputs;
+      owner->lifetime     = _plan_lifetime;
+      runtime->retain_until_query_drain(query_id, owner, [scan_window] {
+        if (scan_window) { scan_window->close(); }
+      });
+    }
     _built = true;
   } catch (...) {
     release_plan();

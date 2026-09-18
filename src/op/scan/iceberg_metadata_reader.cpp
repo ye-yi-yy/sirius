@@ -34,6 +34,7 @@
 #include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <op/scan/puffin_reader.hpp>
+#include <scan/source_registry.hpp>
 #include <sirius_context.hpp>
 
 #include <algorithm>
@@ -44,6 +45,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -620,7 +622,16 @@ namespace {
 
 /// Per-query memo; the wrapper below explains the key and the scope.
 std::mutex g_delete_data_cache_mtx;
-std::unordered_map<std::string, std::shared_ptr<const IcebergDeleteData>> g_delete_data_cache;
+// Typed fields retain path bytes and distinguish connection/statement generations and settings.
+using delete_cache_key = std::tuple<std::uint64_t,
+                                    std::uint64_t,
+                                    std::uint64_t,
+                                    std::uint64_t,
+                                    std::uint64_t,
+                                    std::string,
+                                    std::optional<int64_t>,
+                                    std::optional<bool>>;
+std::map<delete_cache_key, std::shared_ptr<const IcebergDeleteData>> g_delete_data_cache;
 
 /// See the header.
 std::atomic<uint64_t> g_uncached_read_count{0};
@@ -726,10 +737,25 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
   // unset, iceberg_metadata() reads current-snapshot-id from the table metadata, and resolving
   // latest independently disagrees with that after a rollback — filing one snapshot's deletes
   // under another's key.
-  std::string key;
+  delete_cache_key key;
   try {
-    key = std::to_string(context.ActiveTransaction().global_transaction_id) + "|" + table_path +
-          "|" + (snapshot_id.has_value() ? std::to_string(*snapshot_id) : "current");
+    auto state = duckdb::get_sirius_connection_state(context);
+    if (!state || state->current_query_ordinal() == 0) {
+      return read_iceberg_delete_data_uncached(context, table_path, metadata_ioctx, snapshot_id);
+    }
+    duckdb::Value value;
+    std::optional<bool> version_guessing;
+    if (context.TryGetCurrentSetting("unsafe_enable_version_guessing", value) && !value.IsNull()) {
+      version_guessing = value.DefaultCastAs(duckdb::LogicalType::BOOLEAN).GetValue<bool>();
+    }
+    key = {sirius::scan::source_registry::get(*context.db).instance_id(),
+           context.GetConnectionId(),
+           state->current_query_ordinal(),
+           state->planning_generation(),
+           context.ActiveTransaction().global_transaction_id,
+           table_path,
+           snapshot_id,
+           version_guessing};
   } catch (...) {
     // No usable transaction identity: skip the cache rather than key it ambiguously.
     return read_iceberg_delete_data_uncached(context, table_path, metadata_ioctx, snapshot_id);

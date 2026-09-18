@@ -113,7 +113,6 @@ sirius_engine::sirius_engine(duckdb::ClientContext& context,
                              sirius_interface& sirius_iface,
                              sirius::query_id_t query_id)
   : context(context),
-    sirius_iface(sirius_iface),
     query_id_(query_id),
     telemetry_context_(get_telemetry_context_from_client_context(this->context)),
     query_handle_(quent::query::create(

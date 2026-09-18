@@ -215,13 +215,27 @@ In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` 
 
 ### TABLE_SCAN Rewrite
 
-During plan generation, a `TABLE_SCAN` whose source is a supported format is rewritten in place into a single `GPU_SCAN` operator (`sirius_gpu_scan_operator`) that inherits the TABLE_SCAN's tree position and stays the source-leaf of the same pipeline — no separate scan pipeline is created. `GPU_SCAN` is format-agnostic: it owns a pluggable `gpu_ingestible` that knows how to enumerate splits and materialize each split into a `cudf::table`. `wrap_table_scan_source()` (`src/planner/sirius_physical_plan_generator.cpp`) dispatches on the bound table function name:
+During plan generation, a `TABLE_SCAN` whose source is a supported format is rewritten in place into a single `GPU_SCAN` operator (`sirius_gpu_scan_operator`) that inherits the TABLE_SCAN's tree position and stays the source-leaf of the same pipeline — no separate scan pipeline is created. `GPU_SCAN` is format-agnostic: it owns a pluggable `gpu_ingestible` that knows how to enumerate splits and materialize each split into a `cudf::table`. `wrap_table_scan_source()` (`src/planner/sirius_physical_plan_generator.cpp`) resolves a registered source adapter and dispatches through its capabilities.
 
-**Parquet (`parquet_scan` / `read_parquet` / `sirius_read_parquet`, including `s3://` paths):** `build_parquet_table_info()` captures the DuckDB bind data (resolved file paths, hive-partition indices, returned/column/projection ids, table filters) into a `parquet_ingestible_table_info`, builds a parquet ingestible via `make_ingestible()`, and constructs the `GPU_SCAN` operator around it.
+The adapters cover Native, Standard Parquet (both aliases), Sirius-owned Parquet,
+Iceberg and Stream. Each owns its provider-specific verification, capture,
+preflight and runtime construction. Native and file sources use their existing
+`gpu_ingestible`; Stream creates its existing direct source operator. Shared
+planning handles projection, filters, schemas and dynamic-filter wrappers.
 
-**DuckDB-native (`seq_scan` against an attached `.duckdb` file):** `build_duckdb_native_table_info()` resolves the `DuckTableEntry`, fills a `duckdb_native_ingestible_table_info` (storage handle, client context, qualified table identity for the pin cache, projected columns/types, table filters), builds a duckdb-native ingestible via `make_ingestible()`, and constructs the `GPU_SCAN` operator around it.
+The planner captures candidate evidence before lowering consumes bindings.
+Static consumer requirements are saved before filters move. Before native
+runtime construction, all SQL-dependent provider runtimes finish preparation,
+adapters declare their attached databases, and the window acquires checkpoint
+leases. Lowering then freezes one consumer ticket per scan with its final
+logical and physical output layouts. The root retains the window registry
+through mandatory drain; reusable transparent operators retain only original
+evidence and reconstruct fresh contracts on execution.
 
-Any other scan function falls back to CPU: `create_plan(LogicalGet&)` declines it before plan generation reaches the wrap.
+An unsupported adapter or failed verified correspondence declines before GPU
+execution. Standard Parquet and Iceberg retain explicitly unproven compatibility
+behavior until their provider bridges are available; see the
+[framework status](shared-scan-framework.md).
 
 During `prepare_for_query`, `sirius_scan_manager` inspects each `GPU_SCAN` operator's ingestible for a pinned-cache match. A cache miss uses `split_provider`; a cache hit uses `cached_databatch_provider`. The operator keeps its ingestible in both cases. Providers push splits into the connector the operator created at plan time. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
 

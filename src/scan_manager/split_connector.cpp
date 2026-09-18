@@ -30,6 +30,15 @@ split_connector::~split_connector() = default;
 
 void split_connector::push_split(std::unique_ptr<op::operator_data> split)
 {
+  if (_consumer) {
+    const auto* input = dynamic_cast<const op::scan::scan_operator_input*>(split.get());
+    if (!input) { sirius::scan::certificate_failure(_consumer, "input_type"); }
+    if (input->has_scan_metadata()) {
+      input->get_scan_info().validate_slices(_consumer);
+    } else if (!input->is_resident()) {
+      sirius::scan::certificate_failure(_consumer, "empty_input");
+    }
+  }
   assert(split != nullptr && "push_split requires a non-null split");
   // Sized before the lock: a cached-batch split reads its size through the blocking
   // to_read_only(), which waits on a downgrade — under _mutex that stalls every consumer pop.

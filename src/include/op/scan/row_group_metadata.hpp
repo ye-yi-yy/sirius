@@ -17,6 +17,8 @@
 #pragma once
 
 // sirius
+#include "scan/slice_certificate.hpp"
+
 #include <io/sirius_datasource.hpp>
 // cudf
 
@@ -45,6 +47,7 @@ using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
  * cross-depending on each other's headers.
  */
 struct row_group_slice {
+  std::shared_ptr<const sirius::scan::parquet_slice_certificate> certificate;
   row_group_slice(std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata,
                   std::string file_path,
                   std::vector<cudf::size_type> row_group_indices,

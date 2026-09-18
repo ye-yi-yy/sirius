@@ -70,6 +70,9 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
   std::shared_ptr<sirius::op::sirius_dynamic_filter_set> sirius_dynamic_filters;
   std::size_t approximate_batch_size = sirius::config::DEFAULT_SCAN_TASK_BATCH_SIZE;
 
+  std::shared_ptr<sirius::scan::native_checkpoint_lease> checkpoint_lease;
+  duckdb::shared_ptr<duckdb::DataTable> storage_owner;
+  duckdb::shared_ptr<duckdb::ClientContext> context_owner;
   duckdb::DataTable* storage     = nullptr;
   duckdb::ClientContext* context = nullptr;
   std::vector<projected_column> projected_cols;
@@ -114,6 +117,8 @@ class duckdb_native_ingestible_table_info : public op::scan::ingestible_table_in
  */
 class duckdb_native_scan_info : public op::scan::scan_info {
  public:
+  std::shared_ptr<sirius::scan::native_checkpoint_lease> checkpoint_lease;
+  void validate_slices(const sirius::scan::bound_table_scan_ptr&) const override;
   /// Row-group metadata for this unit.
   std::vector<duckdb_row_group_metadata> row_groups;
   /// Read handle for the .db file; prefetched by the sequencer and decoded by materialize.
@@ -165,6 +170,11 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   duckdb_native_gpu_ingestible(std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> info);
 
   ~duckdb_native_gpu_ingestible() override;
+  void validate_dependencies() const override
+  {
+    _info->checkpoint_lease->validate(*_info->storage);
+  }
+  void certify(duckdb_native_scan_info&) const;
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const override;
 

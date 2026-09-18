@@ -18,6 +18,7 @@
 
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/connection.hpp>
+#include <duckdb/transaction/meta_transaction.hpp>
 #include <sirius_context.hpp>
 
 #include <string>
@@ -58,7 +59,7 @@ namespace sirius::op::scan {
 class iceberg_metadata_connection {
  public:
   explicit iceberg_metadata_connection(duckdb::ClientContext& context)
-    : _conn(*context.db), _conn_guard(*_conn.context)
+    : _conn(unsealed_database(context)), _conn_guard(*_conn.context)
   {
     // Session-scoped settings that change which tables are LEGIBLE. Every site that reads Iceberg
     // metadata must agree on this set: if the delete gate and the delete discovery disagree about
@@ -76,16 +77,44 @@ class iceberg_metadata_connection {
         value.DefaultCastAs(duckdb::LogicalType::BOOLEAN).GetValue<bool>();
       _conn.Query(std::string("SET ") + setting + " = " + (outer_effective ? "true" : "false"));
     }
+    auto begin = _conn.Query("BEGIN TRANSACTION READ ONLY");
+    if (begin->HasError()) { begin->ThrowError(); }
+    require_read_only();
+  }
+
+  ~iceberg_metadata_connection()
+  {
+    // End metadata work while its internal-query bracket is still live.
+    try {
+      _conn.Rollback();
+    } catch (...) {
+    }
   }
 
   duckdb::Connection& get() { return _conn; }
 
   duckdb::unique_ptr<duckdb::MaterializedQueryResult> Query(std::string const& sql)
   {
+    require_read_only();
     return _conn.Query(sql);
   }
 
  private:
+  void require_read_only()
+  {
+    if (!_conn.context->ActiveTransaction().IsReadOnly()) {
+      throw duckdb::ExecutorException(
+        "Sirius scan contract: metadata transaction is not read-only");
+    }
+  }
+  static duckdb::DatabaseInstance& unsealed_database(duckdb::ClientContext& context)
+  {
+    auto state = duckdb::get_sirius_connection_state(context);
+    if (state && state->protected_scan_windows != 0) {
+      throw duckdb::ExecutorException("Sirius scan contract: provider SQL after construction seal");
+    }
+    return *context.db;
+  }
   duckdb::Connection _conn;
   // Per-connection bracket. Opening a connection to the same database re-registers the SAME
   // SiriusContext, whose query-lifecycle callbacks would otherwise fire QueryBegin/QueryEnd

@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "scan/scan_contract.hpp"
 #include "scan/source_adapter.hpp"
 
 #include <duckdb/planner/extension_callback.hpp>
@@ -29,6 +30,8 @@ class source_registry final : public duckdb::ExtensionCallback {
                                                   const duckdb::FunctionData* bind_data) const;
   const scan_source_adapter& require(const duckdb::TableFunction& function,
                                      const duckdb::FunctionData* bind_data) const;
+
+  std::shared_ptr<contract_counters> counters = std::make_shared<contract_counters>();
 
  private:
   duckdb::DatabaseInstance& _db;

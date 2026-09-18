@@ -413,6 +413,9 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::get_next_task_input
   auto next = _split_connector->get_next_split();
   if (!next.has_value()) { return nullptr; }
   if (auto* scan_input = dynamic_cast<scan_operator_input*>(next->get()); scan_input) {
+    if (scan_contract && scan_input->has_scan_metadata()) {
+      scan_input->get_scan_info().validate_slices(scan_contract);
+    }
     // Share the operator's "compaction is unprofitable" latch with the split
     // BEFORE any reservation estimate runs: one such batch decides the whole
     // scan (uniform per-batch selectivity), and both the working-set estimator
@@ -449,6 +452,13 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
       std::string(typeid(input_data).name()));
   }
 
+  if (scan_contract) {
+    scan_contract->validate();
+    if (scan_input->has_scan_metadata()) {
+      scan_input->get_scan_info().validate_slices(scan_contract);
+    }
+  }
+  _ingestible->validate_dependencies();
   ::cucascade::memory::memory_space* mem_space = scan_input->gpu_memory_space;
   auto const has_explicit_physical_schema      = has_physical_overrides();
   auto const& targets                          = normalization_targets();

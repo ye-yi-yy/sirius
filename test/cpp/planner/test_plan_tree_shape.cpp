@@ -43,6 +43,7 @@
 #include "op/sirius_physical_projection.hpp"
 #include "planner/gpu_admission.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "scan/scan_contract.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
 
@@ -1285,6 +1286,26 @@ sirius_physical_operator* require_wrap_sidecars(sirius_physical_operator* op,
 
 }  // namespace
 
+namespace {
+
+// These fixtures construct operator-only trees and bypass create_plan. Supply the
+// empty construction window that create_plan normally installs before this phase.
+void insert_synthetic_pipeline_operators(sirius::planner::sirius_physical_plan_generator& gen,
+                                         duckdb::unique_ptr<sirius_physical_operator>& plan)
+{
+  gen.scan_window = std::make_shared<sirius::scan::query_scan_registry>(
+    std::make_shared<sirius::scan::plan_evidence>(),
+    sirius::scan::comparison_result{sirius::scan::comparison_verdict::unproven,
+                                    sirius::scan::correspondence_mode::direct,
+                                    true,
+                                    "synthetic_no_sources"},
+    std::make_shared<sirius::scan::contract_counters>(),
+    sirius::scan::planning_repeat_audit{});
+  gen.insert_gpu_pipeline_operators(plan);
+}
+
+}  // namespace
+
 TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - join-child wrap copies the physical sidecar onto CONCAT and "
                  "PARTITION",
@@ -1299,7 +1320,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     auto plan = make_wrap_hash_join(make_projection_leaf(2, probe_sidecar),
                                     make_projection_leaf(2, build_sidecar));
 
-    gen.insert_gpu_pipeline_operators(plan);
+    insert_synthetic_pipeline_operators(gen, plan);
 
     REQUIRE(plan->type == SiriusPhysicalOperatorType::HASH_JOIN);
     auto* probe_child = require_wrap_sidecars(plan->children[0].get(), probe_sidecar);
@@ -1314,7 +1335,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
   {
     auto plan = make_wrap_hash_join(make_projection_leaf(2), make_projection_leaf(2));
 
-    gen.insert_gpu_pipeline_operators(plan);
+    insert_synthetic_pipeline_operators(gen, plan);
 
     require_wrap_sidecars(plan->children[0].get(), {});
     require_wrap_sidecars(plan->children[1].get(), {});
@@ -1334,7 +1355,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       make_wrap_grouped_aggregate(make_projection_leaf(2, {kInt8, kInt32}));
     plan->set_physical_types(aggregate_sidecar);
 
-    gen.insert_gpu_pipeline_operators(plan);
+    insert_synthetic_pipeline_operators(gen, plan);
 
     REQUIRE(plan->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
     CHECK(plan->get_physical_types() == aggregate_sidecar);
@@ -1352,7 +1373,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     duckdb::unique_ptr<sirius_physical_operator> plan =
       make_wrap_grouped_aggregate(make_projection_leaf(2));
 
-    gen.insert_gpu_pipeline_operators(plan);
+    insert_synthetic_pipeline_operators(gen, plan);
 
     REQUIRE(plan->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY);
     CHECK(!plan->has_physical_overrides());
@@ -1376,7 +1397,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
     delim->children.push_back(make_projection_leaf(1));
     duckdb::unique_ptr<sirius_physical_operator> plan = std::move(delim);
 
-    gen.insert_gpu_pipeline_operators(plan);
+    insert_synthetic_pipeline_operators(gen, plan);
 
     auto& delim_ref = plan->Cast<sirius::op::sirius_physical_delim_join>();
     CHECK_FALSE(delim_ref.declared_output_schema_is_runtime_schema());
@@ -1412,7 +1433,7 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
       duckdb::JoinType::INNER,
       /*estimated_cardinality=*/1);
 
-  gen.insert_gpu_pipeline_operators(plan);
+  insert_synthetic_pipeline_operators(gen, plan);
 
   REQUIRE(plan->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN);
   require_wrap_sidecars(plan->children[0].get(), {});

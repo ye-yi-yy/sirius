@@ -58,6 +58,10 @@ class split_provider;
 class split_connector : public std::enable_shared_from_this<split_connector> {
  public:
   split_connector();
+  void bind_consumer(sirius::scan::bound_table_scan_ptr consumer)
+  {
+    _consumer = std::move(consumer);
+  }
   ~split_connector();
 
   split_connector(const split_connector&)            = delete;
@@ -125,6 +129,7 @@ class split_connector : public std::enable_shared_from_this<split_connector> {
   ///        producers route through the provider's friendship channel.
   void push_split(std::unique_ptr<op::operator_data> split);
 
+  sirius::scan::bound_table_scan_ptr _consumer;
   mutable std::mutex _mutex;
   std::condition_variable _cv;
   std::deque<std::unique_ptr<op::operator_data>> _splits;

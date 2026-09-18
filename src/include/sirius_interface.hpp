@@ -45,7 +45,7 @@ struct sirius_active_query_context {
   //! Prepared statement data
   duckdb::shared_ptr<sirius_prepared_statement_data> sirius_prepared;
   //! The query executor
-  duckdb::unique_ptr<sirius_engine> engine;
+  std::shared_ptr<sirius_engine> engine;
   //! The progress bar
   duckdb::unique_ptr<duckdb::ProgressBar> progress_bar;
 

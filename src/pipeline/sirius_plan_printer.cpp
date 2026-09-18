@@ -661,6 +661,21 @@ std::string sirius_plan_printer::render_dag() const
 // render: combined view
 // ============================================================================
 
-std::string sirius_plan_printer::render() const { return render_pipelines() + "\n" + render_dag(); }
+std::string sirius_plan_printer::render() const
+{
+  std::string result = render_pipelines() + "\n" + render_dag();
+  std::set<std::uint64_t> seen;
+  for (const auto& pipeline : pipelines_) {
+    for (const auto& entry : pipeline->get_operators()) {
+      const auto& op = entry.get();
+      if (op.scan_contract && seen.insert(op.scan_contract->handle).second) {
+        const auto comparison =
+          op.scan_registry ? op.scan_registry->comparison() : scan::comparison_result{};
+        result += "\n" + scan::contract_summary(*op.scan_contract, comparison);
+      }
+    }
+  }
+  return result;
+}
 
 }  // namespace sirius::pipeline

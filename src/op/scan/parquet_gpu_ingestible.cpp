@@ -253,7 +253,18 @@ class parquet_batch_coalescer : public batch_coalescer {
   {
     std::vector<std::unique_ptr<scan_info>> emitted;
     auto* file = dynamic_cast<parquet_file_scan_info*>(info.get());
-    if (file == nullptr) { return emitted; }
+    if (file == nullptr) {
+      throw std::runtime_error("Parquet coalescer received non-Parquet metadata");
+    }
+    if (file->consumer) {
+      file->validate_slices(file->consumer);
+      if (_consumer && _consumer != file->consumer) {
+        sirius::scan::certificate_failure(_consumer, "coalescing_consumers");
+      }
+      _consumer = file->consumer;
+    } else if (_consumer) {
+      sirius::scan::certificate_failure(_consumer, "missing_consumer");
+    }
 
     // Remember the first fully-pruned file. If the WHOLE source coalesces to
     // nothing, flush() emits one empty split built from it — zero splits mean
@@ -267,7 +278,8 @@ class parquet_batch_coalescer : public batch_coalescer {
                          : std::shared_ptr<io::sirius_datasource>{},
         file->partition_values,
         file->disable_filter_pushdown,
-        file->reader_options};
+        file->reader_options,
+        file->certificate};
     }
 
     if (!_slices.empty() && (_partition_values != file->partition_values ||
@@ -300,6 +312,12 @@ class parquet_batch_coalescer : public batch_coalescer {
                            cur_working,
                            cur_comp,
                            std::move(slice_ds));
+      if (file->certificate) {
+        auto& slice       = _slices.back();
+        slice.certificate = std::make_shared<const sirius::scan::parquet_slice_certificate>(
+          sirius::scan::parquet_slice_certificate{
+            file->certificate, slice.row_group_indices, slice.datasource});
+      }
       _produced_any = true;
       _acc_working_bytes += cur_working;
       _acc_rows += cur_rows;
@@ -350,6 +368,12 @@ class parquet_batch_coalescer : public batch_coalescer {
                            /*estimated_decode_working_bytes=*/0,
                            /*reserved_compressed_bytes=*/0,
                            _empty_split_fallback->datasource);
+      if (_empty_split_fallback->certificate) {
+        auto& slice       = _slices.back();
+        slice.certificate = std::make_shared<const sirius::scan::parquet_slice_certificate>(
+          sirius::scan::parquet_slice_certificate{
+            _empty_split_fallback->certificate, {}, slice.datasource});
+      }
       _partition_values   = _empty_split_fallback->partition_values;
       _disable_pushdown   = _empty_split_fallback->disable_filter_pushdown;
       _run_reader_options = _empty_split_fallback->reader_options;
@@ -363,6 +387,7 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::unique_ptr<scan_info> emit_current()
   {
     auto split                     = std::make_unique<parquet_split_info>();
+    split->consumer                = _consumer;
     split->rg_slices               = std::move(_slices);
     split->reader_options          = _run_reader_options ? _run_reader_options : _reader_options;
     split->plan                    = _plan;
@@ -375,6 +400,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     return split;
   }
 
+  sirius::scan::bound_table_scan_ptr _consumer;
   const std::size_t _cap;
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
   std::shared_ptr<scan_plan const> _plan;
@@ -399,6 +425,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     std::vector<std::string> partition_values;
     bool disable_filter_pushdown;
     std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
+    std::shared_ptr<const sirius::scan::parquet_file_certificate> certificate;
   };
   std::optional<fallback_file> _empty_split_fallback;
   bool _produced_any = false;
@@ -440,6 +467,48 @@ void canonicalize_scan_file_paths(std::vector<std::string>& paths)
 //===----------------------------------------------------------------------===//
 // scan_info fadvise_entries — prefetch byte ranges
 //===----------------------------------------------------------------------===//
+void parquet_file_scan_info::validate_slices(
+  const sirius::scan::bound_table_scan_ptr& expected) const
+{
+  sirius::scan::validate_consumer(expected, consumer);
+  if (!certificate || certificate->consumer != expected || !certificate->inventory ||
+      certificate->occurrence >= certificate->inventory->size() ||
+      certificate->inventory->at(certificate->occurrence) != file_path ||
+      certificate->footer != file_metadata || certificate->options != reader_options ||
+      row_groups.size() != certificate->allowed_row_groups.size()) {
+    sirius::scan::certificate_failure(expected, "file_dependencies");
+  }
+  for (std::size_t i = 0; i < row_groups.size(); ++i) {
+    if (row_groups[i].index != certificate->allowed_row_groups[i]) {
+      sirius::scan::certificate_failure(expected, "file_ranges");
+    }
+  }
+}
+
+void parquet_split_info::validate_slices(const sirius::scan::bound_table_scan_ptr& expected) const
+{
+  sirius::scan::validate_consumer(expected, consumer);
+  if (rg_slices.empty()) { sirius::scan::certificate_failure(expected, "missing_parquet_slices"); }
+  for (const auto& slice : rg_slices) {
+    const auto& cert = slice.certificate;
+    if (!cert || !cert->file || cert->file->consumer != expected || !cert->file->inventory ||
+        cert->file->occurrence >= cert->file->inventory->size() ||
+        cert->file->inventory->at(cert->file->occurrence) != slice.file_path ||
+        !slice.file_metadata || cert->file->footer != slice.file_metadata ||
+        cert->datasource != slice.datasource || cert->row_groups != slice.row_group_indices ||
+        cert->file->options != reader_options || cert->file->plan != plan) {
+      sirius::scan::certificate_failure(expected, "parquet_dependencies");
+    }
+    for (auto index : slice.row_group_indices) {
+      if (index < 0 || static_cast<std::size_t>(index) >= slice.file_metadata->row_groups.size() ||
+          !std::binary_search(
+            cert->file->allowed_row_groups.begin(), cert->file->allowed_row_groups.end(), index)) {
+        sirius::scan::certificate_failure(expected, "parquet_ranges");
+      }
+    }
+  }
+}
+
 std::vector<scan_info::fadvise_entry> parquet_file_scan_info::fadvise_entries() const
 {
   if (!file_metadata || !reader_options) { return {}; }
@@ -618,7 +687,7 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
     _sirius_dynamic_filters->ignore_columns(partition_cols);
   }
 
-  _file_paths = bind.resolved_file_paths;
+  _file_paths = std::make_shared<const std::vector<std::string>>(bind.resolved_file_paths);
 }
 
 parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
@@ -637,7 +706,7 @@ std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer(
 //===----------------------------------------------------------------------===//
 bool parquet_gpu_ingestible::has_processed_all_metadata() const
 {
-  return _next_file_idx.load(std::memory_order_relaxed) >= _file_paths.size();
+  return _next_file_idx.load(std::memory_order_relaxed) >= _file_paths->size();
 }
 
 std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::next_split_provider(
@@ -645,17 +714,17 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 {
   if (!resolve) { throw std::runtime_error("parquet_gpu_ingestible: no scan_manager is wired."); }
   auto const idx = _next_file_idx.fetch_add(1, std::memory_order_relaxed);
-  if (idx >= _file_paths.size()) { return nullptr; }  // lost the race for the final file
+  if (idx >= _file_paths->size()) { return nullptr; }  // lost the race for the final file
 
   // Route each file to its own backend (s3:// -> rest, local -> uring/kvikio) so a
   // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
   // per file; row-group chunking and file bundling happen downstream in
   // parquet_batch_coalescer.
-  auto const& file_path = _file_paths[idx];
+  auto const& file_path = _file_paths->at(idx);
   // The resolver returns a valid ioctx or throws if no backend supports the path.
   auto io_ctx = resolve(file_path);
-  return [this, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
-    return build_file_scan_info(file_path, io_ctx);
+  return [this, idx, file_path, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
+    return build_file_scan_info(idx, file_path, io_ctx);
   };
 }
 
@@ -663,7 +732,9 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path, std::shared_ptr<io::sirius_ioctx> const& io_ctx)
+  std::size_t occurrence,
+  std::string const& file_path,
+  std::shared_ptr<io::sirius_ioctx> const& io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
@@ -787,7 +858,9 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // (which fall back to the parquet encoded-uncompressed size in rg_contribution).
   std::vector<std::size_t> selected_chunk_decoded_width;
   std::unordered_set<std::size_t> pure_filter_chunk_indices;
-  if (file_projected) {
+  // A schema-only file has no column chunks to account for. Its empty split
+  // still derives the projected schema from the reader options and scan plan.
+  if (file_projected && !metadata.row_groups.empty()) {
     auto const pure_filter_positions = _plan->pure_filter_batch_positions();
     bool has_data_output             = false;
     for (auto const& output : _plan->output_layout) {
@@ -1049,7 +1122,18 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   out->partition_values = std::move(partition_values);
-
+  out->consumer         = scan_contract();
+  if (out->consumer) {
+    out->certificate = std::make_shared<const sirius::scan::parquet_file_certificate>(
+      sirius::scan::parquet_file_certificate{out->consumer,
+                                             _file_paths,
+                                             occurrence,
+                                             file_metadata,
+                                             row_group_indices,
+                                             out->reader_options,
+                                             _plan,
+                                             visibility_dependencies()});
+  }
   return out;
 }
 

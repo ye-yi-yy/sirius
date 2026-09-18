@@ -483,6 +483,8 @@ class sirius_scan_manager {
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
   void reset();
+  void stop_query_issuance();
+  void drain_query_issuance();
 
   /// \brief Start the worker thread pool. Idempotent.
   void start();

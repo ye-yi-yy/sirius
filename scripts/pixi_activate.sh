@@ -20,7 +20,10 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cmake_presets_src="$project_root/cmake/CMakePresets.json"
 cmake_presets_dst="$project_root/duckdb/CMakePresets.json"
 
-rm -f "$project_root/duckdb/CMakeUserPresets.json"
-ln -sf "$cmake_presets_src" "$cmake_presets_dst"
+# Keep an already-correct link intact, including across concurrent activations.
+if [[ ! "$cmake_presets_dst" -ef "$cmake_presets_src" ]]; then
+  rm -f "$project_root/duckdb/CMakeUserPresets.json"
+  ln -sf "$cmake_presets_src" "$cmake_presets_dst"
+fi
 
 mkdir -p build

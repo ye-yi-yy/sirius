@@ -17,6 +17,7 @@
 #pragma once
 
 #include "helper/logical_type.hpp"
+#include "scan/slice_certificate.hpp"
 
 #include <cudf/types.hpp>
 
@@ -101,6 +102,7 @@ struct duckdb_column_metadata {
 };
 
 struct duckdb_row_group_metadata {
+  std::shared_ptr<const sirius::scan::native_slice_certificate> certificate;
   duckdb::idx_t row_group_index;
   /// Absolute row index of the row group's first row.
   duckdb::idx_t row_group_start;

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/sirius_physical_operator.hpp"
+#include "scan/plan_evidence.hpp"
 #include "scan/source_policy.hpp"
 
 #include <duckdb/common/enums/physical_operator_type.hpp>
@@ -48,6 +49,8 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
                           duckdb::vector<std::string> names,
                           duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
                           scan::source_policy cpu_source_policy,
+                          std::shared_ptr<const scan::original_plan_evidence> originals,
+                          scan::candidate_origin origin,
                           duckdb::idx_t estimated_cardinality);
 
   // Source operator interface
@@ -93,6 +96,8 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
 
   /// Immutable source policy captured from the original CPU plan before any candidate replan.
   const scan::source_policy cpu_source_policy_;
+  const std::shared_ptr<const scan::original_plan_evidence> originals_;
+  const scan::candidate_origin origin_;
 };
 
 }  // namespace sirius::transparent

@@ -110,6 +110,7 @@ bool sirius_physical_streaming_source::all_ports_empty() { return _input->draine
 
 std::unique_ptr<operator_data> sirius_physical_streaming_source::get_next_task_input_data()
 {
+  if (scan_contract) { scan_contract->validate(); }
   auto batch = _input->try_pull();
   if (!batch) return nullptr;
 
@@ -120,6 +121,7 @@ std::unique_ptr<operator_data> sirius_physical_streaming_source::get_next_task_i
 std::unique_ptr<operator_data> sirius_physical_streaming_source::execute(
   const operator_data& input, rmm::cuda_stream_view /*stream*/)
 {
+  if (scan_contract) { scan_contract->validate(); }
   const auto& pod = dynamic_cast<const pipelineable_operator_data&>(input);
   return std::make_unique<pipelineable_operator_data>(pod.get_data_batches());
 }

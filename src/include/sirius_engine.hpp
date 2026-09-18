@@ -68,7 +68,6 @@ class sirius_engine {
   [[nodiscard]] sirius::query_id_t query_id() const noexcept { return query_id_; }
 
   duckdb::ClientContext& context;
-  sirius_interface& sirius_iface;
   duckdb::unique_ptr<op::sirius_physical_operator> sirius_owned_plan;
   duckdb::optional_ptr<op::sirius_physical_operator> sirius_physical_plan;
 
@@ -115,9 +114,8 @@ class sirius_engine {
   /// nothing to gain.
   duckdb::shared_ptr<planner::query> query_;
   /// This query's completion signal, created in execute() and shared with every task through
-  /// its pipeline's global state. shared_ptr because this engine is destroyed (in
-  /// sirius_interface::cleanup_internal) before the query's cleanup drains the task queues, so a
-  /// task still unwinding must be able to report without touching freed memory.
+  /// its pipeline's global state. The execution window retains the engine through mandatory
+  /// drain; tasks also own the signal while reporting completion.
   std::shared_ptr<pipeline::completion_handler> completion_handler_;
   std::shared_ptr<const telemetry::telemetry_context> telemetry_context_;
   rust::Box<quent::query::QueryHandle> query_handle_;

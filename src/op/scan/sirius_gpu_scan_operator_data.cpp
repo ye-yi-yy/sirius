@@ -118,6 +118,9 @@ membership_snapshot snapshot_membership_probes(sirius::op::sirius_dynamic_filter
 void scan_operator_input::prepare_for_processing(
   const ::cucascade::memory::memory_space* requested_memory_space, rmm::cuda_stream_view stream)
 {
+  if (has_scan_metadata() && get_scan_info().consumer) {
+    get_scan_info().validate_slices(get_scan_info().consumer);
+  }
   gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   if (!std::holds_alternative<std::shared_ptr<cucascade::data_batch>>(materialization_info)) {
     prefetch(io::cache::prefetching_stage::just_in_time);

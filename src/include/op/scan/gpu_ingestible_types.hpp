@@ -24,6 +24,7 @@
 #include <vector>
 
 #pragma once
+#include "scan/scan_contract.hpp"
 
 namespace sirius::op::scan {
 
@@ -89,6 +90,11 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
   };
 
   virtual ~scan_info() = default;
+  sirius::scan::bound_table_scan_ptr consumer;
+  virtual void validate_slices(const sirius::scan::bound_table_scan_ptr& expected) const
+  {
+    if (expected) { sirius::scan::certificate_failure(expected, "uncertified_materializer"); }
+  }
 
   virtual std::vector<fadvise_entry> fadvise_entries() const { return {}; }
 

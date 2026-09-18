@@ -308,6 +308,8 @@ set(EXTENSION_SOURCES
     src/scan/source_policy.cpp
     src/scan/bound_read_view.cpp
     src/scan/binding_audit.cpp
+    src/scan/plan_evidence.cpp
+    src/scan/scan_contract.cpp
     src/exec/stream_bind_catalog.cpp
     src/exec/stream_plan_bindings.cpp
     src/exec/streaming_fragment.cpp

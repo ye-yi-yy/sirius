@@ -23,6 +23,7 @@
 #include "late_mat/defer_directive.hpp"
 #include "memory/size_arithmetic.hpp"
 #include "op/sirius_physical_operator_type.hpp"
+#include "scan/scan_contract.hpp"
 #include "sirius/exception.hpp"
 #include "telemetry-bridge/gen/uuid.rs.h"
 
@@ -444,6 +445,11 @@ class sirius_physical_operator {
   std::mutex lock;
 
  public:
+  // Present on planner-created scan leaves; the root retains the execution registry.
+  std::optional<duckdb::idx_t> scan_occurrence_index;
+  std::shared_ptr<sirius::scan::consumer_requirements> pending_scan_requirements;
+  sirius::scan::bound_table_scan_ptr scan_contract;
+  std::shared_ptr<sirius::scan::query_scan_registry> scan_registry;
   virtual std::string get_name() const;
 
   virtual std::string params_to_string() const { return ""; }

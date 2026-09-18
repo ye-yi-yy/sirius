@@ -2,6 +2,26 @@
 
 This document covers the scan subsystem end-to-end: how data enters Super Sirius from storage through the unified GPU scan operator and its per-format `gpu_ingestible` sources, the scan manager that produces and balances scan splits, pinned-table caching, GPU decode of DuckDB-native storage, and the Sirius IO layer underneath.
 
+## Binding and runtime contracts
+
+The five source families enter through registered adapters. The shared framework
+captures original/candidate read views, assigns one immutable ticket per source,
+and retains a registry for each validation or execution window. Standard Parquet
+and Iceberg preserve their existing implementations through explicit unverified
+compatibility profiles; missing provider or DuckDB audit evidence is not promoted
+to verified admission.
+
+Fresh native and Parquet splits carry per-slice certificates through coalescing,
+prefetch and decode. Native storage is protected by a window-owned checkpoint
+lease; Parquet certificates retain file occurrences, metadata and byte-source
+owners. Iceberg also retains the existing delete-data owner. Resident pinned
+batches keep their existing validation, while Stream has a binding contract
+without a file-split path. Runtime owners survive mandatory drain; successful
+drain closes tickets and releases leases before CPU replay or external results.
+
+See [Shared Scan Framework](shared-scan-framework.md) for construction order,
+compatibility limits and the remaining external bridge TODOs.
+
 ## Overview
 
 The GPU scan path is a single unified source operator, `sirius_gpu_scan_operator` (physical type `GPU_SCAN`). It carries no format-specific code: it pulls pre-built splits off a `split_connector` and delegates per-split materialization to an installed **`gpu_ingestible`**. One `gpu_ingestible` implementation exists per source format:

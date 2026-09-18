@@ -66,6 +66,7 @@ class sirius_physical_plan_generator {
   explicit sirius_physical_plan_generator(duckdb::ClientContext& context);
   ~sirius_physical_plan_generator();
 
+  std::shared_ptr<scan::query_scan_registry> scan_window;
   duckdb::LogicalDependencyList dependencies;
   //! Recursive CTEs require at least one ChunkScan, referencing the working_table.
   //! This data structure is used to establish it.
@@ -86,7 +87,9 @@ class sirius_physical_plan_generator {
   //! Creates a plan from the logical operator. This involves resolving column bindings and
   //! generating physical operator nodes.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
-    duckdb::unique_ptr<duckdb::LogicalOperator> logical);
+    duckdb::unique_ptr<duckdb::LogicalOperator> logical,
+    std::shared_ptr<const scan::original_plan_evidence> originals = nullptr,
+    scan::candidate_origin origin                                 = scan::candidate_origin::direct);
 
   //! Whether or not we can (or should) use a batch-index based operator for executing the given
   //! sink

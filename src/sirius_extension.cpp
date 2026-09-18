@@ -109,6 +109,7 @@ extern "C" int cudaProfilerStop();
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "pin_table.hpp"
 #include "scan/bound_schema.hpp"
+#include "scan/source_registry.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
@@ -1396,7 +1397,9 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (block_manager == nullptr) {
       throw InvalidInputException("pin_table: DuckDB-native pins require a single-file database");
     }
-    duckdb_pin_checkpoint_iteration = block_manager->GetCheckpointIteration();
+    info->checkpoint_lease = std::make_shared<sirius::scan::native_checkpoint_lease>(
+      *info->storage, 0, sirius::scan::source_registry::get(*context.db).counters);
+    duckdb_pin_checkpoint_iteration = info->checkpoint_lease->iteration();
     ingestible                      = sirius::op::scan::make_ingestible(std::move(info));
   } else {  // parquet
     auto& fs   = FileSystem::GetFileSystem(context);
@@ -1413,6 +1416,10 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
       build_parquet_pin_info(scan_mgr, file_paths, data.args.cols, batch_size, pinned_column_types);
     ingestible = sirius::op::scan::make_ingestible(std::move(info));
   }
+
+  // Pin population can launch device work. Retain its native lease and storage through
+  // mandatory drain on both success and unwinding; resident cache entries do not own this lease.
+  sirius_ctx->retain_until_query_drain(window.query_id(), ingestible);
 
   auto const& pin_op_params      = sirius_ctx->get_config().get_operator_params();
   bool const capture_chunk_stats = pin_op_params.enable_pinned_zone_map_pruning;

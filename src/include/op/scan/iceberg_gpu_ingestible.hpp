@@ -63,6 +63,7 @@ class iceberg_gpu_ingestible : public parquet_gpu_ingestible {
   explicit iceberg_gpu_ingestible(std::unique_ptr<iceberg_ingestible_table_info> info);
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const override;
+  std::shared_ptr<const void> visibility_dependencies() const override { return _delete_data; }
 
   filtered_table materialize_metadata_to_table(
     scan_info const& info,

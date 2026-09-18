@@ -22,6 +22,8 @@
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "scan/scan_contract.hpp"
+#include "scan/source_registry.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
@@ -115,9 +117,20 @@ class native_source_adapter final : public detail::factory_source_adapter {
                               dynamic_filter_mode::post_decode,
                               byte_source_class::native_storage,
                               true,
-                              false},
+                              false,
+                              true,
+                              scan_runtime_form::ingestible,
+                              true},
                              duckdb::TableScanFunction::GetFunction())
   {
+  }
+
+  void declare_resources(query_scan_registry& window,
+                         duckdb::ClientContext& context,
+                         const binding_ref& binding) const override
+  {
+    const auto& bind = static_cast<const duckdb::TableScanBindData&>(*binding.data);
+    window.declare_native(context, bind.table.Cast<duckdb::DuckTableEntry>().GetStorage());
   }
 
   bool valid_payload(const binding_ref& binding) const override
@@ -144,6 +157,13 @@ class native_source_adapter final : public detail::factory_source_adapter {
 
   source_preflight_result preflight_source(const source_preflight_request& request) const override
   {
+    const auto& native_bind = static_cast<const duckdb::TableScanBindData&>(*request.get.bind_data);
+    auto& native_storage    = native_bind.table.Cast<duckdb::DuckTableEntry>().GetStorage();
+    duckdb::DuckTransaction::Get(request.context, native_storage.GetAttached());
+    // The early pin/codec probe borrows storage only within this scope. The final runtime
+    // acquires the shared window lease after all providers finish their metadata SQL.
+    native_checkpoint_lease probe(
+      native_storage, 0, source_registry::get(*request.context.db).counters);
     auto& op                                 = request.get;
     auto& context                            = request.context;
     auto* sirius_state                       = request.sirius_state;
@@ -360,9 +380,13 @@ class native_source_adapter final : public detail::factory_source_adapter {
 
   scan_runtime_handle create_scan_runtime(const runtime_build_request& request) const override
   {
-    return detail::make_ingestible_runtime(
-      build_duckdb_native_table_info(request.physical(), request.parameters(), request.context),
-      request);
+    auto info =
+      build_duckdb_native_table_info(request.physical(), request.parameters(), request.context);
+    if (!request.window) {
+      throw duckdb::InternalException("Native runtime requires a construction window");
+    }
+    info->checkpoint_lease = request.window->lease_for(*info->storage);
+    return detail::make_ingestible_runtime(std::move(info), request);
   }
   source_policy_evidence inspect_source(const binding_ref&) const override { return {}; }
 };
