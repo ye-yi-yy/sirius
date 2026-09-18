@@ -72,10 +72,14 @@ than `:latest` so the same Sirius commit is reproducible over time:
 
 | image | tag |
 |---|---|
-| `minio/minio` | `RELEASE.2025-09-07T16-13-09Z-cpuv1` |
+| `quay.io/minio/minio` | `RELEASE.2025-09-07T16-13-09Z-cpuv1` |
 
-To bump it, edit `kMinioImage` in `test/cpp/utils/s3_container.cpp` and confirm
-`make s3-test` still passes.
+The image comes from MinIO's [official Quay registry](https://github.com/minio/minio/blob/master/docs/docker/README.md).
+The fully qualified registry path avoids resolving `minio/minio` against Docker Hub.
+
+To bump it, edit `kMinioImage` in `test/cpp/utils/s3_container.cpp`, rebuild
+`sirius_unittest`, and confirm `make s3-test` still passes. The `s3-test` target
+runs the existing binary without rebuilding it.
 
 ## Fixtures
 

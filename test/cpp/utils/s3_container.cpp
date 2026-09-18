@@ -76,9 +76,9 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Pinned MinIO image — kept in sync with the (now-retired) docker-compose.yml so
-// the same Sirius commit produces reproducible S3 test behavior over time.
-constexpr char const* kMinioImage = "minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1";
+// Use MinIO's official Quay registry and pin the release tag so the same Sirius
+// commit produces reproducible S3 test behavior over time.
+constexpr char const* kMinioImage = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1";
 constexpr int kMinioPort          = 9000;
 constexpr char const* kAccessKey  = "minioadmin";
 constexpr char const* kSecretKey  = "minioadmin";
