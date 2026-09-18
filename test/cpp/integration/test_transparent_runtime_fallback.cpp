@@ -294,17 +294,18 @@ TEST_CASE_METHOD(RuntimeFallbackFixture,
   create_table("CREATE TABLE rf_basic AS SELECT i AS id, i * 2 AS val FROM range(1000) t(i);");
   const std::string q = "SELECT count(*) AS n, sum(val) AS s FROM rf_basic WHERE val > 100;";
 
-  // With injection: GPU is attempted (rebind + execution), fails, falls back to CPU.
-  inject();
+  REQUIRE_FALSE(con->Query("SET sirius_test_inject_native_walk_failure=true;")->HasError());
   auto before = sirius::test::get_transparent_execution_stats(*con);
   auto gpu    = con->Query(q);
   REQUIRE(gpu);
   REQUIRE_FALSE(gpu->HasError());
   auto after = sirius::test::get_transparent_execution_stats(*con);
   sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1, 1);
+  REQUIRE(after.execution_rebuilds == before.execution_rebuilds);
+  REQUIRE(after.lease_held_at_replay == before.lease_held_at_replay);
+  REQUIRE_FALSE(con->Query("FORCE CHECKPOINT;")->HasError());
 
-  // Same query with no injection runs fully on the GPU (no runtime fallback).
-  clear_injection();
+  REQUIRE_FALSE(con->Query("SET sirius_test_inject_native_walk_failure=false;")->HasError());
   before    = sirius::test::get_transparent_execution_stats(*con);
   auto gpu2 = con->Query(q);
   REQUIRE(gpu2);

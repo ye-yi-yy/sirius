@@ -29,7 +29,8 @@ class source_registry final : public duckdb::ExtensionCallback {
   [[nodiscard]] const scan_source_adapter* lookup(const duckdb::TableFunction& function,
                                                   const duckdb::FunctionData* bind_data) const;
   const scan_source_adapter& require(const duckdb::TableFunction& function,
-                                     const duckdb::FunctionData* bind_data) const;
+                                     const duckdb::FunctionData* bind_data,
+                                     scan_attempt_diagnostics* diagnostics = nullptr) const;
 
   std::shared_ptr<contract_counters> counters = std::make_shared<contract_counters>();
 

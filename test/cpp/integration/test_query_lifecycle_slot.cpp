@@ -1785,6 +1785,7 @@ void run_ac11_planning_error_retry(duckdb::Connection& connection,
 struct ac12_operator_window {
   std::vector<std::uint64_t> operator_ids;
   bool saw_runtime_plan_creation = false;
+  bool saw_runtime_plan_reuse    = false;
   bool saw_query_plan            = false;
   std::string outcome;
 };
@@ -1833,6 +1834,9 @@ bool parse_ac12_operator_windows(std::vector<std::string> const& lines,
       if (line.find("Creating sirius physical plan") != std::string::npos) {
         window.saw_runtime_plan_creation = true;
       }
+      if (line.find("reusing finalize-validated Sirius plan") != std::string::npos) {
+        window.saw_runtime_plan_reuse = true;
+      }
       if (line.find("Query Plan:") != std::string::npos) { window.saw_query_plan = true; }
       if (line.find("=== Pipeline Overview ===") != std::string::npos) {
         in_pipeline_overview = true;
@@ -1868,7 +1872,11 @@ void run_ac12_operator_ids(duckdb::Connection& connection,
   }
 
   auto prepared = connection.Prepare("SELECT sum(i) FROM ac12_operator_ids;");
-  if (!require_success(prepared.get(), "AC-12 Prepare", out)) { return; }
+  if (!require_success(prepared.get(), "AC-12 Prepare", out) ||
+      !run_statement(
+        connection, "FORCE CHECKPOINT;", "AC-12 idle prepared checkpoint", out.error)) {
+    return;
+  }
   std::vector<std::string> before_lines;
   if (!read_variant_log_lines(before_lines, out.error)) { return; }
 
@@ -1876,13 +1884,31 @@ void run_ac12_operator_ids(duckdb::Connection& connection,
   auto const stats_before = context->get_transparent_execution_stats();
   mark_workload_started(output_path, out);
   auto const expected = range_sum(kCount);
-  if (!run_prepared_scalar(*prepared, expected, "AC-12 first Execute", out.error) ||
-      !run_prepared_scalar(*prepared, expected, "AC-12 second Execute", out.error)) {
+  if (!run_prepared_scalar(*prepared, expected, "AC-12 first Execute", out.error)) { return; }
+  if (context->get_transparent_execution_stats().execution_rebuilds !=
+      stats_before.execution_rebuilds) {
+    out.error = "AC-12 rebuilt an unchanged finalize-validated plan";
+    return;
+  }
+  if (!run_statement(connection,
+                     "SET sirius_test_inject_pin_registry_change=true;",
+                     "AC-12 change pin epoch",
+                     out.error) ||
+      !run_prepared_scalar(*prepared, expected, "AC-12 second Execute", out.error) ||
+      !run_statement(connection,
+                     "SET sirius_test_inject_pin_registry_change=false;",
+                     "AC-12 clear pin epoch injection",
+                     out.error)) {
     return;
   }
   auto const stats_after = context->get_transparent_execution_stats();
   if (!require_transparent_execution_delta(
         stats_before, stats_after, 2, "AC-12 repeated execution", out.error)) {
+    return;
+  }
+  if (stats_after.execution_rebuilds != stats_before.execution_rebuilds + 1 ||
+      stats_after.lease_held_at_replay != stats_before.lease_held_at_replay) {
+    out.error = "AC-12 did not rebuild exactly once after pin invalidation";
     return;
   }
 
@@ -1902,14 +1928,20 @@ void run_ac12_operator_ids(duckdb::Connection& connection,
     return;
   }
   for (auto const& window : windows) {
-    if (window.outcome != "ok" || !window.saw_runtime_plan_creation || !window.saw_query_plan ||
-        window.operator_ids.empty() ||
+    if (window.outcome != "ok" ||
+        (!window.saw_runtime_plan_creation && !window.saw_runtime_plan_reuse) ||
+        !window.saw_query_plan || window.operator_ids.empty() ||
         // Id 0 may belong to a plan-root operator absorbed from the pipeline overview.
         *std::min_element(window.operator_ids.begin(), window.operator_ids.end()) > 1) {
       out.error =
         "AC-12 runtime window did not contain a complete id-zero Sirius plan with outcome=ok";
       return;
     }
+  }
+  if (!windows[0].saw_runtime_plan_reuse || windows[0].saw_runtime_plan_creation ||
+      !windows[1].saw_runtime_plan_creation || windows[1].saw_runtime_plan_reuse) {
+    out.error = "AC-12 expected plan reuse followed by a pin-epoch rebuild";
+    return;
   }
   if (windows[0].operator_ids != windows[1].operator_ids) {
     out.error = "AC-12 repeated executions produced different operator-id sequences";

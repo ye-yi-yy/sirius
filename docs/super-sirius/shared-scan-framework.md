@@ -1,371 +1,215 @@
-# Shared Scan Framework: R1 Staging
-
-The binding ownership package is committed as Sirius `63af08a8`, based on
-DuckDB `3ff87f1ec7282ef44727e0e1d84237e88dd9a7b5`. Subsequent staging adds
-source adapters, original/candidate comparison, window-owned scan contracts,
-slice certificates, checkpoint leases and original-plan source policy. The DuckDB submodule remains at that revision without local source
-patches. Standard Parquet and Iceberg use explicit unverified compatibility
-adapters; unavailable binding observations retain unproven verdicts.
-
-R1 is not complete or qualified. A descriptor match or complete read view
-does not prove that repeating a binder or executing a CPU replay is safe.
-
-## Full schema snapshots
-
-`scan::bound_schema` owns column names, their order and serialized DuckDB
-logical type metadata. Returning types deserializes independent objects:
-DuckDB logical type copies otherwise share mutable auxiliary metadata.
-Serialization is an ownership mechanism, not the equality representation.
-
-The optional canonical schema identity is versioned and uses typed fields with
-byte-length prefixes. It includes names, logical and physical types, aliases,
-decimal width/scale, string collation, nested child names/order, array size and
-enum dictionary order. It does not use display strings or DuckDB's permissive
-type equality. Unqualified types or extension-specific semantic metadata retain
-their owned payload but have no canonical identity. An absent identity is not
-an empty schema. Equality of supported independently captured schemas compares
-the complete canonical text; sharing the same immutable owner also establishes
-schema equality.
-
-`SiriusReadParquetBindData` retains this schema along with its existing URI and
-row count. `Copy()` shares the immutable snapshot and `Equals()` includes it.
-The metadata-only constructor remains available with a null schema, which
-read-view capture classifies as unavailable. The binding callback always
-supplies the full schema. No table-function serializer or additional I/O is
-introduced.
-
-This schema identity is only one component of the bound-read-view key. It
-does not identify files, options, source implementations or physical versions.
-
-## Stream declaration ownership
-
-Each `stream_bind_catalog` has a process-unique, non-wrapping instance ID.
-Declarations receive monotonically increasing, non-reused generation numbers.
-The immutable declaration owns:
-
-- Catalog instance, stream ID and declaration generation.
-- Full schema and the existing Sirius runtime types.
-- Repository and expected senders.
-
-The DuckDB bind payload retains this exact declaration, including across
-`FunctionData::Copy()`. Physical lowering consumes the retained declaration
-instead of resolving the latest entry for an ID. Attachment verifies it still
-belongs to the current catalog and generation.
-
-The mutable `built` pointer is kept in the catalog entry, outside the immutable
-declaration. A plan-owned `stream_source_attachment` retains the declaration and
-catalog and clears only its own declaration/operator pair on destruction.
-Existing one-leaf-per-stream restrictions still apply.
-
-Replacement, erasure and clear fail with `stream_binding_in_use` while a binding
-or operator retains the declaration. Clear checks all entries before deleting
-any. `get()` returns a detached snapshot, not a reference into an unlocked map;
-binding code uses `get_declaration()` to retain ownership explicitly.
-
-Fragments record the generations they publish. Success teardown, failed builds
-and retries release sessions and plans before erasing those generations. A stale
-fragment cannot erase a newer declaration for the same ID, and an unbuilt
-fragment cannot erase a peer's declaration. FFI setup declarations are tracked
-separately from the generations later published by the streaming fragment.
-
-FFI type resolution retains the full DuckDB schema before conversion to Sirius
-runtime types. Direct C++ callers can supply the same snapshot through
-`stream_input_spec::schema` or `stream_input_binding::schema`. Without it,
-scalar schemas are reconstructed from the supplied runtime types; nested types
-whose child metadata has been erased are rejected rather than inventing a
-schema.
-
-## Source adapters and compatibility
-
-Each DatabaseInstance owns one registry through its extension callback manager.
-The registry owns five implementations of `scan_source_adapter`: native,
-standard Parquet, Sirius-owned Parquet, stream and Iceberg. It resolves the
-adapter by calling `verify_binding` before provider-specific payload access.
-`source_registry.cpp` is the single built-in registration site.
-
-Each adapter provides:
-
-- `profile`: dynamic-filter mode, runtime form, verification status and replay veto.
-- `verify_binding`: recognition of the implementation and its bind payload.
-- `try_capture_bound_view`: source identity from the retained binding, without binding or I/O.
-- `preflight_source`: existing source-specific planning gates and cache residency evidence.
-- `declare_resources`: attached native storage and transactions needed before protection.
-- `create_scan_runtime`: the existing ingestible or direct source operator.
-- `inspect_source`: byte-source facts for the original-plan fallback policy.
-
-Logical planning calls preflight and handles shared projection/filter/schema
-work. Physical lowering wraps an ingestible using the profile's dynamic-filter
-capability; direct sources use their existing source operator. Source kind is
-an identity tag, not behavioral dispatch in either planner, read-view capture
-or fallback policy. Stream construction does not require a synthetic file list.
-
-Native preflight owns the overflow-string and pinned MVCC checks. Iceberg owns
-its snapshot, schema-evolution and delete gates and delete discovery. Standard
-and Sirius-owned Parquet own their respective path/partition extraction. These
-are moves of existing behavior; adapters do not introduce new bind calls or
-replace the existing readers. Whole-plan replay decisions remain in the
-framework, combining adapter facts and vetoes across all original sources.
-
-To add another scan, implement an adapter, register its factory and add its
-source file to the build. Add or reuse a reader/runtime implementation as
-needed, and supply a distinct canonical identity if supported. Extend the
-source-kind tag when the new identity needs one; it carries no dispatch logic. A new source
-using existing runtime/filter capabilities does not require source-specific
-branches in the common planner, capture or fallback code. New execution
-semantics can still require an explicit shared capability extension.
-
-Native scans use DuckDB's existing TableScanFunction factory; Sirius-owned
-Parquet and streams use the same factories as their registration. Their
-adapters check callbacks, signatures, named parameter types, semantic flags
-and concrete bind payloads without DuckDB source changes.
-
-Standard Parquet aliases and Iceberg retain their existing implementations
-through explicit compatibility profiles:
-
-- `duckdb.parquet.legacy.unverified`: parquet_scan and read_parquet.
-- `iceberg.legacy.unverified`: iceberg_scan.
-
-These adapters use name/MultiFile payload checks for compatibility routing and
-set implementation_verified to false. They do not claim verified callback or
-bound-option identity. Read-view capture returns unverified for both profiles;
-a known function name or successful scan cannot supply the missing evidence.
-Native, Sirius-owned Parquet and stream verification remains available through
-existing APIs.
-
-TODO(R1 D1): provide supported Parquet factory/bound-option access and the
-actual Iceberg provider descriptor bridge. Validate concrete inner bind data,
-reader and interface before enabling verified Parquet view capture. No local
-DuckDB header relocation, private-layout replica or options accessor is used.
-
-## Inventory and read views
-
-`legacy_multi_file_paths` retains the existing MultiFile GetAllFiles behavior
-for standard Parquet and Iceberg. Adapter preflight, runtime lowering and
-source-policy discovery use this internal compatibility helper. It can expand the inventory and
-perform I/O, just as the old implementation did; it supplies execution paths,
-not verified read-view or repeat-safety evidence. Missing inventories remain
-unavailable instead of being certified as complete. Sirius-owned URI lowering
-continues to read the retained bind payload.
-
-TODO(R1 D2): obtain supported non-expanding inventory and original publication
-APIs, preserve original owner/provenance across allowed materialization,
-distinguish complete-empty, unavailable and unsupported captures, and retain
-file options. Only then enable Parquet/Iceberg file-multiset and option equality.
-The framework's reserved file evidence type is Sirius-owned and does not
-depend on new DuckDB declarations.
-
-`bound_read_view` currently represents a versioned, typed, length-prefixed
-identity for supported schemas and verified profiles:
-
-- Database instance, source kind/profile and full schema.
-- Native catalog/table OIDs and the resolved qualified table name.
-- The exact supplied Sirius-owned Parquet URI.
-- Stream catalog instance, stream ID and declaration generation.
-
-Cardinality, projection, filters and transaction IDs do not enter the view.
-The typed selector encoder reads already evaluated values without evaluating
-expressions. Hook evidence is retained before template copying, including when
-copying fails. Physical-original capture walks unique `GetChildren()` nodes.
-Finalize and execution rebuild each compare their own candidate against the
-preserved generation. No Parquet or Iceberg read view is completed by enumerating
-files or inferring the missing reader options.
-
-## Binding-audit compatibility
-
-`capture_planning_repeat_audit` preserves the framework API using only existing
-Sirius connection state. It reports observations_available=false and unproven
-for repeat binding, speculative execution and CPU replay. It does not register
-a DuckDB observer, reconstruct an audit from optimized expressions, evaluate
-selectors again or synthesize a safe verdict.
-
-The optimizer/finalize integration keeps the legacy copy/replan behavior while
-this bridge is absent. In particular, volatile selectors such as nextval no
-longer have the experimental early-binding veto from the reverted DuckDB
-patch. Exactly-once selector evaluation is not guaranteed by this staging.
-The existing connection planning generation is bookkeeping, not proof of an
-original pre-evaluation observation.
-
-TODO(R1 D3): consume supported observations before scalar/aggregate/cast
-binding and table-argument evaluation; allocate original statement generations
-and occurrence tokens; retain original evaluated selectors and source views;
-isolate nested/internal planning; then qualify operation, copy and collation
-profiles before enabling repeat-safety admission. DuckDB source patches for
-these hooks are deferred.
-
-## Original-plan source policy
-
-Transparent finalize captures a whole-plan policy from DuckDB's original
-physical plan before any candidate replan. The walk uses GetChildren, includes
-wrapper-owned subplans and visits shared nodes once. Discovery completeness
-and byte-source classification remain separate.
-
-Known S3 and adapter replay vetoes dominate unknown/incomplete sources.
-Non-replayable adapters contribute their source names to a shared veto set;
-the policy has no stream- or owned-Parquet-specific boolean branches. An unregistered
-MultiFile reader still participates through legacy inventory enumeration; a
-missing or failed inventory prevents replay. Unknown non-file sources and
-unverified profiles remain unclassified. A failed scan capture does not stop
-discovery of vetoes elsewhere in the plan. Parquet and Iceberg share the internal
-compatibility discovery helper to preserve existing local/S3 routing while provider
-migration remains pending.
-
-All finalize decline paths and runtime fallback consume this preserved policy.
-SQL text can add an S3 veto, never clear one. A missing candidate also follows
-the source policy. Runtime fallback additionally requires the preserved CPU
-statement to be read-only. Candidate installation retains the original CPU
-plan until construction succeeds.
-
-This centralizes existing source vetoes, not the complete R1 replay predicate.
-Non-expanding discovery, original statement safety observations, consumer/window
-ownership and failed-drain qualification are still required.
-
-## Candidate correspondence and runtime windows
-
-Verified source views are compared as multisets, preserving independent duplicate
-occurrences. `original_copy_chain` requires a bijection to hook occurrences by
-`table_index`; SQL replans require a single source or an empty correspondence.
-Copying a replan-derived template preserves its origin. Required evaluated
-selectors are compared against the same-generation hook partner, and candidate
-output types must match the retained CPU plan before lowering.
-
-Compatibility providers remain explicitly unproven. Their occurrence counts
-and function names are checked without claiming file/option/selector equality.
-The requested compatibility path also retains existing multi-source replans
-when a Standard Parquet or Iceberg source is present. Remove this exception
-when D1/D2/D3 can qualify the real provider path.
-
-Each validation or execution build receives a fresh registry and process-wide,
-monotonic, non-wrapping 64-bit handles. Immutable tickets retain the source,
-generation, window, output layouts, required columns, projection, static
-filters and materializer. Filters are copied before lowering consumes them.
-Stream receives a ticket without creating file splits. Registry membership and
-active-window checks reject expired or foreign consumers.
-
-Validation contracts and leases die before installing the reusable transparent
-operator. Execution rebuild captures and compares again with fresh contracts.
-The registry never publishes `admission_supported` while D3 remains unproven.
-
-## Construction, native leases and drain
-
-Adapters declare resources before the construction seal. All existing
-SQL-dependent provider preparation finishes before the window acquires native
-checkpoint readers. Native preflight uses a temporary reader for its existing
-storage probes; runtime layout capture uses one shared checkpoint lease per
-actual AttachedDatabase, acquired in database order. Transactions start before
-leases. Pin population records its checkpoint iteration under its own scoped
-lease.
-
-A protected window rejects new internal-query brackets and metadata-connection
-creation until drain releases its leases. Iceberg metadata uses an explicit
-read-only transaction. This is a construction restriction, not D3 evidence or
-permission for arbitrary provider callbacks. Supporting new internal SQL lanes
-under a lease still requires separate qualification.
-
-Native prepare, metadata walks, staging and decode revalidate the attached
-database, block manager, iteration and layout association. The engine, plan,
-storage, pin runtime and fragment declarations are retained through mandatory
-drain. Cleanup stops metadata issuance, drains task creation, execution,
-device work and I/O, then closes registries and releases leases. Failed drain
-retains owners until runtime teardown and prohibits CPU replay. Buffered results
-and idle prepared plans do not retain active leases.
-
-## Certified slices and diagnostics
-
-Fresh Parquet slices retain a runtime inventory occurrence (including duplicate
-paths), footer, selected row groups, reader options/plan and datasource owner.
-Iceberg slices additionally retain the existing delete-data owner. This runtime
-inventory is not original-binding D2 evidence. Native slices retain the exact
-row-group/segment descriptor snapshot, lease, storage, datasource and staging
-owners. Insert-delta staging remains shared while each consuming scan receives
-its own certificates.
-
-Coalescing preserves constituent certificates and rejects mixed consumers.
-Connector enqueue, prefetch and materialization validate live membership and
-per-slice range/dependency associations before decode. Resident pinned batches
-continue through their existing identity/MVCC/layout checks. Empty results
-retain the dependencies still used by their existing materializer.
-
-The source registry owns `read_view_mismatches`, `certificate_mismatches` and
-`checkpoint_revalidation_failures`. Plan dumps include a bounded ticket/window,
-source, identity hash, correspondence and evidence/replay classification, with
-no paths, selectors or predicate values. Safety/admission remain explicitly
-unproven. This adds runtime enforcement, not physical byte-version guarantees.
-
-Iceberg delete-data memoization uses a typed key containing database instance,
-connection, query ordinal, planning generation, transaction, exact table path,
-snapshot and the effective version-guessing setting. It remains query-local and
-never supplies missing original evidence.
-
-## Remaining external qualification
-
-D1/D2 bridges for actual Standard Parquet/Iceberg providers and DuckDB D3
-original-binding observations remain deferred. The compatibility adapters and
-audit TODOs describe the external changes needed before full admission can be
-enabled. R0 provenance, real-provider compatibility, performance/concurrency
-matrices and the complete R1 acceptance qualification are still required.
-R2a-R4 statement certification, byte-version contracts and new reader/runtime
-implementations are outside this change.
-
-## Validation
-
-The release build of `duckdb`, `sirius_loadable_extension` and `sirius_unittest`
-passes with the current runtime-contract changes (2026-09-18), including the
-device fence in `SiriusContext`. Formatting/static hooks and whitespace checks
-pass. DuckDB tracked source and the submodule revision are unchanged. Pixi
-activation now preserves an already-correct CMakePresets symlink.
-
-Runtime verification exposed and fixed two implementation issues:
-
-- Logical-plan copies do not preserve resolved output types. Candidate type
-  resolution now precedes evidence capture, avoiding false
-  `output_schema_mismatch` refusals for supported queries.
-- Schema-only Parquet files have no row-group column chunks. Byte accounting
-  skips those absent chunks while the empty split retains its schema and
-  dependency certificates.
-
-Only existing tests were adapted to the new contract; no test cases were added.
-Operator-only plan-tree fixtures now supply the construction window normally
-installed by `create_plan`; a missing window produces an explicit error instead
-of dereferencing null. Lifecycle AC-6 now permits the CPU fallback it expects
-when the optimizer is disabled and no current logical capture/SQL candidate
-exists. It still verifies that the old generation is not consumed and the new
-binding returns the correct result.
-
-Existing-suite results:
-
-- Plan-tree shapes: 18 cases, 1,211 assertions passed.
-- Stream catalog/session/batches, owned-Parquet metadata and Iceberg
-  layout/delete/Puffin helpers: 71 cases, 379 assertions passed. Provider checks
-  that return early without S3 fixtures do not qualify live S3 behavior.
-- Streaming fragments: 5 cases, 83 assertions passed, including output surviving
-  window cleanup, two-fragment chains, Parquet scans and multiple batches.
-- Local transparent runtime fallback: 6 cases passed, covering own uncommitted
-  writes, snapshot stability across a concurrent commit, fallback-disabled
-  errors and subsequent recovery. The broader selector reported 31 cases and
-  110 assertions; its S3/child-runner early returns are not provider validation.
-- Query lifecycle: 11 cases, 78 assertions passed, including unconsumed/pending
-  results, concurrent execution/preparation, pin-state changes, stale capture
-  rejection, unavailable runtime and planning-error recovery.
-- Cancelled-waiter gate: 1 case, 6 assertions passed. Cancellation does not enter
-  a later execution window or trigger replay; a follow-up query succeeds.
-- Scan/scan-manager selection: 298 of 300 cases passed together. The CPU-only
-  `any_uncheckpointed_appends` case encountered a default-size GPU allocation
-  failure in the combined process and passed independently (27 assertions).
-  The remaining default-config case fails because WSL reports unknown capacity
-  for NUMA node -1; it does not exercise the shared scan contract.
-
-Fourteen manual SQL CPU/GPU comparisons passed with fallback disabled on the
-supported GPU paths: native filters/projections/self-join/empty results,
-Parquet aliases/duplicates/globs/empty and pruned files, owned Parquet, Hive
-partition projection, mixed native/Parquet joins, and a pinned native self-join
-over insert deltas. `FORCE CHECKPOINT` completed after normal queries and after
-unpinning, checking that query-scoped leases had been released.
-
-The integration suites above used their original configuration. Its 32 GB host
-capacity is a budget, not an immediate 32 GB allocation; the initial host pools
-allocate about 5 GiB. The earlier assumption that this capacity alone prevented
-running the suites was incorrect.
-
-Local command output is retained under `build/r1-validation/`. Live S3 and
-actual-provider Iceberg end-to-end/ABI qualification remain unverified. Full R1
-acceptance, performance and concurrency qualification are still not claimed.
+# Shared Scan Framework
+
+The framework gives table scans shared binding evidence, plan contracts and
+execution lifetimes while preserving their existing readers. Source-specific
+behavior lives in adapters; the logical planner, physical planner and fallback
+policy consume their common interface.
+
+## Sources and adapter boundary
+
+Each DuckDB `DatabaseInstance` owns a `source_registry` with five adapters:
+
+| Source | Entry points | Binding evidence |
+| --- | --- | --- |
+| DuckDB native | `seq_scan` | Verified implementation, schema and table identity |
+| Standard Parquet | `read_parquet`, `parquet_scan` | Unverified compatibility path |
+| Sirius-owned Parquet | `sirius_read_parquet` | Verified implementation, schema and retained URI |
+| Iceberg | `iceberg_scan` | Unverified compatibility path |
+| Stream | `sirius_stream_source` | Verified implementation, schema and retained declaration |
+
+Verification checks the implementation and bind payload before source-specific
+access. Native, Sirius-owned Parquet and Stream use their existing factories.
+Standard Parquet and Iceberg currently use function-name and MultiFile payload
+checks for routing, which do not establish implementation or bound-option identity.
+
+The [adapter interface](../../src/include/scan/source_adapter.hpp) provides:
+
+| Method | Responsibility |
+| --- | --- |
+| `profile` | Runtime form, dynamic-filter capability, verification status and replay veto |
+| `verify_binding` | Recognize the implementation and bind payload |
+| `try_capture_bound_view` | Capture retained binding identity without rebinding or I/O |
+| `preflight_source` | Apply source-specific planning gates and inspect pin residency |
+| `declare_resources` | Retain native storage needed for execution preparation |
+| `create_scan_runtime` | Construct an ingestible or a direct source operator |
+| `inspect_source` | Report byte-source facts for whole-plan fallback policy |
+
+Adapters retain native MVCC/overflow-string checks, Parquet path handling and
+Iceberg snapshot/schema/delete gates. An ingestible uses the common table-scan
+operator; a direct source such as Stream supplies its own operator. There is no
+single replacement reader/runtime: an adapter may reuse an existing one.
+
+## Binding evidence and ownership
+
+`bound_schema` owns full column names and serialized DuckDB types, including
+nested metadata. Returned types are independent copies. Supported schemas also
+have a canonical identity; unsupported semantic metadata remains owned but
+cannot be claimed equal through a missing identity.
+
+`bound_read_view` identifies a source using its database instance, kind/profile,
+full schema and source-specific identity: native table OIDs and qualified name,
+the retained Sirius-owned Parquet URI, or Stream catalog/ID/declaration
+generation. Equality uses canonical data, not the diagnostic hash. Projection,
+filters, cardinality and transaction IDs are not part of this identity.
+A matching view does not prove that bytes are unchanged or that repeating
+binding is safe.
+
+Stream bind data retains an immutable declaration containing schema, repository
+and expected senders. Lowering uses that declaration rather than looking up the
+latest declaration by ID. Replacement and erasure fail while bindings or
+operators retain it. A plan-owned attachment releases only its own
+declaration/operator pair, and fragment cleanup erases only its published
+generations.
+
+Standard Parquet and Iceberg have no verified read view yet.
+`legacy_multi_file_paths` preserves their existing `GetAllFiles` behavior for
+preflight, runtime construction and fallback discovery. It may expand the file
+inventory and perform I/O; its result is execution data, not evidence of what
+the original binding observed.
+
+## Planning and execution flow
+
+1. **Capture the original.** Retain logical-hook evidence and evaluated
+   selectors before copying the template. Walk the original physical plan,
+   including wrapper-owned subplans, to capture source policy.
+2. **Compare and lower.** Compare candidate source occurrences and output types
+   against the original. Verified views are compared as multisets, preserving
+   duplicates. Copy-derived plans match hook occurrences by table index and
+   compare required selectors. SQL replans have stricter correspondence rules;
+   the Parquet/Iceberg compatibility exception is described below.
+3. **Retain the validated plan.** `OnFinalizePrepare` keeps the physical plan
+   and pin-registry epoch. Its scan registry is inactive and owns no checkpoint
+   keys. First execution reuses the plan if the epoch is unchanged; an epoch
+   change rebuilds and compares again. Prepared re-execution goes through
+   DuckDB rebind/finalize with new binding evidence.
+4. **Prepare execution.** `sirius_scan_manager::prepare_for_query` activates the
+   registry once. It starts all required native transactions before acquiring
+   any checkpoint key, then shares one lease per actual attached database.
+   Fresh native metadata walks run on the query thread under those leases;
+   fully resident pin hits skip the walk.
+5. **Validate asynchronous handoffs.** Consumer tickets and slice certificates
+   retain ownership and reject expired windows, foreign consumers, invalid
+   ranges or inconsistent dependencies before decode.
+6. **Drain and release.** Cleanup stops metadata issuance and drains task
+   creation, execution, device work and I/O before closing registries and
+   releasing leases. Failed drain retains owners until runtime teardown and
+   prohibits CPU replay. Idle prepared plans and buffered results hold no
+   active checkpoint leases.
+
+`StandaloneQueryScope::finish()` records the attempt's lease-release result
+before releasing the lifecycle slot. CPU replay accepts only `released` or
+`not_entered`; it does not inspect a scan manager that another query may already
+own. Replay also requires the preserved source policy, a read-only CPU
+statement and the existing fallback/error rules to permit it. Known S3 sources,
+adapter vetoes and incomplete file discovery can prohibit replay.
+
+## Runtime contracts
+
+A plan-owned `query_scan_registry` assigns immutable consumer tickets containing
+source identity, generation/window, output layouts, required columns,
+projection, copied static filters and materializer. Execution activates the
+registry once; cleanup closes it permanently.
+
+Parquet slices retain inventory occurrences, footers, selected row groups,
+reader options and datasource owners. Iceberg also retains delete-data owners.
+Native slices retain descriptor snapshots, storage, checkpoint leases,
+datasource and staging owners. Coalescing preserves constituent certificates
+and rejects mixed consumers. Connector enqueue, prefetch and materialization
+check membership and range/dependency associations.
+
+Resident pinned batches retain their existing identity, MVCC and layout checks.
+Runtime dependency checks protect ownership and decode assumptions; they do
+not certify original file inventories or physical byte versions.
+
+## Internal metadata connections
+
+Use [`scan::open_internal_connection`](../../src/include/scan/internal_connection.hpp)
+for framework-owned metadata SQL. Iceberg metadata/schema probes and
+positional-delete reads use this helper.
+
+The helper installs an internal-query guard, starts `BEGIN TRANSACTION READ ONLY`,
+then mirrors explicitly requested Boolean settings. `Query` accepts exactly
+one SELECT and requires the same read-only transaction. The raw connection is
+not exposed. Rollback and connection destruction run while the guard is active,
+including constructor failure.
+
+Helper connections retain the parent's protected-window ancestry, so ordinary
+nested planning guards cannot bypass a native lease by switching connections.
+Read-only helpers avoid DuckDB's non-read-only transaction-start lock. This
+controls connection lifetime and transaction mode; it does not establish
+original binding provenance or qualify arbitrary provider callbacks. Iceberg
+discovery remains plan-time work over an explicitly selected snapshot.
+
+## Diagnostics
+
+The source registry and `SiriusContext::transparent_execution_stats` share
+database-owned contract counters:
+
+| Counter | Meaning |
+| --- | --- |
+| `read_view_mismatches` | Original/candidate view or correspondence mismatch |
+| `certificate_mismatches` | Consumer or slice contract violation |
+| `checkpoint_revalidation_failures` | Native checkpoint dependency failed revalidation |
+| `scan_capture_incomplete` | An attempt observed incomplete capture, including compatibility captures |
+| `scan_planning_safety_declines` | A planning-safety refusal |
+| `scan_source_verification_declines` | A source-verification refusal |
+
+Attempt diagnostics deduplicate repeated reports and emit at most one bounded
+contract-refusal INFO report per attempt. Unproven safety or verification does
+not increment a decline counter when compatibility behavior still permits the
+plan. Execution rebuilds start a new diagnostic attempt.
+
+Plan dumps show each consumer's source/profile, instance/generation, candidate
+origin, identity hash, correspondence, evidence scope/depth, selector status
+and independent repeat-bind, speculation and CPU-replay verdicts. Missing
+evidence remains unverified or unproven. `execution_rebuilds` tracks rebuilt
+plans; `lease_held_at_replay` must remain zero for permitted replay.
+
+## Adding a source
+
+1. Implement `scan_source_adapter` under
+   [`src/scan/adapters/`](../../src/scan/adapters/). Define a profile and verify
+   the actual factory and payload before accessing provider data.
+2. Implement side-effect-free read-view capture with owned schema and source
+   identity. Keep unavailable evidence explicit; do not manufacture it by
+   rebinding, enumerating files or evaluating selectors again.
+3. Supply preflight gates, resource declarations, runtime construction and
+   source-policy facts. Reuse an ingestible/direct operator where its semantics
+   fit; add a reader when storage, decoding or delivery semantics require it.
+   Preserve the shared ticket, dependency and cleanup contracts.
+4. Declare the factory in
+   [`source_adapters.hpp`](../../src/scan/adapters/source_adapters.hpp),
+   register it in [`source_registry.cpp`](../../src/scan/source_registry.cpp)
+   and add implementation files to [`CMakeLists.txt`](../../CMakeLists.txt).
+5. Extend source identity encoding when needed. The source-kind tag is not a
+   dispatch switch. Existing runtime/filter capabilities need no source-specific
+   branches in the common planners, capture or fallback policy; new execution
+   semantics may require a shared capability extension.
+
+## Current limitations and follow-up
+
+- **Provider verification:** Standard Parquet needs supported factory and
+  bound-option access; Iceberg needs a descriptor bridge from the actual
+  provider. Verify concrete bind data, reader and interface before enabling
+  verified capture.
+- **Original file evidence:** Providers must expose retained inventories,
+  options and provenance without expansion or I/O. Distinguish complete-empty,
+  unavailable and unsupported capture before enforcing file-multiset and option
+  equality. Runtime inventories cannot substitute for this evidence.
+- **Original binding observations:** DuckDB must expose observations before
+  binding and table-argument evaluation, including statement generations,
+  occurrence identity and retained evaluated selectors. Nested/internal planning
+  must be isolated. Operation, copy and collation behavior then need separate
+  repeat-bind, speculation and CPU-replay qualification.
+- **Compatibility admission:** The current binding audit reports unavailable
+  observations and unproven safety. Legacy copy/replan behavior remains;
+  exactly-once selector evaluation is not guaranteed. Parquet/Iceberg comparison
+  checks occurrence counts and function names, not file/option/selector
+  equality, and retains a multi-source SQL-replan exception. Remove that
+  exception only when the provider and original-binding evidence support it.
+- **External prerequisites:** Native decoder correctness and provider-internal
+  connection isolation still need their separate prerequisite changes integrated.
+  Current helpers and ownership checks do not replace those changes.
+
+Full statement safety certification, physical byte-version guarantees and a
+unified reader/runtime implementation are outside the current framework.

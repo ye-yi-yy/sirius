@@ -93,6 +93,8 @@ class gpu_ingestible : public std::enable_shared_from_this<gpu_ingestible> {
   {
     return _scan_contract;
   }
+  virtual void prepare_dependencies(sirius::scan_manager::sirius_scan_manager&) {}
+  virtual void ensure_metadata_prepared() {}
   virtual void validate_dependencies() const {}
 
   gpu_ingestible(gpu_ingestible const&)            = delete;

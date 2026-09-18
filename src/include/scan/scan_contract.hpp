@@ -5,6 +5,7 @@
  */
 #pragma once
 #include "helper/logical_type.hpp"
+#include "scan/diagnostics.hpp"
 #include "scan/plan_evidence.hpp"
 
 #include <duckdb/common/column_index.hpp>
@@ -24,14 +25,13 @@ class StorageLockKey;
 class SiriusConnectionState;
 }  // namespace duckdb
 namespace sirius::scan {
-struct contract_counters {
-  std::atomic<std::uint64_t> read_view_mismatches{0};
-  std::atomic<std::uint64_t> certificate_mismatches{0};
-  std::atomic<std::uint64_t> checkpoint_revalidation_failures{0};
+struct native_scan_resource {
+  duckdb::ClientContext* context;
+  duckdb::shared_ptr<duckdb::DataTable> storage;
 };
 class native_checkpoint_lease {
  public:
-  native_checkpoint_lease(duckdb::DataTable&, std::uint64_t, std::shared_ptr<contract_counters>);
+  native_checkpoint_lease(duckdb::DataTable&, std::shared_ptr<contract_counters>);
   ~native_checkpoint_lease();
   void validate(const duckdb::DataTable&) const;
   void release() noexcept;
@@ -79,17 +79,21 @@ struct registry_membership {
   std::shared_ptr<contract_counters> counters;
 };
 
-// Runtime windows own this registry. Reusable transparent operators retain only original evidence.
 class query_scan_registry {
  public:
   query_scan_registry(std::shared_ptr<const plan_evidence>,
                       comparison_result,
                       std::shared_ptr<contract_counters>,
-                      planning_repeat_audit);
+                      planning_repeat_audit,
+                      candidate_origin = candidate_origin::direct);
   ~query_scan_registry();
   void declare_native(duckdb::ClientContext&, duckdb::DataTable&);
-  void seal_and_acquire(duckdb::ClientContext&);
-  std::shared_ptr<native_checkpoint_lease> lease_for(duckdb::DataTable&) const;
+  void seal();
+  const std::map<duckdb::idx_t, native_scan_resource>& native_resources() const noexcept
+  {
+    return _native;
+  }
+  void activate();
   bound_table_scan_ptr add(duckdb::idx_t, consumer_requirements);
   void freeze();
   void close() noexcept;
@@ -104,21 +108,27 @@ class query_scan_registry {
            _audit.cpu_replay == audit_verdict::safe;
   }
   std::uint64_t window() const noexcept { return _window; }
+  const planning_repeat_audit& audit() const noexcept { return _audit; }
+  candidate_origin origin() const noexcept { return _origin; }
 
  private:
   const std::shared_ptr<const plan_evidence> _candidate;
   const comparison_result _comparison;
   const planning_repeat_audit _audit;
+  const candidate_origin _origin;
   const std::uint64_t _window;
   std::shared_ptr<registry_membership> _membership;
   std::vector<bound_table_scan_ptr> _tickets;
-  std::map<duckdb::idx_t, duckdb::shared_ptr<duckdb::DataTable>> _native;
-  std::map<duckdb::idx_t, std::shared_ptr<native_checkpoint_lease>> _leases;
-  duckdb::shared_ptr<duckdb::SiriusConnectionState> _connection;
+  std::map<duckdb::idx_t, native_scan_resource> _native;
   bool _sealed = false;
+  bool _frozen = false;
+  bool _closed = false;
 };
 
 void certificate_failure(const bound_table_scan_ptr&, const char* reason);
 void validate_consumer(const bound_table_scan_ptr& expected, const bound_table_scan_ptr& actual);
-std::string contract_summary(const bound_table_scan&, const comparison_result&);
+std::string contract_summary(const bound_table_scan&,
+                             const comparison_result&,
+                             const planning_repeat_audit& = {},
+                             candidate_origin             = candidate_origin::direct);
 }  // namespace sirius::scan

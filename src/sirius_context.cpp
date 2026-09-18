@@ -39,6 +39,7 @@
 #include "scan/binding_audit.hpp"
 #include "scan/plan_evidence.hpp"
 #include "scan/source_policy.hpp"
+#include "scan/source_registry.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/batch_telemetry.hpp"
 #include "transparent/physical_sirius_execution.hpp"
@@ -223,7 +224,10 @@ std::optional<std::string> find_legacy_config_file()
 
 // ================= sirius_context ================= //
 
-SiriusContext::SiriusContext() = default;
+SiriusContext::SiriusContext(std::shared_ptr<sirius::scan::contract_counters> counters)
+  : scan_contract_counters_(std::move(counters))
+{
+}
 
 SiriusContext::~SiriusContext() noexcept
 {
@@ -422,7 +426,8 @@ void SiriusContext::retain_until_query_drain(sirius::query_id_t id,
   drain_owners_[sirius::value_of(id)].push_back({std::move(owner), std::move(after_drain)});
 }
 
-void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag)
+SiriusContext::StandaloneQueryScope::lease_release_result SiriusContext::run_mandatory_cleanup(
+  sirius::query_id_t query_id, std::string_view end_tag)
 {
   // Observability inside the cleanup is best-effort: only the mandatory steps
   // (query/drain/repository/scan/task resets) may throw out of this function
@@ -504,7 +509,7 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // Drop scan-manager providers for this query. Repositories are already
   // cleared above, so downstream data_batches that referenced sliced
   // host_data_representation are gone before the providers go away.
-  if (scan_manager_) { scan_manager_->reset(); }
+  const auto keys_released = scan_manager_ ? scan_manager_->reset() : 0;
   {
     std::vector<drain_owner> retired;
     {
@@ -532,13 +537,15 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
     log_pool_stats(end_tag);
   } catch (...) {  // best-effort observability
   }
+  return {StandaloneQueryScope::lease_release_state::released, keys_released};
 }
 
-void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
-                                                   std::string_view end_tag) noexcept
+SiriusContext::StandaloneQueryScope::lease_release_result
+SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
+                                              std::string_view end_tag) noexcept
 {
   try {
-    run_mandatory_cleanup(query_id, end_tag);
+    return run_mandatory_cleanup(query_id, end_tag);
   } catch (std::exception& e) {
     mark_runtime_unavailable();
     drop_query_runtime_state_best_effort(query_id);
@@ -559,6 +566,7 @@ void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
     } catch (...) {
     }
   }
+  return {StandaloneQueryScope::lease_release_state::cleanup_failed, 0};
 }
 
 void SiriusContext::drop_query_runtime_state_best_effort(sirius::query_id_t query_id) noexcept
@@ -642,7 +650,8 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     // CPU-fall-back on): latch unavailability, attempt the backstop cleanup,
     // release, and throw the distinguishable begin-failure error. Entry-point
     // catch blocks rethrow it as-is instead of falling back.
-    state_ = scope_state::FAILED;
+    state_               = scope_state::FAILED;
+    lease_release_.state = lease_release_state::begin_failed;
     ctx_.mark_runtime_unavailable();
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
@@ -651,7 +660,8 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
       string("Sirius execution-window initialization failed (runtime marked unavailable): ") +
       e.what());
   } catch (...) {
-    state_ = scope_state::FAILED;
+    state_               = scope_state::FAILED;
+    lease_release_.state = lease_release_state::begin_failed;
     ctx_.mark_runtime_unavailable();
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
@@ -674,7 +684,7 @@ void SiriusContext::StandaloneQueryScope::finish()
   } releaser{ctx_};
 
   try {
-    ctx_.run_mandatory_cleanup(window_id_, end_tag_);
+    lease_release_ = ctx_.run_mandatory_cleanup(window_id_, end_tag_);
   } catch (...) {
     // A mandatory-cleanup failure means the shared runtime can no longer be
     // trusted; the destructor must NOT run a second pass over half-cleaned
@@ -683,7 +693,8 @@ void SiriusContext::StandaloneQueryScope::finish()
     // will run it once the latch is set — retained buffer handles must not
     // survive to DB teardown), release (via the releaser), and let the query
     // error.
-    state_ = scope_state::FAILED;
+    state_               = scope_state::FAILED;
+    lease_release_.state = lease_release_state::cleanup_failed;
     ctx_.mark_runtime_unavailable();
     ctx_.drop_query_runtime_state_best_effort(window_id_);
     log_window_event("end", "cleanup_failed");
@@ -700,7 +711,7 @@ SiriusContext::StandaloneQueryScope::~StandaloneQueryScope() noexcept
   // One backstop cleanup attempt; on failure the runtime is latched
   // unavailable. The slot is released exactly once either way; logging is
   // noexcept-wrapped so the destructor can never terminate.
-  ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
+  lease_release_ = ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
   log_window_event("end", "unwind");
   ctx_.release_query_lifecycle_slot();
   state_ = scope_state::FAILED;
@@ -1211,10 +1222,24 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
   const noexcept
 {
   return transparent_execution_stats{
-    .successful_rebinds = transparent_rebind_success_count_.load(std::memory_order_relaxed),
-    .fallbacks          = transparent_fallback_count_.load(std::memory_order_relaxed),
-    .executions         = transparent_execution_count_.load(std::memory_order_relaxed),
-    .runtime_fallbacks  = transparent_runtime_fallback_count_.load(std::memory_order_relaxed),
+    .successful_rebinds   = transparent_rebind_success_count_.load(std::memory_order_relaxed),
+    .fallbacks            = transparent_fallback_count_.load(std::memory_order_relaxed),
+    .executions           = transparent_execution_count_.load(std::memory_order_relaxed),
+    .runtime_fallbacks    = transparent_runtime_fallback_count_.load(std::memory_order_relaxed),
+    .execution_rebuilds   = transparent_execution_rebuild_count_.load(std::memory_order_relaxed),
+    .lease_held_at_replay = lease_held_at_replay_count_.load(std::memory_order_relaxed),
+    .read_view_mismatches =
+      scan_contract_counters_->read_view_mismatches.load(std::memory_order_relaxed),
+    .certificate_mismatches =
+      scan_contract_counters_->certificate_mismatches.load(std::memory_order_relaxed),
+    .checkpoint_revalidation_failures =
+      scan_contract_counters_->checkpoint_revalidation_failures.load(std::memory_order_relaxed),
+    .scan_capture_incomplete =
+      scan_contract_counters_->scan_capture_incomplete.load(std::memory_order_relaxed),
+    .scan_planning_safety_declines =
+      scan_contract_counters_->scan_planning_safety_declines.load(std::memory_order_relaxed),
+    .scan_source_verification_declines =
+      scan_contract_counters_->scan_source_verification_declines.load(std::memory_order_relaxed),
   };
 }
 
@@ -1236,6 +1261,29 @@ void SiriusContext::record_transparent_execution() noexcept
 void SiriusContext::record_transparent_runtime_fallback() noexcept
 {
   transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_transparent_execution_rebuild() noexcept
+{
+  transparent_execution_rebuild_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_lease_held_at_replay() noexcept
+{
+  lease_held_at_replay_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void require_cpu_replay_lease_release(
+  ClientContext& context, const SiriusContext::StandaloneQueryScope::lease_release_result& result)
+{
+  using state = SiriusContext::StandaloneQueryScope::lease_release_state;
+  if (result.state == state::not_entered || result.state == state::released) { return; }
+  if (auto runtime = context.registered_state->Get<SiriusContext>("sirius_state")) {
+    runtime->record_lease_held_at_replay();
+  }
+  throw ExecutorException(
+    "Sirius CPU replay refused: checkpoint lease release was not confirmed "
+    "for the failed GPU attempt");
 }
 
 SiriusContext::compressed_materialization_stats
@@ -1415,7 +1463,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     } catch (InterruptException&) {
       throw;
     } catch (std::exception&) {
-      SIRIUS_LOG_INFO("Scan contract refused: reason=original_capture_incomplete stage=capture");
+      sirius::scan::diagnostics_for(context)->capture_incomplete();
     }
   }
   unique_ptr<LogicalOperator> logical_plan;
@@ -1444,6 +1492,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   };
   // Missing D3 observations keep legacy copy/replan behavior; they do not prove repeat safety.
   if (originals->audit.observed_unsafe()) {
+    sirius::scan::diagnostics_for(context)->refuse(
+      sirius::scan::scan_refusal_reason::planning_repeat_unsafe);
     return decline_without_candidate(
       "planning_repeat_unsafe: original binding observed a volatile or modifying operation");
   }
@@ -1507,14 +1557,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // its nested bind never re-enters the slot, and inside this try so a
     // runtime-unavailable error takes the existing fallback split below.
     SlotGuard plan_window(*this, context);
-    // Validate that the captured logical plan is GPU-translatable before we
-    // install a reusable transparent execution operator for prepared statements.
-    //
-    // For plans whose LogicalGet does not implement Copy (bind_data has no
-    // serializer), validation runs against `logical_plan`
-    // directly and consumes it; we then re-plan from `unbound_statement` for
-    // the actual execution path. PhysicalSiriusExecution falls back to
-    // re-planning per execute when its `logical_plan_` is null.
     sirius::planner::sirius_physical_plan_generator planner(context);
     duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
     bool plan_is_copyable = true;
@@ -1523,14 +1565,11 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     } catch (NotImplementedException&) {
       plan_is_copyable = false;
     }
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_plan;
     if (plan_is_copyable) {
-      planner.create_plan(std::move(validation_plan), originals, candidate_origin);
+      validated_plan = planner.create_plan(std::move(validation_plan), originals, candidate_origin);
     } else {
-      // Validate by consuming the freshly re-planned logical_plan; the
-      // PhysicalSiriusExecution operator will re-plan again at execute time
-      // using the SQL string we cached above.
-      planner.create_plan(std::move(logical_plan), originals, candidate_origin);
-      logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
+      validated_plan = planner.create_plan(std::move(logical_plan), originals, candidate_origin);
     }
 
     SIRIUS_LOG_INFO("Transparent execution: Sirius physical plan generated successfully");
@@ -1546,16 +1585,18 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 
     // Create a new DuckDB PhysicalPlan containing our custom operator.
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
-    auto& sirius_op =
-      new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(std::move(logical_plan),
-                                                                            current_query_sql,
-                                                                            prepared.types,
-                                                                            prepared.names,
-                                                                            cpu_fallback,
-                                                                            original_source_policy,
-                                                                            originals,
-                                                                            candidate_origin,
-                                                                            0);
+    auto& sirius_op        = new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
+      std::move(logical_plan),
+      current_query_sql,
+      prepared.types,
+      prepared.names,
+      cpu_fallback,
+      original_source_policy,
+      originals,
+      candidate_origin,
+      0,
+      std::move(validated_plan),
+      get_scan_manager().pin_registry_epoch());
     new_physical_plan->SetRoot(sirius_op);
 
     // Publish only after construction succeeds: an allocation failure must retain the CPU plan.
@@ -1606,16 +1647,13 @@ RebindQueryInfo SiriusContext::OnExecutePrepared(ClientContext& context,
   auto& prepared = info.prepared_statement;
   reject_update_to_pinned_table(*this, context, prepared);
 
-  // GPU eligibility can drift with data alone (e.g. an insert pushes a varchar past
-  // the overflow-string limit) and data changes never trigger DuckDB's own rebind.
-  // By execute time the CPU plan has been discarded, so a stale
-  // PhysicalSiriusExecution would error with no fallback. Rebind instead:
-  // OnFinalizePrepare re-decides against current stats and keeps the fresh CPU plan
-  // when create_plan now refuses.
+  // Data changes can alter GPU eligibility without triggering DuckDB's rebind.
+  // Re-finalize each EXECUTE against current stats and retain its own validated plan.
   if (!prepared.unbound_statement || !prepared.physical_plan) { return current_rebind; }
   auto& root = prepared.physical_plan->Root();
-  if (root.type == sirius::transparent::PhysicalSiriusExecution::TYPE &&
-      dynamic_cast<sirius::transparent::PhysicalSiriusExecution*>(&root) != nullptr) {
+  if (auto* execution = dynamic_cast<sirius::transparent::PhysicalSiriusExecution*>(&root)) {
+    // DuckDB builds the replacement before destroying this plan's stream attachments.
+    execution->discard_validated_plan();
     return RebindQueryInfo::ATTEMPT_TO_REBIND;
   }
   return current_rebind;
@@ -1744,11 +1782,12 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
   read_config_file_if_exists();
 }
 
-void SiriusContextExtensionCallback::initialize_context()
+void SiriusContextExtensionCallback::initialize_context(DatabaseInstance& db)
 {
   if (disabled_ || context_) { return; }
 
-  auto context = duckdb::make_shared_ptr<SiriusContext>();
+  auto context =
+    duckdb::make_shared_ptr<SiriusContext>(sirius::scan::source_registry::get(db).counters);
   context->initialize(config_);
   context_ = std::move(context);
 }

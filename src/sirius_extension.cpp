@@ -231,10 +231,12 @@ std::uint64_t count_narrowed_columns(
   return count;
 }
 
-unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
-                                                        Connection& connection,
-                                                        const string& query,
-                                                        const string& gpu_error = "")
+unique_ptr<QueryResult> run_internal_cpu_fallback_query(
+  ClientContext& context,
+  Connection& connection,
+  const string& query,
+  const string& gpu_error                                                         = "",
+  duckdb::SiriusContext::StandaloneQueryScope::lease_release_result lease_release = {})
 {
   // S3 CPU fallback is not supported. Sirius reads s3:// only on the GPU path
   // (sirius_read_parquet -> describe_parquet -> cuDF via s3_ioctx); DuckDB's CPU
@@ -249,6 +251,7 @@ unique_ptr<QueryResult> run_internal_cpu_fallback_query(ClientContext& context,
       gpu_error);
   }
 
+  duckdb::require_cpu_replay_lease_release(context, lease_release);
   // CpuFallbackGuard marks this replay so sirius_httpfs refuses to serve s3://
   // data reached indirectly (e.g. through a view) to the CPU plan — the
   // string-level references_sirius_owned_s3_parquet check above only catches a
@@ -755,6 +758,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
     ErrorData gpu_error;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
+    duckdb::SiriusContext::StandaloneQueryScope::lease_release_result lease_release;
 
     // The execution window: fresh plan extraction, Sirius physical plan
     // generation, execution and mandatory cleanup all happen inside one scope
@@ -763,7 +767,9 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
     {
       std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
       try {
-        if (sirius_ctx) { window.emplace(*sirius_ctx, context, "gpu_execution"); }
+        if (!sirius_ctx) { throw ExecutorException("Sirius context is not initialized"); }
+        window.emplace(*sirius_ctx, context, "gpu_execution");
+        sirius::scan::begin_scan_diagnostic_attempt(context);
 
         unique_ptr<LogicalOperator> query_plan;
         {
@@ -806,6 +812,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       // destructor backstop.
       if (window) {
         window->finish();
+        lease_release = window->lease_release();
         window.reset();
       }
     }
@@ -826,7 +833,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", gpu_error.RawMessage());
       print_cpu_fallback_banner();
       gstate.res = run_internal_cpu_fallback_query(
-        context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage());
+        context, *gstate.conn, data.cpu_fallback_query, gpu_error.RawMessage(), lease_release);
     }
     auto end      = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -1397,10 +1404,11 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     if (block_manager == nullptr) {
       throw InvalidInputException("pin_table: DuckDB-native pins require a single-file database");
     }
-    info->checkpoint_lease = std::make_shared<sirius::scan::native_checkpoint_lease>(
-      *info->storage, 0, sirius::scan::source_registry::get(*context.db).counters);
-    duckdb_pin_checkpoint_iteration = info->checkpoint_lease->iteration();
-    ingestible                      = sirius::op::scan::make_ingestible(std::move(info));
+    info->checkpoint_lease = scan_mgr.acquire_checkpoint_key(context, *info->storage);
+    auto native            = sirius::op::scan::make_ingestible(std::move(info));
+    native->ensure_metadata_prepared();
+    duckdb_pin_checkpoint_iteration = native->checkpoint_iteration();
+    ingestible                      = std::move(native);
   } else {  // parquet
     auto& fs   = FileSystem::GetFileSystem(context);
     auto files = fs.GlobFiles(data.args.path);
@@ -3262,6 +3270,18 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config, const sirius::sirius_c
                     Value(""));
   add_sirius_option(config,
                     option_visibility::internal,
+                    "sirius_test_inject_pin_registry_change",
+                    "force transparent execution to rebuild after a pin-registry epoch change",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_native_walk_failure",
+                    "fail native metadata preparation after acquiring its checkpoint key",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "enable_pinned_zone_map_pruning",
                     "disable automatic pinned-table zone-map capture and pruning",
                     LogicalType::BOOLEAN,
@@ -3627,7 +3647,7 @@ static void LoadInternal(ExtensionLoader& loader)
     // Config loading above must remain NVTX-free. Publish discovery after its
     // validation, but before SiriusContext can make any NVTX call.
     maybe_set_nvtx_injection_path(callback_ptr->get_loaded_config().get_telemetry_config());
-    callback_ptr->initialize_context();
+    callback_ptr->initialize_context(db);
   }
   config.GetCallbackManager().Register(std::move(callback));
 

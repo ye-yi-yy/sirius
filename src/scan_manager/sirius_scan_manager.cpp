@@ -46,7 +46,9 @@
 #include "op/sirius_physical_operator_type.hpp"
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
+#include "scan/source_registry.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
+#include "sirius_context.hpp"
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/io/datasource.hpp>
@@ -1437,6 +1439,32 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     }
   }
 
+  std::map<duckdb::idx_t, scan::native_scan_resource> native_resources;
+  for (auto* source : query.get_scan_operators()) {
+    auto registry = source->scan_registry;
+    if (!registry || std::find(_scan_registries.begin(), _scan_registries.end(), registry) !=
+                       _scan_registries.end()) {
+      continue;
+    }
+    _scan_registries.push_back(registry);
+    for (const auto& [id, resource] : registry->native_resources()) {
+      auto [it, inserted] = native_resources.emplace(id, resource);
+      if (!inserted && &it->second.storage->GetAttached() != &resource.storage->GetAttached()) {
+        throw duckdb::ExecutorException("Sirius scan contract: native database identity collision");
+      }
+    }
+  }
+  // Start every lazy transaction before acquiring any checkpoint reader.
+  for (const auto& [id, resource] : native_resources) {
+    duckdb::DuckTransaction::Get(*resource.context, resource.storage->GetAttached());
+  }
+  for (const auto& [id, resource] : native_resources) {
+    acquire_checkpoint_key(*resource.context, *resource.storage);
+  }
+  for (const auto& registry : _scan_registries) {
+    registry->activate();
+  }
+
   auto round_robin = std::make_shared<round_robin_strategy>(allocated_gpu_ids);
 
   _metadata_processor = std::make_unique<load_balancing_scan_batch_coalescer>();
@@ -1446,6 +1474,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     if (scan_op->type != ::sirius::op::SiriusPhysicalOperatorType::GPU_SCAN) { continue; }
     auto* op = &scan_op->Cast<op::scan::sirius_gpu_scan_operator>();
     if (op->scan_contract) { op->scan_contract->validate(); }
+    op->get_ingestible().prepare_dependencies(*this);
     op->get_ingestible().validate_dependencies();
     if (_providers_by_op.find(op) != _providers_by_op.end()) { continue; }
     _metadata_processor->register_pipeline(op, round_robin);
@@ -1459,6 +1488,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       _scan_op_order.push_back(op);
       continue;
     }
+    op->get_ingestible().ensure_metadata_prepared();
     auto provider = std::make_unique<split_provider>(
       op->get_ingestible(),
       [this](std::string_view file_path) -> std::shared_ptr<io::sirius_ioctx> {
@@ -1479,20 +1509,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     return;
   }
 
-  _checkpoint_locks.reserve(_pending_mvcc_mask_jobs.size());
   for (auto const& request : _pending_mvcc_mask_jobs) {
-    bool protected_by_window = false;
-    for (const auto* scan_op : _scan_op_order) {
-      if (scan_op->scan_registry) {
-        scan_op->scan_registry->lease_for(*request.storage);
-        protected_by_window = true;
-        break;
-      }
-    }
-    if (!protected_by_window) {
-      _checkpoint_locks.push_back(
-        duckdb::DuckTransactionManager::Get(request.storage->GetAttached()).SharedCheckpointLock());
-    }
+    checkpoint_lease_for(*request.storage);
   }
 
   // A manual CHECKPOINT can replace DuckDB's on-disk base while the pinned
@@ -1896,7 +1914,43 @@ void sirius_scan_manager::drain_query_issuance()
   _dispatcher->wait_for_all();
 }
 
-void sirius_scan_manager::reset()
+std::shared_ptr<scan::native_checkpoint_lease> sirius_scan_manager::acquire_checkpoint_key(
+  duckdb::ClientContext& context, duckdb::DataTable& storage)
+{
+  const auto* database = &storage.GetAttached();
+  if (auto it = _checkpoint_leases.find(database); it != _checkpoint_leases.end()) {
+    it->second->validate(storage);
+    return it->second;
+  }
+  if (auto connection = duckdb::get_sirius_connection_state(context)) {
+    if (_checkpoint_connections.emplace(&context, connection).second) {
+      ++connection->protected_scan_windows;
+    }
+  }
+  auto lease = std::make_shared<scan::native_checkpoint_lease>(
+    storage, scan::source_registry::get(*context.db).counters);
+  _checkpoint_leases.emplace(database, lease);
+  return lease;
+}
+
+std::shared_ptr<scan::native_checkpoint_lease> sirius_scan_manager::checkpoint_lease_for(
+  duckdb::DataTable& storage) const
+{
+  auto it = _checkpoint_leases.find(&storage.GetAttached());
+  if (it == _checkpoint_leases.end()) {
+    throw duckdb::ExecutorException("Sirius scan contract: native checkpoint key not held");
+  }
+  it->second->validate(storage);
+  return it->second;
+}
+
+bool sirius_scan_manager::holds_checkpoint_key(
+  const duckdb::AttachedDatabase& database) const noexcept
+{
+  return _checkpoint_leases.contains(&database);
+}
+
+std::size_t sirius_scan_manager::reset()
 {
   stop_query_issuance();
   drain_query_issuance();
@@ -1905,8 +1959,21 @@ void sirius_scan_manager::reset()
   _pending_mvcc_mask_jobs.clear();
   _pending_insert_delta_jobs.clear();
   _metadata_processor.reset();
-  _checkpoint_locks.clear();
+  for (const auto& registry : _scan_registries) {
+    registry->close();
+  }
+  _scan_registries.clear();
+  const auto keys_released = _checkpoint_leases.size();
+  for (const auto& [database, lease] : _checkpoint_leases) {
+    lease->release();
+  }
+  _checkpoint_leases.clear();
+  for (const auto& [context, connection] : _checkpoint_connections) {
+    --connection->protected_scan_windows;
+  }
+  _checkpoint_connections.clear();
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
+  return keys_released;
 }
 
 void sirius_scan_manager::start() {}
@@ -2075,6 +2142,7 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
   sirius::pinned_column_storage_matrix column_storage)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   // chunk_memory_spaces is parallel to data_tables — the caller
   // (PinTableFunction) emits one memory_space* per coalesced batch, and
   // there is exactly one
@@ -2360,6 +2428,7 @@ void sirius_scan_manager::insert_pinned_entry_host(
   std::vector<std::vector<duckdb::unique_ptr<duckdb::BaseStatistics>>> chunk_stats,
   sirius::pinned_column_storage_matrix column_storage)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   // The host-tier path captures one chunk per emitted batch; each chunk holds every
   // pinned column (compressed or uncompressed). Re-insert always replaces — there is
   // no per-column merge analog to the GPU path because the chunk-vs-column dimensions
@@ -2442,6 +2511,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
   cucascade::memory::memory_space& memory_space,
   sirius::pinned_column_storage_matrix column_storage)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   std::size_t new_num_rows = 0;
   for (auto const& chunk : chunks) {
     if (chunk.compressed) {
@@ -2495,6 +2565,7 @@ void sirius_scan_manager::insert_pinned_entry_device(
 void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
                                                duckdb_mvcc_metadata metadata)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   auto it = _pinned_entries.find(name);
   if (it == _pinned_entries.end()) {
     throw std::invalid_argument("[attach_mvcc_metadata] no pinned entry named '" + name + "'");
@@ -2507,6 +2578,7 @@ void sirius_scan_manager::attach_mvcc_metadata(const std::string& name,
 void sirius_scan_manager::attach_proven_unique_columns(
   const std::string& name, std::span<std::string const> unique_column_names)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   auto it = _pinned_entries.find(name);
   if (it == _pinned_entries.end()) {
     throw std::invalid_argument("[attach_proven_unique_columns] no pinned entry named '" + name +
@@ -2526,6 +2598,7 @@ void sirius_scan_manager::attach_proven_unique_columns(
 
 void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 {
+  pin_registry_mutation_scope const registry_mutation{*this};
   retire_late_mat_handle(name);
   _pinned_entries.erase(name);
 }

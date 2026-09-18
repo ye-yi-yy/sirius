@@ -389,12 +389,14 @@ TEST_CASE("materialize_table applies the mvcc keep-mask to metadata splits",
   std::vector<std::shared_ptr<void>> keepalive;
   host_back_segments(*env.con->context, storage, md, keepalive, /*clear_block_ids=*/true);
 
-  auto info             = std::make_unique<duckdb_native_ingestible_table_info>();
-  info->storage         = &storage;
-  info->context         = env.con->context.get();
-  info->projected_cols  = cols;
-  info->projected_types = types;
-  auto ingestible       = make_ingestible(std::move(info));
+  auto info              = std::make_unique<duckdb_native_ingestible_table_info>();
+  info->storage          = &storage;
+  info->context          = env.con->context.get();
+  info->projected_cols   = cols;
+  info->projected_types  = types;
+  info->checkpoint_lease = std::make_shared<sirius::scan::native_checkpoint_lease>(
+    storage, std::make_shared<sirius::scan::contract_counters>());
+  auto ingestible = make_ingestible(std::move(info));
 
   // Keep every third row.
   auto const n_words = (n_rows + 31) / 32;

@@ -6,6 +6,7 @@
 #pragma once
 #include "scan/binding_audit.hpp"
 #include "scan/bound_read_view.hpp"
+#include "scan/diagnostics.hpp"
 
 #include <memory>
 #include <optional>
@@ -28,6 +29,7 @@ struct source_occurrence {
   bool requires_selector;
   bool allows_cpu_replay;
   std::optional<std::string> selector;
+  const source_profile* profile = nullptr;
 };
 struct plan_evidence {
   std::uint64_t instance;
@@ -42,6 +44,10 @@ struct comparison_result {
   // An explicit staging exception, never a positive identity/safety verdict.
   bool compatibility = false;
   std::string reason;
+  scan_refusal_reason refusal  = scan_refusal_reason::read_view_mismatch;
+  std::uint64_t original_hash  = 0;
+  std::uint64_t candidate_hash = 0;
+  std::uint64_t differences    = 0;
   void require_match() const;
 };
 struct original_plan_evidence {

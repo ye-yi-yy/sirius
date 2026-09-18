@@ -155,9 +155,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   auto column_ids = op.GetColumnIds();
 
-  // Resolve and verify before a provider accesses its concrete payload.
   const auto& adapter =
-    scan::source_registry::get(*context.db).require(op.function, op.bind_data.get());
+    scan::source_registry::get(*context.db)
+      .require(op.function, op.bind_data.get(), scan::diagnostics_for(context).get());
   auto sirius_state                        = context.registered_state
                                                ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                                                : nullptr;

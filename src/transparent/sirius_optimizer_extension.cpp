@@ -229,7 +229,10 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 
   // TODO(R1 D3): enforce qualified original-binding observations when DuckDB exposes them.
   // The compatibility adapter currently reports unproven and preserves legacy derivation.
-  if (scan::capture_planning_repeat_audit(input.context).observed_unsafe()) { return; }
+  if (scan::capture_planning_repeat_audit(input.context).observed_unsafe()) {
+    scan::diagnostics_for(input.context)->refuse(scan::scan_refusal_reason::planning_repeat_unsafe);
+    return;
+  }
 
   // Optimizer hooks must not throw: a failed derivation only costs the pushdown, never the query.
   try {
@@ -259,7 +262,10 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
 
   // Unavailable original-binding observations are not proof that plan copying is repeat-safe.
-  if (scan::capture_planning_repeat_audit(context).observed_unsafe()) { return; }
+  if (scan::capture_planning_repeat_audit(context).observed_unsafe()) {
+    scan::diagnostics_for(context)->refuse(scan::scan_refusal_reason::planning_repeat_unsafe);
+    return;
+  }
 
   // Copy the optimized plan into THIS connection's per-connection state,
   // stamped with the current planning generation. OnFinalizePrepare will

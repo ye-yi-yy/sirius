@@ -67,7 +67,6 @@ struct source_preflight_result {
   bool serves_insert_deltas                = false;
 };
 
-/// Two existing construction lanes; a provider need not pretend to be a file ingestible.
 struct runtime_build_request {
   duckdb::ClientContext& context;
   std::variant<std::reference_wrapper<duckdb::LogicalGet>,
@@ -105,7 +104,7 @@ struct source_policy_evidence {
 
 /// Sirius-owned, database-lifetime adapter. Requests are borrowed for one call only.
 /// Verification/capture never bind or perform I/O. Compatibility preflight/runtime retain
-/// existing source behavior. The window orders provider preparation before protected construction.
+/// existing source behavior.
 class scan_source_adapter {
  public:
   virtual void declare_resources(query_scan_registry&,

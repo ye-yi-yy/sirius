@@ -24,7 +24,6 @@ struct source_profile {
   bool selector_outside_bind;
   bool implementation_verified = true;
   scan_runtime_form runtime    = scan_runtime_form::ingestible;
-  bool protected_construction  = false;
 };
 
 }  // namespace sirius::scan

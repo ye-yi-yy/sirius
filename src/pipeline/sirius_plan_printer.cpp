@@ -671,7 +671,12 @@ std::string sirius_plan_printer::render() const
       if (op.scan_contract && seen.insert(op.scan_contract->handle).second) {
         const auto comparison =
           op.scan_registry ? op.scan_registry->comparison() : scan::comparison_result{};
-        result += "\n" + scan::contract_summary(*op.scan_contract, comparison);
+        result +=
+          "\n" + scan::contract_summary(
+                   *op.scan_contract,
+                   comparison,
+                   op.scan_registry ? op.scan_registry->audit() : scan::planning_repeat_audit{},
+                   op.scan_registry ? op.scan_registry->origin() : scan::candidate_origin::direct);
       }
     }
   }

@@ -112,7 +112,7 @@ std::string escape_sql_string(std::string const& s)
 /// the survivor would be whichever the manifest happens to list last -- an order Iceberg gives no
 /// precedence meaning. Reading the retired one restores rows the table deleted.
 std::vector<IcebergDeleteFileEntry> read_deletion_vectors_from_manifest(
-  duckdb::Connection& conn, std::string const& manifest_path)
+  iceberg_metadata_connection& conn, std::string const& manifest_path)
 {
   auto result = conn.Query(
     "SELECT data_file.file_path, lower(data_file.file_format), "
@@ -192,7 +192,7 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
   // See iceberg_metadata_connection for why this is a connection, why it cannot observe a
   // different snapshot than the bind did, and why it mirrors settings instead of forcing them.
   iceberg_metadata_connection metadata_conn(context);
-  auto& conn = metadata_conn.get();
+  auto& conn = metadata_conn;
 
   std::string query =
     "SELECT content, file_path, manifest_sequence_number, file_format, manifest_path "
@@ -343,12 +343,11 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
 
 /// Appends one positional-delete file's records to @p out_map. Schema must be
 /// { file_path VARCHAR, pos BIGINT }. CPU read: these files are tiny metadata.
-void read_positional_delete_file(duckdb::DatabaseInstance& db,
+void read_positional_delete_file(duckdb::ClientContext& context,
                                  std::string const& delete_file_path,
                                  std::unordered_map<std::string, std::vector<int64_t>>& out_map)
 {
-  duckdb::Connection conn(db);
-  duckdb::SiriusContext::InternalQueryGuard conn_guard(*conn.context);
+  auto conn = sirius::scan::open_internal_connection(context);
 
   auto result = conn.Query("SELECT file_path, pos FROM read_parquet('" +
                            escape_sql_string(delete_file_path) + "')");
@@ -432,7 +431,7 @@ equality_delete_read_result read_equality_delete_file(std::string const& delete_
 }
 
 /// Merges V2 positional deletes and V3 deletion vectors into one per-data-file map.
-void materialize_positional_deletes(duckdb::DatabaseInstance& db,
+void materialize_positional_deletes(duckdb::ClientContext& context,
                                     IcebergManifestDiscovery const& files,
                                     std::unordered_map<std::string, std::vector<int64_t>>& out_map)
 {
@@ -441,7 +440,7 @@ void materialize_positional_deletes(duckdb::DatabaseInstance& db,
                     files.positional_delete_files.size());
     for (auto const& del_path : files.positional_delete_files) {
       SIRIUS_LOG_DEBUG("[iceberg] Reading positional-delete file: {}", del_path);
-      read_positional_delete_file(db, del_path, out_map);
+      read_positional_delete_file(context, del_path, out_map);
     }
   }
 
@@ -622,7 +621,6 @@ namespace {
 
 /// Per-query memo; the wrapper below explains the key and the scope.
 std::mutex g_delete_data_cache_mtx;
-// Typed fields retain path bytes and distinguish connection/statement generations and settings.
 using delete_cache_key = std::tuple<std::uint64_t,
                                     std::uint64_t,
                                     std::uint64_t,
@@ -688,7 +686,7 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data_uncached(
   }
 
   if (has_pos_deletes) {
-    materialize_positional_deletes(*context.db, discovery, data->positional_deletes);
+    materialize_positional_deletes(context, discovery, data->positional_deletes);
   }
   if (has_eq_deletes) {
     // The plan gate declines these tables, so reaching here means it has a hole. Two pieces of

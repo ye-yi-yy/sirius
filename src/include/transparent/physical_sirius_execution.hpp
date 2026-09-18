@@ -51,7 +51,9 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
                           scan::source_policy cpu_source_policy,
                           std::shared_ptr<const scan::original_plan_evidence> originals,
                           scan::candidate_origin origin,
-                          duckdb::idx_t estimated_cardinality);
+                          duckdb::idx_t estimated_cardinality,
+                          duckdb::unique_ptr<op::sirius_physical_operator> validated_plan,
+                          std::uint64_t validated_plan_pin_epoch);
 
   // Source operator interface
   bool IsSource() const override { return true; }
@@ -64,17 +66,10 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
                                            duckdb::OperatorSourceInput& input) const override;
 
   std::string GetName() const override { return "SIRIUS_GPU_EXECUTION"; }
+  void discard_validated_plan();
 
  private:
-  /// A reusable copy of the optimized logical plan.
-  /// DuckDB can execute the same prepared physical operator multiple times, so
-  /// we rebuild a fresh Sirius physical plan from this template for each run.
-  /// May be null when the plan contains a non-Copy()-able LogicalGet (a table
-  /// function whose bind_data has no serializer) — in that case we fall back to
-  /// re-planning from `unbound_statement_`.
-  /// Mutable: GetDataInternal is `const` per the DuckDB interface, but on the
-  /// first execute we may discover Copy() throws and need to clear this so
-  /// future executes skip straight to the replan path.
+  // Used only if the retained plan must be rebuilt; null for uncopyable bindings.
   mutable duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan_;
 
   /// Original SQL string used to re-plan when `logical_plan_` cannot be
@@ -98,6 +93,8 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   const scan::source_policy cpu_source_policy_;
   const std::shared_ptr<const scan::original_plan_evidence> originals_;
   const scan::candidate_origin origin_;
+  mutable duckdb::unique_ptr<op::sirius_physical_operator> validated_plan_;
+  const std::uint64_t validated_plan_pin_epoch_;
 };
 
 }  // namespace sirius::transparent

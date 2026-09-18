@@ -34,7 +34,8 @@ source_occurrence capture(source_registry& registry,
           adapter && !adapter->profile().implementation_verified,
           adapter && adapter->profile().selector_outside_bind,
           adapter && adapter->profile().allows_cpu_replay,
-          std::nullopt};
+          std::nullopt,
+          adapter ? &adapter->profile() : nullptr};
 }
 
 std::string key(const source_occurrence& source)
@@ -86,7 +87,7 @@ std::shared_ptr<const plan_evidence> capture_logical_plan(duckdb::ClientContext&
     if (node->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
       const auto& get = node->Cast<duckdb::LogicalGet>();
       if (origin == capture_origin::candidate) {
-        registry.require(get.function, get.bind_data.get());
+        registry.require(get.function, get.bind_data.get(), diagnostics_for(context).get());
       }
       auto source = capture(registry,
                             generation,
@@ -98,6 +99,9 @@ std::shared_ptr<const plan_evidence> capture_logical_plan(duckdb::ClientContext&
                             get.returned_types);
       if (source.requires_selector) {
         source.selector = capture_selector(get.parameters, get.named_parameters);
+      }
+      if (source.capture.status() != capture_status::complete) {
+        diagnostics_for(context)->capture_incomplete();
       }
       result->sources.push_back(std::move(source));
     }
@@ -133,6 +137,9 @@ std::shared_ptr<const plan_evidence> capture_physical_plan(duckdb::ClientContext
                                         get.bind_data.get(),
                                         get.names,
                                         get.returned_types));
+      if (result->sources.back().capture.status() != capture_status::complete) {
+        diagnostics_for(context)->capture_incomplete();
+      }
     }
     for (const auto& child : node->GetChildren()) {
       pending.push_back(&child.get());
@@ -145,19 +152,37 @@ comparison_result compare_candidate(const original_plan_evidence& original,
                                     const plan_evidence& candidate,
                                     candidate_origin origin)
 {
-  auto refuse = [](comparison_verdict verdict, const char* reason) {
-    return comparison_result{verdict, correspondence_mode::none, false, reason};
+  const auto fingerprint = [](const plan_evidence& plan) {
+    std::uint64_t hash = 0;
+    for (const auto& source : plan.sources) {
+      hash += source.capture.view() ? source.capture.view()->identity_hash
+                                    : std::hash<std::string>{}(source.function);
+    }
+    return hash;
   };
+  const auto original_hash  = original.physical ? fingerprint(*original.physical) : 0;
+  const auto candidate_hash = fingerprint(candidate);
+  auto refuse =
+    [&](comparison_verdict verdict, scan_refusal_reason reason, std::uint64_t differences = 0) {
+      return comparison_result{verdict,
+                               correspondence_mode::none,
+                               false,
+                               refusal_name(reason),
+                               reason,
+                               original_hash,
+                               candidate_hash,
+                               differences};
+    };
   if (!original.physical || original.physical->instance != candidate.instance ||
       original.physical->generation != candidate.generation) {
-    return refuse(comparison_verdict::unproven, "original_generation_unproven");
+    return refuse(comparison_verdict::unproven, scan_refusal_reason::original_generation_unproven);
   }
   const auto& physical = *original.physical;
   if (physical.output_types != candidate.output_types) {
-    return refuse(comparison_verdict::mismatch, "output_schema_mismatch");
+    return refuse(comparison_verdict::mismatch, scan_refusal_reason::output_schema_mismatch);
   }
   if (!available(candidate) || !available(physical)) {
-    return refuse(comparison_verdict::unproven, "capture_incomplete");
+    return refuse(comparison_verdict::unproven, scan_refusal_reason::capture_incomplete);
   }
   const bool compatibility = has_compatibility(candidate) || has_compatibility(physical);
   std::map<std::string, std::int64_t> multiplicities;
@@ -167,8 +192,13 @@ comparison_result compare_candidate(const original_plan_evidence& original,
   for (const auto& source : candidate.sources) {
     --multiplicities[key(source)];
   }
+  std::uint64_t differences = 0;
   for (const auto& entry : multiplicities) {
-    if (entry.second) { return refuse(comparison_verdict::mismatch, "read_view_mismatch"); }
+    differences += entry.second < 0 ? -entry.second : entry.second;
+  }
+  if (differences) {
+    return refuse(
+      comparison_verdict::mismatch, scan_refusal_reason::read_view_mismatch, differences);
   }
 
   auto mode = correspondence_mode::empty;
@@ -178,26 +208,26 @@ comparison_result compare_candidate(const original_plan_evidence& original,
           original.hook->instance != candidate.instance ||
           original.hook->generation != candidate.generation ||
           original.hook->sources.size() != candidate.sources.size()) {
-        return refuse(comparison_verdict::unproven, "no_correspondence");
+        return refuse(comparison_verdict::unproven, scan_refusal_reason::no_correspondence);
       }
       std::map<duckdb::idx_t, const source_occurrence*> partners;
       for (const auto& source : original.hook->sources) {
         if (!partners.emplace(source.table_index, &source).second) {
-          return refuse(comparison_verdict::unproven, "no_correspondence");
+          return refuse(comparison_verdict::unproven, scan_refusal_reason::no_correspondence);
         }
       }
       for (const auto& source : candidate.sources) {
         const auto it = partners.find(source.table_index);
         if (it == partners.end()) {
-          return refuse(comparison_verdict::unproven, "no_correspondence");
+          return refuse(comparison_verdict::unproven, scan_refusal_reason::no_correspondence);
         }
         if (!same_view(source, *it->second)) {
-          return refuse(comparison_verdict::mismatch, "read_view_mismatch");
+          return refuse(comparison_verdict::mismatch, scan_refusal_reason::read_view_mismatch);
         }
         if (source.requires_selector && !source.compatibility &&
             (!source.selector || !it->second->selector ||
              source.selector != it->second->selector)) {
-          return refuse(comparison_verdict::unproven, "selector_unproven");
+          return refuse(comparison_verdict::unproven, scan_refusal_reason::selector_unproven);
         }
         partners.erase(it);
       }
@@ -206,7 +236,9 @@ comparison_result compare_candidate(const original_plan_evidence& original,
       if (candidate.sources.size() != 1) {
         // TODO(R1 D1/D2/D3): remove this explicitly requested compatibility exception
         // when the actual Parquet/Iceberg bridges can support full admission.
-        if (!compatibility) { return refuse(comparison_verdict::unproven, "no_correspondence"); }
+        if (!compatibility) {
+          return refuse(comparison_verdict::unproven, scan_refusal_reason::no_correspondence);
+        }
         mode = correspondence_mode::none;
       } else {
         mode               = correspondence_mode::single;
@@ -218,7 +250,7 @@ comparison_result compare_candidate(const original_plan_evidence& original,
              !same_view(source, original.hook->sources.front()) || !source.selector ||
              !original.hook->sources.front().selector ||
              source.selector != original.hook->sources.front().selector)) {
-          return refuse(comparison_verdict::unproven, "selector_unproven");
+          return refuse(comparison_verdict::unproven, scan_refusal_reason::selector_unproven);
         }
       }
     }
@@ -226,7 +258,11 @@ comparison_result compare_candidate(const original_plan_evidence& original,
   return {compatibility ? comparison_verdict::unproven : comparison_verdict::equal,
           mode,
           compatibility,
-          compatibility ? "provider_bridge_deferred" : ""};
+          compatibility ? "provider_bridge_deferred" : "",
+          scan_refusal_reason::read_view_mismatch,
+          original_hash,
+          candidate_hash,
+          0};
 }
 
 void comparison_result::require_match() const

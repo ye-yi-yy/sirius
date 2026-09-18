@@ -36,6 +36,7 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -170,10 +171,14 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   duckdb_native_gpu_ingestible(std::unique_ptr<op::scan::duckdb_native_ingestible_table_info> info);
 
   ~duckdb_native_gpu_ingestible() override;
-  void validate_dependencies() const override
+  void prepare_dependencies(sirius::scan_manager::sirius_scan_manager&) override;
+  void ensure_metadata_prepared() override;
+  [[nodiscard]] bool metadata_walk_pending() const noexcept
   {
-    _info->checkpoint_lease->validate(*_info->storage);
+    return !_walk_ready.load(std::memory_order_acquire);
   }
+  [[nodiscard]] std::uint64_t checkpoint_iteration() const;
+  void validate_dependencies() const override;
   void certify(duckdb_native_scan_info&) const;
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const override;
@@ -223,8 +228,10 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
   //===----------RG Range Slicing----------===//
   std::size_t _chunk_row_groups =
     1;  ///< The number of row groups to chunk together for each metadata scan task.
-  std::size_t _num_ranges = 0;
+  std::atomic<std::size_t> _num_ranges{0};
   std::atomic<std::size_t> _next_range_idx{0};
+  std::once_flag _walk_once;
+  std::atomic<bool> _walk_ready{false};
 };
 
 std::shared_ptr<duckdb_native_gpu_ingestible> make_ingestible(

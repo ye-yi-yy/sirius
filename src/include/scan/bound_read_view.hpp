@@ -13,6 +13,7 @@
 #include <duckdb/function/table_function.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,6 +39,7 @@ struct bound_read_view {
   const bound_schema_ptr schema;
   const std::string canonical_identity;
   const std::vector<file_inventory_entry> files;
+  const std::uint64_t identity_hash = std::hash<std::string>{}(canonical_identity);
 };
 
 /// Records capture status and provenance without binding or I/O. Standard Parquet and Iceberg

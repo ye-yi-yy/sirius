@@ -25,6 +25,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
+#include "scan/diagnostics.hpp"
 #include "scan/plan_evidence.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_config.hpp"
@@ -132,6 +133,7 @@ class SiriusConnectionState : public ClientContextState {
       throw InvalidInputException("Sirius planning generation exhausted");
     }
     ++planning_generation_;
+    scan_diagnostics.reset();
     clear_captured_plan();
   }
 
@@ -163,8 +165,15 @@ class SiriusConnectionState : public ClientContextState {
     original_scans.reset();
   }
   std::shared_ptr<const sirius::scan::plan_evidence> original_scans;
-  // Context-thread construction guard. Provider SQL must finish before native leases.
+  std::shared_ptr<sirius::scan::scan_attempt_diagnostics> scan_diagnostics;
+  // Context-thread protection inherited by framework-owned helper connections.
   std::size_t protected_scan_windows = 0;
+  shared_ptr<SiriusConnectionState> internal_query_parent;
+  [[nodiscard]] bool has_protected_scan_window() const noexcept
+  {
+    return protected_scan_windows != 0 ||
+           (internal_query_parent && internal_query_parent->has_protected_scan_window());
+  }
 
   void set_pending_query_label(std::string label) { pending_query_label_ = std::move(label); }
   [[nodiscard]] std::optional<std::string> take_pending_query_label()
@@ -265,7 +274,15 @@ class SiriusContext : public ClientContextState {
     // GPU execution was attempted and failed at runtime, and the query completed
     // via DuckDB CPU fallback (same transaction). Distinct from `fallbacks`, which
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
-    uint64_t runtime_fallbacks = 0;
+    uint64_t runtime_fallbacks                 = 0;
+    uint64_t execution_rebuilds                = 0;
+    uint64_t lease_held_at_replay              = 0;
+    uint64_t read_view_mismatches              = 0;
+    uint64_t certificate_mismatches            = 0;
+    uint64_t checkpoint_revalidation_failures  = 0;
+    uint64_t scan_capture_incomplete           = 0;
+    uint64_t scan_planning_safety_declines     = 0;
+    uint64_t scan_source_verification_declines = 0;
   };
 
   /// Monotonic counters describing compressed-materialization activity.
@@ -290,7 +307,8 @@ class SiriusContext : public ClientContextState {
     uint64_t scan_narrow_targets_retracted = 0;
   };
 
-  SiriusContext();
+  explicit SiriusContext(std::shared_ptr<sirius::scan::contract_counters> counters =
+                           std::make_shared<sirius::scan::contract_counters>());
   ~SiriusContext() noexcept override;
 
   // Non-copyable and non-movable
@@ -358,7 +376,7 @@ class SiriusContext : public ClientContextState {
       : state_(get_sirius_connection_state(context))
     {
       if (state_) {
-        if (state_->protected_scan_windows != 0) {
+        if (state_->has_protected_scan_window()) {
           throw ExecutorException(
             "Sirius scan contract: internal SQL while native leases are held");
         }
@@ -459,6 +477,17 @@ class SiriusContext : public ClientContextState {
    */
   class StandaloneQueryScope {
    public:
+    enum class lease_release_state : uint8_t {
+      not_entered,
+      released,
+      begin_failed,
+      cleanup_failed
+    };
+    struct lease_release_result {
+      lease_release_state state = lease_release_state::not_entered;
+      std::size_t keys_released = 0;
+    };
+    [[nodiscard]] lease_release_result lease_release() const noexcept { return lease_release_; }
     StandaloneQueryScope(SiriusContext& ctx, ClientContext& context, std::string_view window_label);
     ~StandaloneQueryScope() noexcept;
     StandaloneQueryScope(const StandaloneQueryScope&)            = delete;
@@ -495,6 +524,7 @@ class SiriusContext : public ClientContextState {
     char begin_tag_[192] = {};
     char end_tag_[192]   = {};
     scope_state state_   = scope_state::ACTIVE;
+    lease_release_result lease_release_{lease_release_state::cleanup_failed, 0};
   };
 
   /// \brief Terminate the Sirius context, releasing all resources.
@@ -627,6 +657,8 @@ class SiriusContext : public ClientContextState {
   /// \brief Record that a GPU execution failed at runtime and the query completed
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
+  void record_transparent_execution_rebuild() noexcept;
+  void record_lease_held_at_replay() noexcept;
 
   /// \brief Snapshot counters for compressed-materialization observability.
   [[nodiscard]] compressed_materialization_stats get_compressed_materialization_stats()
@@ -673,11 +705,12 @@ class SiriusContext : public ClientContextState {
   /// telemetry and logging inside are best-effort and never abort the
   /// remaining steps. @p query_id selects which query's repositories to drop;
   /// @p end_tag keys the pool-stats log line to the window.
-  void run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag);
+  StandaloneQueryScope::lease_release_result run_mandatory_cleanup(sirius::query_id_t query_id,
+                                                                   std::string_view end_tag);
   /// noexcept variant for the StandaloneQueryScope destructor backstop: one
   /// attempt; on failure marks the runtime UNAVAILABLE.
-  void run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
-                                      std::string_view end_tag) noexcept;
+  StandaloneQueryScope::lease_release_result run_mandatory_cleanup_backstop(
+    sirius::query_id_t query_id, std::string_view end_tag) noexcept;
 
   /// \brief Best-effort per-query teardown for latched-unavailable paths, where no later
   /// window will ever run the in-cleanup reset: drops @p query_id's task_creator state and its
@@ -767,10 +800,13 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::scan_manager::sirius_scan_manager> scan_manager_;
 
   sirius::op::dynamic_filter_stats dynamic_filter_stats_;
+  const std::shared_ptr<sirius::scan::contract_counters> scan_contract_counters_;
   std::atomic<uint64_t> transparent_rebind_success_count_{0};
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  std::atomic<uint64_t> transparent_execution_rebuild_count_{0};
+  std::atomic<uint64_t> lease_held_at_replay_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_columns_narrowed_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
   std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};
@@ -778,6 +814,9 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> compressed_materialization_partition_narrow_columns_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_narrow_targets_retracted_count_{0};
 };
+
+void require_cpu_replay_lease_release(
+  ClientContext&, const SiriusContext::StandaloneQueryScope::lease_release_result&);
 
 /// Installs the sink selected by `Config::LOG_BACKEND` (with `Config::LOG_*`).
 ///
@@ -795,7 +834,7 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
 
   /// Finish runtime initialization after process-wide setup that must precede
   /// the first NVTX/runtime-initialization call.
-  void initialize_context();
+  void initialize_context(DatabaseInstance& db);
 
   [[nodiscard]] bool is_disabled() const noexcept { return disabled_; }
 

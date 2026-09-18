@@ -180,6 +180,9 @@ struct duckdb_native_walk_plan {
   std::string viability_failure_reason;
 };
 
+std::optional<std::string> unsupported_projected_type_reason(
+  const std::vector<projected_column>&, const std::vector<sirius::logical_type>&);
+
 /**
  * @brief Prepare a DuckDB-native metadata walk without per-segment I/O.
  *

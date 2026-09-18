@@ -79,7 +79,6 @@ class stream_source_adapter final : public detail::factory_source_adapter {
     auto source = duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(
       binding.types, op.EstimateCardinality(context), binding.repository, binding.expected_senders);
 
-    // Lower the retained binding; never resolve a possibly newer declaration by stream ID.
     source->attach_binding(std::move(catalog), bind->declaration);
     return scan_runtime_handle(std::move(source));
   }

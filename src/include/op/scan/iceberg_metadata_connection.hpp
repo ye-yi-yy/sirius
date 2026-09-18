@@ -16,111 +16,26 @@
 
 #pragma once
 
-#include <duckdb/main/client_context.hpp>
-#include <duckdb/main/connection.hpp>
-#include <duckdb/transaction/meta_transaction.hpp>
-#include <sirius_context.hpp>
-
-#include <string>
+#include "scan/internal_connection.hpp"
 
 namespace sirius::op::scan {
 
-/**
- * @brief The one place Sirius opens a DuckDB connection to read Iceberg metadata while planning.
- *
- * ## Why a connection at all
- *
- * Iceberg metadata lives behind `duckdb-iceberg`'s table functions. Sirius does not link against
- * that extension, and the facts it needs are not readable from the bound plan: `MultiFileBindData`
- * exposes no snapshot, and `OpenFileInfo::extended_info` carries only file_size/etag/last_modified/
- * first_row_id/sequence_number. duckdb-iceberg DOES install a `get_bind_info` hook
- * (`IcebergBindInfo`), and it holds the resolved `IcebergMultiFileList` when it runs, but it
- * publishes only the catalog entry -- the snapshot identity it has in hand never reaches
- * `BindInfo::options`. So the delete files, the manifest entries and the data-file footers are
- * reachable only by asking DuckDB for them.
- *
- * ## Why a SECOND connection cannot see a different table than the bind did
- *
- * This was the reviewers' hazard, and it is closed by construction rather than by agreement: an
- * `iceberg_scan` with no `snapshot_from_id` is declined at plan time, so every query issued
- * through this connection names the SAME snapshot id the outer scan was bound to. A commit landing
- * mid-plan moves `current`; it does not move a pinned id. Callers that read Iceberg metadata must
- * therefore pass `snapshot_from_id` through, and there is no path here that resolves "current".
- *
- * ## What it deliberately does NOT do
- *
- * It does not force settings on. A fresh connection inherits GLOBAL settings from the shared
- * `DatabaseInstance` but not session-scoped ones, so a session-level flag is MIRRORED from the
- * outer context. Forcing `unsafe_enable_version_guessing = true` here would mean Sirius reading a
- * table the user's own session refuses to read, and deciding on its behalf that a table with no
- * version hint may be guessed at. When the outer session has not enabled it, the query fails, the
- * caller's "any failure declines" rule fires, and the table is read by DuckDB instead.
- */
+// Callers supply the bound snapshot; this connection must not resolve a new current snapshot.
 class iceberg_metadata_connection {
  public:
   explicit iceberg_metadata_connection(duckdb::ClientContext& context)
-    : _conn(unsealed_database(context)), _conn_guard(*_conn.context)
+    : _connection(
+        sirius::scan::open_internal_connection(context, {"unsafe_enable_version_guessing"}))
   {
-    // Session-scoped settings that change which tables are LEGIBLE. Every site that reads Iceberg
-    // metadata must agree on this set: if the delete gate and the delete discovery disagree about
-    // which tables they can read, the gate's verdict describes a different table than the scan.
-    //
-    // Mirrored in BOTH directions. Only copying `true` left the inverse ungoverned: a GLOBAL true
-    // overridden to false in the outer session was inherited as true here, so this connection
-    // could read a table the user's own session refuses to read -- the exact asymmetry the class
-    // exists to prevent, just the other way round.
-    static constexpr auto kMirroredSettings = {"unsafe_enable_version_guessing"};
-    for (auto const* setting : kMirroredSettings) {
-      duckdb::Value value;
-      if (!context.TryGetCurrentSetting(setting, value) || value.IsNull()) { continue; }
-      bool const outer_effective =
-        value.DefaultCastAs(duckdb::LogicalType::BOOLEAN).GetValue<bool>();
-      _conn.Query(std::string("SET ") + setting + " = " + (outer_effective ? "true" : "false"));
-    }
-    auto begin = _conn.Query("BEGIN TRANSACTION READ ONLY");
-    if (begin->HasError()) { begin->ThrowError(); }
-    require_read_only();
   }
 
-  ~iceberg_metadata_connection()
+  duckdb::unique_ptr<duckdb::MaterializedQueryResult> Query(const std::string& sql)
   {
-    // End metadata work while its internal-query bracket is still live.
-    try {
-      _conn.Rollback();
-    } catch (...) {
-    }
-  }
-
-  duckdb::Connection& get() { return _conn; }
-
-  duckdb::unique_ptr<duckdb::MaterializedQueryResult> Query(std::string const& sql)
-  {
-    require_read_only();
-    return _conn.Query(sql);
+    return _connection.Query(sql);
   }
 
  private:
-  void require_read_only()
-  {
-    if (!_conn.context->ActiveTransaction().IsReadOnly()) {
-      throw duckdb::ExecutorException(
-        "Sirius scan contract: metadata transaction is not read-only");
-    }
-  }
-  static duckdb::DatabaseInstance& unsealed_database(duckdb::ClientContext& context)
-  {
-    auto state = duckdb::get_sirius_connection_state(context);
-    if (state && state->protected_scan_windows != 0) {
-      throw duckdb::ExecutorException("Sirius scan contract: provider SQL after construction seal");
-    }
-    return *context.db;
-  }
-  duckdb::Connection _conn;
-  // Per-connection bracket. Opening a connection to the same database re-registers the SAME
-  // SiriusContext, whose query-lifecycle callbacks would otherwise fire QueryBegin/QueryEnd
-  // underneath the query being planned; and unbracketed these contend for the plan slot the outer
-  // query already holds. Declared after _conn so it is constructed from a live connection.
-  duckdb::SiriusContext::InternalQueryGuard _conn_guard;
+  sirius::scan::internal_connection _connection;
 };
 
 }  // namespace sirius::op::scan

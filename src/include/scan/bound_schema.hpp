@@ -24,7 +24,6 @@ class bound_schema {
  public:
   bound_schema(std::vector<std::string> names, const duckdb::vector<duckdb::LogicalType>& types);
 
-  // Share the const owner instead of assigning to, or moving out of, a published snapshot.
   bound_schema(const bound_schema&)            = delete;
   bound_schema& operator=(const bound_schema&) = delete;
   bound_schema(bound_schema&&)                 = delete;

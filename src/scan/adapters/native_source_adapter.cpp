@@ -34,9 +34,6 @@
 
 namespace sirius::scan {
 namespace {
-//! Build a `duckdb_native_ingestible_table_info` from a `seq_scan` TABLE_SCAN. Requires a
-//! live `ClientContext` (the ingestible reads table storage during `prepare_for_query`);
-//! throws on non-base-table scans.
 std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info>
 build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
                                const sirius::operator_params& op_params,
@@ -59,10 +56,7 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
   info->storage = &table.GetStorage();
   info->context = &context;
   info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
-  // Qualified-name identity for the pin cache — derived from the resolved
-  // DuckTableEntry so it matches the pin-side derivation (build_duckdb_pin_info)
-  // exactly. Without these a pin_table(format='duckdb', ...) query silently misses
-  // the pinned cache and falls through to disk.
+  // Pin lookup must use the same resolved identity as build_duckdb_pin_info.
   info->catalog_name           = table.ParentCatalog().GetName();
   info->schema_name            = table.ParentSchema().name;
   info->table_name             = table.name;
@@ -119,8 +113,7 @@ class native_source_adapter final : public detail::factory_source_adapter {
                               true,
                               false,
                               true,
-                              scan_runtime_form::ingestible,
-                              true},
+                              scan_runtime_form::ingestible},
                              duckdb::TableScanFunction::GetFunction())
   {
   }
@@ -157,13 +150,6 @@ class native_source_adapter final : public detail::factory_source_adapter {
 
   source_preflight_result preflight_source(const source_preflight_request& request) const override
   {
-    const auto& native_bind = static_cast<const duckdb::TableScanBindData&>(*request.get.bind_data);
-    auto& native_storage    = native_bind.table.Cast<duckdb::DuckTableEntry>().GetStorage();
-    duckdb::DuckTransaction::Get(request.context, native_storage.GetAttached());
-    // The early pin/codec probe borrows storage only within this scope. The final runtime
-    // acquires the shared window lease after all providers finish their metadata SQL.
-    native_checkpoint_lease probe(
-      native_storage, 0, source_registry::get(*request.context.db).counters);
     auto& op                                 = request.get;
     auto& context                            = request.context;
     auto* sirius_state                       = request.sirius_state;
@@ -191,12 +177,8 @@ class native_source_adapter final : public detail::factory_source_adapter {
         }
       }
     }
-    // Plan-time probe for the duckdb-native seq_scan path: strings at/over
-    // StringUncompressed::GetStringBlockLimit (a per-value limit) live in overflow
-    // blocks the GPU string decoder cannot resolve. Refuse HERE, where the throw still
-    // becomes a clean CPU fallback — the walker's refusal at pipeline conversion
-    // surfaces as a mid-query error with none. Conservative for DICT_FSST, which
-    // inlines strings up to 16 KiB (see prepare_duckdb_native_walk).
+    // Reject known overflow strings before execution; the GPU decoder cannot resolve their
+    // blocks. This is conservative for DICT_FSST, which can inline strings up to 16 KiB.
     if (op.bind_data) {
       auto* table_scan_bind = dynamic_cast<duckdb::TableScanBindData*>(op.bind_data.get());
       if (table_scan_bind != nullptr && table_scan_bind->table.IsDuckTable()) {
@@ -385,7 +367,6 @@ class native_source_adapter final : public detail::factory_source_adapter {
     if (!request.window) {
       throw duckdb::InternalException("Native runtime requires a construction window");
     }
-    info->checkpoint_lease = request.window->lease_for(*info->storage);
     return detail::make_ingestible_runtime(std::move(info), request);
   }
   source_policy_evidence inspect_source(const binding_ref&) const override { return {}; }

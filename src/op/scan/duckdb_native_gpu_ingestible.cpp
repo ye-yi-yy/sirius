@@ -16,6 +16,7 @@
 
 // sirius
 #include "op/scan/owning_table_view.hpp"
+#include "scan_manager/sirius_scan_manager.hpp"
 
 #include <expression/ast/from_duckdb.hpp>
 #include <expression_evaluator/expression_evaluator.hpp>
@@ -210,32 +211,8 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   }
 
   _info->storage_owner = bind.storage->shared_from_this();
-  _info->context_owner = bind.context->shared_from_this();
-  if (!_info->checkpoint_lease) {
-    // Direct native pin population uses the same scoped protection.
-    duckdb::DuckTransaction::Get(*bind.context, bind.storage->GetAttached());
-    _info->checkpoint_lease = std::make_shared<sirius::scan::native_checkpoint_lease>(
-      *bind.storage, 0, sirius::scan::source_registry::get(*bind.context->db).counters);
-  }
-  _info->checkpoint_lease->validate(*bind.storage);
-
-  // Phase 1 (serial): PartitionStatistics,
-  //                   projected-type gate, and
-  //                   filter-stat row-group pruning.
-  // Unsupported types / invalid partitions refuse -> CPU fallback before any per-segment IO.
-  // PartitionStatistics touches ClientContext/LocalStorage (not thread-safe), so it must stay
-  // serial.
-  _plan = prepare_duckdb_native_walk(*bind.storage,
-                                     *bind.context,
-                                     bind.projected_cols,
-                                     bind.projected_types,
-                                     bind.table_filters.get(),
-                                     &bind.column_ids);
-  if (!_plan.viable) {
-    SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}",
-                     _plan.viability_failure_reason);
-    throw std::runtime_error("duckdb-native scan rejected query: " +
-                             _plan.viability_failure_reason);
+  if (auto reason = unsupported_projected_type_reason(bind.projected_cols, bind.projected_types)) {
+    throw std::runtime_error("duckdb-native scan rejected query: " + *reason);
   }
 
   auto& sm          = bind.storage->GetAttached().GetStorageManager();
@@ -270,12 +247,68 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
     }
   }
 
-  // Slice [0, n_row_groups) into parse ranges; each becomes one thunk (Phase 2).
-  // Always at least one range: a zero-row-group table must still push one (empty)
-  // scan_info so the coalescer seeds its template and emits the empty split —
-  // zero splits would mean zero tasks and the query never completes.
   _chunk_row_groups = metadata_parse_chunk();
-  _num_ranges = std::max<std::size_t>(1, utils::ceil_div(_plan.n_row_groups, _chunk_row_groups));
+}
+
+void duckdb_native_gpu_ingestible::prepare_dependencies(
+  sirius::scan_manager::sirius_scan_manager& manager)
+{
+  auto lease = manager.checkpoint_lease_for(*_info->storage);
+  if (_info->checkpoint_lease && _info->checkpoint_lease != lease) {
+    throw std::runtime_error("Sirius scan contract: native execution window changed");
+  }
+  _info->checkpoint_lease = std::move(lease);
+  _block_manager          = _info->checkpoint_lease->block_manager();
+  _info->context_owner    = _info->context->shared_from_this();
+}
+
+void duckdb_native_gpu_ingestible::validate_dependencies() const
+{
+  if (!_info->checkpoint_lease) {
+    throw std::runtime_error("Sirius scan contract: native checkpoint key not held");
+  }
+  _info->checkpoint_lease->validate(*_info->storage);
+}
+
+void duckdb_native_gpu_ingestible::ensure_metadata_prepared()
+{
+  if (_walk_ready.load(std::memory_order_acquire)) { return; }
+  std::call_once(_walk_once, [this] {
+    validate_dependencies();
+    _block_manager       = _info->checkpoint_lease->block_manager();
+    const auto& bind     = *_info;
+    _info->context_owner = bind.context->shared_from_this();
+    duckdb::Value inject;
+    if (bind.context->TryGetCurrentSetting("sirius_test_inject_native_walk_failure", inject) &&
+        !inject.IsNull() && inject.GetValue<bool>()) {
+      throw duckdb::ExecutorException("injected native metadata walk failure");
+    }
+    // Partition statistics use ClientContext/LocalStorage; prepare runs on the query thread.
+    auto plan = prepare_duckdb_native_walk(*bind.storage,
+                                           *bind.context,
+                                           bind.projected_cols,
+                                           bind.projected_types,
+                                           bind.table_filters.get(),
+                                           &bind.column_ids);
+    if (!plan.viable) {
+      throw std::runtime_error("duckdb-native scan rejected query: " +
+                               plan.viability_failure_reason);
+    }
+    _plan = std::move(plan);
+    _num_ranges.store(
+      std::max<std::size_t>(1, utils::ceil_div(_plan.n_row_groups, _chunk_row_groups)),
+      std::memory_order_relaxed);
+    _walk_ready.store(true, std::memory_order_release);
+  });
+}
+
+std::uint64_t duckdb_native_gpu_ingestible::checkpoint_iteration() const
+{
+  if (metadata_walk_pending()) {
+    throw std::runtime_error("Sirius native metadata has not been prepared");
+  }
+  validate_dependencies();
+  return _info->checkpoint_lease->iteration();
 }
 
 duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;
@@ -285,14 +318,17 @@ duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;
 //===----------------------------------------------------------------------===//
 bool duckdb_native_gpu_ingestible::has_processed_all_metadata() const
 {
-  return _next_range_idx.load(std::memory_order_relaxed) >= _num_ranges;
+  return _walk_ready.load(std::memory_order_acquire) &&
+         _next_range_idx.load(std::memory_order_relaxed) >=
+           _num_ranges.load(std::memory_order_relaxed);
 }
 
 duckdb_native_gpu_ingestible::metadata_scan_task_t
 duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
 {
+  ensure_metadata_prepared();
   auto const idx = _next_range_idx.fetch_add(1, std::memory_order_relaxed);
-  if (idx >= _num_ranges) { return nullptr; }  // lost the race for the final range
+  if (idx >= _num_ranges.load(std::memory_order_relaxed)) { return nullptr; }
 
   auto const rg_begin = idx * _chunk_row_groups;
   auto const rg_end   = std::min(rg_begin + _chunk_row_groups, _plan.n_row_groups);

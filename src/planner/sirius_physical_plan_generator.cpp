@@ -168,9 +168,6 @@ void visit_runtime_nodes(sirius::op::sirius_physical_operator& node, const Visit
   }
 }
 
-//! Replace a TABLE_SCAN with its adapter's GPU runtime. Shared wrappers follow capabilities,
-//! without inspecting provider names or payloads. Decline unsupported output carriers while
-//! transparent planning can still fall back to DuckDB.
 void wrap_table_scan_source(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator>& table_scan_slot,
   const sirius::operator_params& op_params,
@@ -182,7 +179,8 @@ void wrap_table_scan_source(
 
   auto& scan = table_scan_slot->Cast<sirius::op::sirius_physical_table_scan>();
   const auto& adapter =
-    sirius::scan::source_registry::get(*context.db).require(scan.function, scan.bind_data.get());
+    sirius::scan::source_registry::get(*context.db)
+      .require(scan.function, scan.bind_data.get(), sirius::scan::diagnostics_for(context).get());
   // GPU_SCAN normalization requires one target per output column. Reject an incomplete schema
   // while transparent execution can still fall back to DuckDB.
   require_complete_gpu_scan_schema(scan);
@@ -844,23 +842,20 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
   if (sirius_ctx) { op_params = sirius_ctx->get_config().get_operator_params(); }
-  // Complete every SQL-dependent provider runtime before acquiring any native lease.
-  // Dispatch is by construction capability; adding a provider requires no source-kind branch.
   visit_runtime_nodes(*plan, [&](auto& node) {
     if (node.type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) { return; }
     auto& source         = node.template Cast<sirius::op::sirius_physical_table_scan>();
     source.scan_registry = scan_window;
     const auto& adapter =
-      scan::source_registry::get(*context.db).require(source.function, source.bind_data.get());
+      scan::source_registry::get(*context.db)
+        .require(source.function, source.bind_data.get(), scan::diagnostics_for(context).get());
     adapter.declare_resources(
       *scan_window, context, {*context.db, source.function, source.bind_data.get()});
-    if (!adapter.profile().protected_construction) {
-      auto runtime =
-        adapter.create_scan_runtime({context, std::ref(source), &op_params, scan_window});
-      source.prepared_runtime = runtime.take_ingestible();
-    }
+    auto runtime =
+      adapter.create_scan_runtime({context, std::ref(source), &op_params, scan_window});
+    source.prepared_runtime = runtime.take_ingestible();
   });
-  scan_window->seal_and_acquire(context);
+  scan_window->seal();
   insert_gpu_pipeline_operators_recursive(plan, op_params, context, sirius_ctx.get());
   visit_runtime_nodes(*plan, [&](auto& node) {
     if (!node.scan_occurrence_index) { return; }
@@ -884,7 +879,11 @@ void sirius_physical_plan_generator::insert_gpu_pipeline_operators(
         .get_ingestible()
         .set_scan_contract(node.scan_contract);
     }
-    SIRIUS_LOG_DEBUG("{}", scan::contract_summary(*node.scan_contract, scan_window->comparison()));
+    SIRIUS_LOG_DEBUG("{}",
+                     scan::contract_summary(*node.scan_contract,
+                                            scan_window->comparison(),
+                                            scan_window->audit(),
+                                            scan_window->origin()));
   });
   scan_window->freeze();
   plan->scan_registry = scan_window;
@@ -962,8 +961,10 @@ sirius_physical_plan_generator::create_plan(
   if (originals) {
     comparison = scan::compare_candidate(*originals, *candidate, origin);
     if (comparison.verdict != scan::comparison_verdict::equal && !comparison.compatibility) {
-      scan::source_registry::get(*context.db).counters->read_view_mismatches.fetch_add(1);
-      SIRIUS_LOG_INFO("Scan contract refused: reason={} stage=admission", comparison.reason);
+      scan::diagnostics_for(context)->refuse(comparison.refusal,
+                                             comparison.original_hash,
+                                             comparison.candidate_hash,
+                                             comparison.differences);
     }
     comparison.require_match();
   } else {
@@ -977,7 +978,8 @@ sirius_physical_plan_generator::create_plan(
     candidate,
     comparison,
     scan::source_registry::get(*context.db).counters,
-    originals ? originals->audit : scan::capture_planning_repeat_audit(context));
+    originals ? originals->audit : scan::capture_planning_repeat_audit(context),
+    origin);
 
   // Resolve the column references.
   profiler.StartPhase(duckdb::MetricType::PHYSICAL_PLANNER_COLUMN_BINDING);

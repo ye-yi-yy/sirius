@@ -56,9 +56,11 @@ namespace cucascade::memory {
 class fixed_size_host_memory_resource;
 }  // namespace cucascade::memory
 
+#include <atomic>
 #include <concepts>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -482,7 +484,15 @@ class sirius_scan_manager {
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
-  void reset();
+  std::size_t reset();
+  std::shared_ptr<scan::native_checkpoint_lease> acquire_checkpoint_key(duckdb::ClientContext&,
+                                                                        duckdb::DataTable&);
+  std::shared_ptr<scan::native_checkpoint_lease> checkpoint_lease_for(duckdb::DataTable&) const;
+  [[nodiscard]] bool holds_checkpoint_key(const duckdb::AttachedDatabase&) const noexcept;
+  [[nodiscard]] bool holds_any_checkpoint_key() const noexcept
+  {
+    return !_checkpoint_leases.empty();
+  }
   void stop_query_issuance();
   void drain_query_issuance();
 
@@ -651,6 +661,11 @@ class sirius_scan_manager {
 
   /// \brief Remove the pinned entry for @p name. No-op if absent.
   void remove_pinned_entry(const std::string& name);
+  [[nodiscard]] std::uint64_t pin_registry_epoch() const noexcept
+  {
+    return _pin_registry_epoch.load(std::memory_order_acquire);
+  }
+  void bump_pin_registry_epoch_for_testing() noexcept { bump_pin_registry_epoch(); }
 
   void visit_pinned_entries(
     const std::function<bool(std::string_view, const pinned_entry&)>& visitor) const;
@@ -766,6 +781,24 @@ class sirius_scan_manager {
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_scan_operator*> _scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
+  std::atomic<std::uint64_t> _pin_registry_epoch{0};
+  void bump_pin_registry_epoch() noexcept
+  {
+    _pin_registry_epoch.fetch_add(1, std::memory_order_release);
+  }
+  // Even a partial mutation followed by a throw invalidates retained plans.
+  class pin_registry_mutation_scope {
+   public:
+    explicit pin_registry_mutation_scope(sirius_scan_manager& manager) noexcept : _manager(manager)
+    {
+    }
+    ~pin_registry_mutation_scope() { _manager.bump_pin_registry_epoch(); }
+    pin_registry_mutation_scope(const pin_registry_mutation_scope&)            = delete;
+    pin_registry_mutation_scope& operator=(const pin_registry_mutation_scope&) = delete;
+
+   private:
+    sirius_scan_manager& _manager;
+  };
   bool _pruning_enabled{true};
   /// Source of pin generations. Never 0 — that value means "invalidated", so
   /// an origin holding it can never resolve.
@@ -792,9 +825,11 @@ class sirius_scan_manager {
   /// table has no rows beyond the pinned prefix.
   std::vector<insert_delta_job_request> _pending_insert_delta_jobs;
 
-  /// Prevents DuckDB checkpoints from replacing row groups between pinned
-  /// query validation and completion.
-  std::vector<duckdb::unique_ptr<duckdb::StorageLockKey>> _checkpoint_locks;
+  std::map<const duckdb::AttachedDatabase*, std::shared_ptr<scan::native_checkpoint_lease>>
+    _checkpoint_leases;
+  std::map<duckdb::ClientContext*, duckdb::shared_ptr<duckdb::SiriusConnectionState>>
+    _checkpoint_connections;
+  std::vector<std::shared_ptr<scan::query_scan_registry>> _scan_registries;
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
   /// in @ref prepare_for_query, gets one @c pipeline_slot per scan,

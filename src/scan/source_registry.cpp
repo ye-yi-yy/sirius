@@ -34,7 +34,6 @@ std::uint64_t next_instance()
 
 source_registry::source_registry(duckdb::DatabaseInstance& db) : _db(db), _instance(next_instance())
 {
-  // The only built-in registration site; public planning/policy code does not dispatch by kind.
   _adapters.push_back(make_native_source_adapter());
   _adapters.push_back(make_parquet_source_adapter());
   _adapters.push_back(make_owned_parquet_source_adapter());
@@ -74,10 +73,12 @@ const scan_source_adapter* source_registry::lookup(const duckdb::TableFunction& 
 }
 
 const scan_source_adapter& source_registry::require(const duckdb::TableFunction& function,
-                                                    const duckdb::FunctionData* data) const
+                                                    const duckdb::FunctionData* data,
+                                                    scan_attempt_diagnostics* diagnostics) const
 {
   const auto* adapter = lookup(function, data);
   if (!adapter) {
+    if (diagnostics) { diagnostics->refuse(scan_refusal_reason::source_identity_unverified); }
     throw duckdb::NotImplementedException("Table function '%s' is not supported in Sirius",
                                           function.name);
   }

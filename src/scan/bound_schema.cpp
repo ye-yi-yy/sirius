@@ -19,7 +19,6 @@
 namespace sirius::scan {
 namespace {
 
-/// Both tags and payloads are length-prefixed; embedded separators, NULs and UTF-8 are literal.
 void field(std::string& out, const std::string& tag, const std::string& value)
 {
   out += std::to_string(tag.size()) + ":" + tag + std::to_string(value.size()) + ":" + value;

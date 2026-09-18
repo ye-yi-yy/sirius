@@ -5,8 +5,6 @@
  */
 #include "scan/scan_contract.hpp"
 
-#include "sirius_context.hpp"
-
 #include <duckdb/common/exception.hpp>
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -14,7 +12,6 @@
 #include <duckdb/storage/single_file_block_manager.hpp>
 #include <duckdb/storage/storage_lock.hpp>
 #include <duckdb/storage/storage_manager.hpp>
-#include <duckdb/transaction/duck_transaction.hpp>
 #include <duckdb/transaction/duck_transaction_manager.hpp>
 
 #include <limits>
@@ -41,13 +38,12 @@ const duckdb::SingleFileBlockManager* single_file(duckdb::AttachedDatabase& db)
 }  // namespace
 
 native_checkpoint_lease::native_checkpoint_lease(duckdb::DataTable& table,
-                                                 std::uint64_t epoch,
                                                  std::shared_ptr<contract_counters> counters)
   : _database(table.GetAttached().shared_from_this()),
     _lock(duckdb::DuckTransactionManager::Get(*_database).SharedCheckpointLock()),
     _block_manager(single_file(*_database)),
     _iteration(_block_manager ? _block_manager->GetCheckpointIteration() : 0),
-    _epoch(epoch),
+    _epoch(allocate_handle()),
     _counters(std::move(counters))
 {
   if (!_block_manager) {
@@ -76,10 +72,12 @@ void native_checkpoint_lease::validate(const duckdb::DataTable& table) const
 query_scan_registry::query_scan_registry(std::shared_ptr<const plan_evidence> candidate,
                                          comparison_result comparison,
                                          std::shared_ptr<contract_counters> counters,
-                                         planning_repeat_audit audit)
+                                         planning_repeat_audit audit,
+                                         candidate_origin origin)
   : _candidate(std::move(candidate)),
     _comparison(std::move(comparison)),
     _audit(audit),
+    _origin(origin),
     _window(allocate_handle()),
     _membership(std::make_shared<registry_membership>())
 {
@@ -89,37 +87,35 @@ query_scan_registry::~query_scan_registry() { close(); }
 void query_scan_registry::declare_native(duckdb::ClientContext& context, duckdb::DataTable& table)
 {
   if (_sealed) { throw duckdb::ExecutorException("Sirius scan construction is sealed"); }
-  // All lazy outer transactions start before any checkpoint reader is acquired.
-  duckdb::DuckTransaction::Get(context, table.GetAttached());
-  _native.emplace(table.GetAttached().oid, table.shared_from_this());
+  const auto database_id = table.GetAttached().oid;
+  if (_native.contains(database_id)) { return; }
+  struct storage_owner {
+    duckdb::shared_ptr<duckdb::AttachedDatabase> database;
+    duckdb::shared_ptr<duckdb::DataTable> table;
+  };
+  // DataTable borrows its database; retain both without acquiring a checkpoint key.
+  auto owner = duckdb::make_shared_ptr<storage_owner>(
+    storage_owner{table.GetAttached().shared_from_this(), table.shared_from_this()});
+  _native.emplace(
+    database_id,
+    native_scan_resource{&context, duckdb::shared_ptr<duckdb::DataTable>(owner, &table)});
 }
-void query_scan_registry::seal_and_acquire(duckdb::ClientContext& context)
+void query_scan_registry::seal()
 {
   if (_sealed) { throw duckdb::InternalException("Sirius scan construction sealed twice"); }
   _sealed = true;
-  if (!_native.empty()) {
-    _connection = duckdb::get_sirius_connection_state(context);
-    if (_connection) { ++_connection->protected_scan_windows; }
-  }
-  for (const auto& [id, table] : _native) {
-    _leases.emplace(
-      id, std::make_shared<native_checkpoint_lease>(*table, _window, _membership->counters));
-  }
 }
-std::shared_ptr<native_checkpoint_lease> query_scan_registry::lease_for(
-  duckdb::DataTable& table) const
+void query_scan_registry::activate()
 {
-  auto it = _leases.find(table.GetAttached().oid);
-  if (!_sealed || it == _leases.end()) {
-    throw duckdb::ExecutorException("Sirius scan contract: undeclared_native_resource");
+  if (!_frozen || _closed || _membership->active.load(std::memory_order_acquire)) {
+    throw duckdb::ExecutorException("Sirius scan contract: invalid window activation");
   }
-  it->second->validate(table);
-  return it->second;
+  _membership->active.store(true, std::memory_order_release);
 }
 bound_table_scan_ptr query_scan_registry::add(duckdb::idx_t index,
                                               consumer_requirements requirements)
 {
-  if (_membership->active.load()) {
+  if (_frozen || _closed) {
     throw duckdb::ExecutorException("Sirius scan contract registry is frozen");
   }
   const source_occurrence* source = nullptr;
@@ -151,29 +147,23 @@ bound_table_scan_ptr query_scan_registry::add(duckdb::idx_t index,
 }
 void query_scan_registry::freeze()
 {
-  if (!_sealed || _membership->active.load()) {
+  if (!_sealed || _frozen || _closed) {
     throw duckdb::InternalException("Sirius scan contract: invalid registry freeze");
   }
   if (_tickets.size() != _candidate->sources.size()) {
     throw duckdb::NotImplementedException("Sirius scan contract: incomplete_consumer_registry");
   }
-  _membership->active.store(true, std::memory_order_release);
+  _frozen = true;
 }
 void query_scan_registry::close() noexcept
 {
   _membership->active.store(false, std::memory_order_release);
-  for (const auto& [id, lease] : _leases) {
-    lease->release();
-  }
-  if (_connection) {
-    --_connection->protected_scan_windows;
-    _connection.reset();
-  }
+  _closed = true;
 }
 void query_scan_registry::validate() const
 {
-  for (const auto& [id, lease] : _leases) {
-    lease->validate();
+  if (!_membership->active.load(std::memory_order_acquire)) {
+    throw duckdb::ExecutorException("Sirius scan contract: inactive_window");
   }
 }
 void bound_table_scan::validate() const
@@ -203,18 +193,79 @@ void validate_consumer(const bound_table_scan_ptr& expected, const bound_table_s
   }
   expected->validate();
 }
-std::string contract_summary(const bound_table_scan& ticket, const comparison_result& comparison)
+namespace {
+const char* kind_name(const source_profile* profile)
 {
-  // No paths, table names, selectors or predicate values in the bounded diagnostic.
+  if (!profile) { return "unknown"; }
+  switch (profile->kind) {
+    case source_kind::native: return "native";
+    case source_kind::parquet: return "parquet";
+    case source_kind::owned_parquet: return "owned_parquet";
+    case source_kind::stream: return "stream";
+    case source_kind::iceberg: return "iceberg";
+  }
+  return "unknown";
+}
+const char* audit_name(audit_verdict verdict)
+{
+  switch (verdict) {
+    case audit_verdict::safe: return "safe";
+    case audit_verdict::unsafe: return "unsafe";
+    case audit_verdict::unproven: return "unproven";
+  }
+  return "unproven";
+}
+const char* origin_name(candidate_origin origin)
+{
+  switch (origin) {
+    case candidate_origin::original_copy_chain: return "original_copy_chain";
+    case candidate_origin::sql_replan: return "sql_replan";
+    case candidate_origin::direct: return "direct";
+  }
+  return "unknown";
+}
+}  // namespace
+
+std::string contract_summary(const bound_table_scan& ticket,
+                             const comparison_result& comparison,
+                             const planning_repeat_audit& audit,
+                             candidate_origin origin)
+{
+  const auto& source   = ticket.source;
+  const auto* profile  = source.profile;
+  const auto& view     = source.capture.view();
+  const bool verified  = profile && profile->implementation_verified && !source.compatibility;
+  const bool validated = verified && view && comparison.verdict == comparison_verdict::equal;
+  const bool safe      = audit.observations_available && audit.generation == ticket.generation &&
+                    audit.repeat_bind == audit_verdict::safe &&
+                    audit.speculative_execution == audit_verdict::safe &&
+                    audit.cpu_replay == audit_verdict::safe;
+  const char* selector  = !source.requires_selector ? "not_required"
+                          : !source.selector        ? "missing"
+                          : validated               ? "equal"
+                                                    : "present";
+  const char* admission = audit.observed_unsafe() ? "unsupported"
+                          : validated && safe     ? "supported"
+                                                  : "unproven";
+  // Only static profile labels and bounded evidence metadata are displayed.
   return "scan ticket=" + std::to_string(ticket.handle) +
-         " window=" + std::to_string(ticket.window) + " source=" + ticket.source.function +
+         " window=" + std::to_string(ticket.window) +
+         " instance=" + std::to_string(ticket.instance) +
+         " generation=" + std::to_string(ticket.generation) + " kind=" + kind_name(profile) +
+         " profile=" + (profile ? std::string(profile->id) : "unverified") +
+         " origin=" + origin_name(origin) +
+         " implementation=" + (verified ? "verified" : "unverified") +
          " identity=" + comparison_name(comparison.verdict) +
-         " correspondence=" + correspondence_name(comparison.mode) + " hash=" +
-         (ticket.source.capture.view() ? std::to_string(std::hash<std::string>{}(
-                                           ticket.source.capture.view()->canonical_identity))
-                                       : "unavailable") +
-         " evidence=" + (ticket.source.capture.view() ? "binding" : "compatibility") +
-         " replay=" + (ticket.source.allows_cpu_replay ? "source_permitted" : "source_veto") +
-         " safety=unproven admission=unproven";
+         " correspondence=" + correspondence_name(comparison.mode) +
+         " hash=" + (view ? std::to_string(view->identity_hash) : "unavailable") +
+         " available_evidence_depth=" + (view ? "binding_identity" : "none") +
+         " validated_depth=" + (validated ? "binding_identity" : "none") +
+         " evidence_scope=" + (validated ? "binding_correspondence" : "none") +
+         " selector=" + selector +
+         " replay=" + (source.allows_cpu_replay ? "source_permitted" : "source_veto") +
+         " observations=" + (audit.observations_available ? "available" : "unavailable") +
+         " repeat_bind=" + audit_name(audit.repeat_bind) +
+         " speculation=" + audit_name(audit.speculative_execution) +
+         " cpu_replay=" + audit_name(audit.cpu_replay) + " admission=" + admission;
 }
 }  // namespace sirius::scan

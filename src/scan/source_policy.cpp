@@ -99,7 +99,6 @@ source_policy capture_source_policy(duckdb::DatabaseInstance& db,
     } catch (const std::exception&) {
       policy.byte_source_discovery_complete = false;
     }
-    // Visit wrapper-owned plans too. GetChildren() is the DuckDB physical traversal API.
     // Continue after a scan capture failure so a later known veto is not lost.
     try {
       for (const auto& child : op->GetChildren()) {
