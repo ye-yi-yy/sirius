@@ -67,19 +67,15 @@ SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 \
 
 ## Pinned image version
 
-The MinIO image is pinned to an exact release tag (in `s3_container.cpp`) rather
-than `:latest` so the same Sirius commit is reproducible over time:
+`kMinioImage` in `test/cpp/utils/s3_container.cpp` pins the full image reference:
 
-| image | tag |
-|---|---|
-| `quay.io/minio/minio` | `RELEASE.2025-09-07T16-13-09Z-cpuv1` |
+```text
+quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z-cpuv1
+```
 
-The image comes from MinIO's [official Quay registry](https://github.com/minio/minio/blob/master/docs/docker/README.md).
-The fully qualified registry path avoids resolving `minio/minio` against Docker Hub.
-
-To bump it, edit `kMinioImage` in `test/cpp/utils/s3_container.cpp`, rebuild
-`sirius_unittest`, and confirm `make s3-test` still passes. The `s3-test` target
-runs the existing binary without rebuilding it.
+After changing the registry or release tag, rebuild `sirius_unittest` before
+running `pixi run make s3-test`. The `s3-test` target runs the existing binary
+without rebuilding it.
 
 ## Fixtures
 

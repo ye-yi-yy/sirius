@@ -215,29 +215,34 @@ In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` 
 
 ### TABLE_SCAN Rewrite
 
-During plan generation, a `TABLE_SCAN` whose source is a supported format is rewritten in place into a single `GPU_SCAN` operator (`sirius_gpu_scan_operator`) that inherits the TABLE_SCAN's tree position and stays the source-leaf of the same pipeline — no separate scan pipeline is created. `GPU_SCAN` is format-agnostic: it owns a pluggable `gpu_ingestible` that knows how to enumerate splits and materialize each split into a `cudf::table`. `wrap_table_scan_source()` (`src/planner/sirius_physical_plan_generator.cpp`) resolves a registered source adapter and dispatches through its capabilities.
+`wrap_table_scan_source()` resolves a source adapter for Native, Standard
+Parquet, Sirius-owned Parquet or Iceberg and wraps its `gpu_ingestible` in a
+`GPU_SCAN` operator. The replacement keeps the `TABLE_SCAN` tree position and
+pipeline; no separate scan pipeline is created. Stream uses its adapter to
+construct a direct `STREAMING_SOURCE` operator. Shared planning handles
+projection, filters, schemas and dynamic-filter wrappers.
 
-The adapters cover Native, Standard Parquet (both aliases), Sirius-owned Parquet,
-Iceberg and Stream. Each owns its provider-specific verification, capture,
-preflight and runtime construction. Native and file sources use their existing
-`gpu_ingestible`; Stream creates its existing direct source operator. Shared
-planning handles projection, filters, schemas and dynamic-filter wrappers.
+Before lowering consumes bindings and filters, the planner captures candidate
+evidence and consumer requirements. Each scan receives an immutable ticket with
+its output layouts in a plan-owned registry. Provider preparation that needs
+SQL finishes during planning; native storage is retained without checkpoint
+leases.
 
-The planner captures candidate evidence before lowering consumes bindings.
-Static consumer requirements are saved before filters move. Before native
-runtime construction, all SQL-dependent provider runtimes finish preparation,
-adapters declare their attached databases, and the window acquires checkpoint
-leases. Lowering then freezes one consumer ticket per scan with its final
-logical and physical output layouts. The root retains the window registry
-through mandatory drain; reusable transparent operators retain only original
-evidence and reconstruct fresh contracts on execution.
+Transparent execution retains the validated physical plan and reuses it when
+the pin-registry epoch is unchanged. An epoch change rebuilds the plan and
+checks correspondence again. During `prepare_for_query`, the scan manager
+activates the registry, starts native transactions, acquires shared checkpoint
+leases and prepares fresh native metadata walks. Cleanup closes the registry
+and releases leases after mandatory drain.
 
-An unsupported adapter or failed verified correspondence declines before GPU
-execution. Standard Parquet and Iceberg retain explicitly unproven compatibility
-behavior until their provider bridges are available; see the
-[framework status](shared-scan-framework.md).
+Unsupported sources or failed correspondence checks decline GPU execution.
+Standard Parquet and Iceberg retain unverified compatibility paths; see
+[Shared Scan Framework](shared-scan-framework.md) for their evidence limits.
 
-During `prepare_for_query`, `sirius_scan_manager` inspects each `GPU_SCAN` operator's ingestible for a pinned-cache match. A cache miss uses `split_provider`; a cache hit uses `cached_databatch_provider`. The operator keeps its ingestible in both cases. Providers push splits into the connector the operator created at plan time. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
+The scan manager serves pin-cache hits through `cached_databatch_provider` and
+fresh scans through `split_provider`. Both feed the operator's `split_connector`;
+the operator pulls work in `get_next_task_input_data()`. See
+[Scan Manager](scan.md#scan-manager).
 
 ### HASH_JOIN Probe Side
 

@@ -4,23 +4,24 @@ This document covers the scan subsystem end-to-end: how data enters Super Sirius
 
 ## Binding and runtime contracts
 
-The five source families enter through registered adapters. The shared framework
-captures original/candidate read views, assigns one immutable ticket per source,
-and retains a registry for each validation or execution window. Standard Parquet
-and Iceberg preserve their existing implementations through explicit unverified
-compatibility profiles; missing provider or DuckDB audit evidence is not promoted
-to verified admission.
+Registered source adapters provide binding evidence and runtime construction.
+Each scan has an immutable consumer ticket in a plan-owned registry. The registry
+is activated for execution and closed after drain. Standard Parquet and Iceberg
+retain unverified compatibility paths where provider evidence is unavailable.
 
-Fresh native and Parquet splits carry per-slice certificates through coalescing,
-prefetch and decode. Native storage is protected by a window-owned checkpoint
-lease; Parquet certificates retain file occurrences, metadata and byte-source
-owners. Iceberg also retains the existing delete-data owner. Resident pinned
-batches keep their existing validation, while Stream has a binding contract
-without a file-split path. Runtime owners survive mandatory drain; successful
-drain closes tickets and releases leases before CPU replay or external results.
+Fresh native and Parquet splits carry slice certificates through coalescing,
+prefetch and decode. These validate the consumer, ranges and retained
+dependencies. The scan manager owns native checkpoint leases for execution;
+Parquet certificates retain file occurrences, metadata and datasource owners,
+and Iceberg also retains delete-data owners. Pinned batches keep their existing
+validation. Stream has a consumer ticket without file splits.
 
-See [Shared Scan Framework](shared-scan-framework.md) for construction order,
-compatibility limits and the remaining external bridge TODOs.
+Cleanup drains outstanding work before closing the registry and releasing
+leases. CPU replay requires an attempt-local result confirming that leases were
+released or execution was never entered. Failed drain prohibits replay.
+
+See [Shared Scan Framework](shared-scan-framework.md) for adapter APIs, the full
+execution lifecycle and current evidence limits.
 
 ## Overview
 
