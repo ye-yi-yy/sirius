@@ -349,7 +349,7 @@ class parquet_gpu_ingestible : public gpu_ingestible {
   /// @ref next_split_provider).
   std::unique_ptr<scan_info> build_file_scan_info(std::size_t occurrence,
                                                   std::string const& file_path,
-                                                  std::shared_ptr<io::sirius_ioctx> const& io_ctx);
+                                                  std::shared_ptr<io::ioctx> const& io_ctx);
 
   std::unique_ptr<parquet_ingestible_table_info> _info;
 

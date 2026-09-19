@@ -212,10 +212,15 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       }
       auto sirius_plan = std::move(validated_plan_);
       if (sirius_plan && validated_plan_pin_epoch_ != scans.pin_registry_epoch()) {
+        SIRIUS_LOG_INFO(
+          "Transparent execution: discarding finalize-validated Sirius plan (pinned registry "
+          "changed: epoch {} -> {})",
+          validated_plan_pin_epoch_,
+          scans.pin_registry_epoch());
         sirius_plan.reset();
       }
       if (sirius_plan) {
-        SIRIUS_LOG_DEBUG("Transparent GPU execution: reusing finalize-validated Sirius plan");
+        SIRIUS_LOG_INFO("Transparent execution: reusing finalize-validated Sirius plan");
       } else {
         state.sirius_context->record_transparent_execution_rebuild();
         scan::begin_scan_diagnostic_attempt(context.client);

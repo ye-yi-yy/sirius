@@ -20,8 +20,10 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/testcontainers/testcontainers-native.git
   GIT_TAG d6929da7c953403eca5f2cf81008c961ab5d23fc
   PATCH_COMMAND
-    "${GIT_EXECUTABLE}" apply --whitespace=nowarn
-    "${CMAKE_CURRENT_LIST_DIR}/../third_party/testcontainers-native.patch"
+    "${CMAKE_COMMAND}" "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+    "-DSOURCE_DIR=<SOURCE_DIR>"
+    "-DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/../third_party/testcontainers-native.patch"
+    -P "${CMAKE_CURRENT_LIST_DIR}/apply_git_patch.cmake"
     # Download + patch only: this subdir has no CMakeLists.txt, so MakeAvailable
     # populates (and runs PATCH_COMMAND) without add_subdirectory()'ing
     # upstream.

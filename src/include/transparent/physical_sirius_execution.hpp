@@ -24,6 +24,8 @@
 #include <duckdb/execution/physical_operator.hpp>
 #include <duckdb/planner/logical_operator.hpp>
 
+#include <cstdint>
+
 namespace duckdb {
 class PreparedStatementData;
 }  // namespace duckdb

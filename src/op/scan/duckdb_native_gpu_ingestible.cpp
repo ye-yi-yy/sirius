@@ -95,7 +95,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     // Each metadata task may open a distinct byte-source object for the same file.
     // Keep each certificate attached to the object used by its resulting split.
     if (_have_template && _datasource && scan_info->datasource &&
-        &_datasource->io_object() != &scan_info->datasource->io_object()) {
+        &_datasource->get_io_object() != &scan_info->datasource->get_io_object()) {
       if (!_acc.empty()) { emitted.push_back(emit_current()); }
       _have_template = false;
     }
@@ -430,7 +430,7 @@ void duckdb_native_scan_info::validate_slices(
     if (!cert || cert->consumer != expected || cert->lease != checkpoint_lease || !cert->storage ||
         !cert->layout || !same_native_range(group, *cert->layout) ||
         (cert->datasource &&
-         (!datasource || &cert->datasource->io_object() != &datasource->io_object()))) {
+         (!datasource || &cert->datasource->get_io_object() != &datasource->get_io_object()))) {
       sirius::scan::certificate_failure(expected, "native_range_or_dependencies");
     }
     cert->lease->validate(*cert->storage);

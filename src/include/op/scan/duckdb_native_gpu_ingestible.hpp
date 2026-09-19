@@ -183,6 +183,12 @@ class duckdb_native_gpu_ingestible : public op::scan::gpu_ingestible {
 
   std::unique_ptr<batch_coalescer> create_batch_coalescer() const override;
 
+  /// Call only when !metadata_walk_pending().
+  [[nodiscard]] duckdb_native_walk_plan const& walk_plan_for_testing() const noexcept
+  {
+    return _plan;
+  }
+
   [[nodiscard]] bool has_processed_all_metadata() const override;
 
   metadata_scan_task_t next_split_provider(io::ioctx_resolver resolve) override;
