@@ -22,8 +22,10 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cucascade/memory/common.hpp>
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <sys/utsname.h>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
@@ -508,7 +510,8 @@ struct host_mem_config {
       "sirius.memory.host", opt.downgrade_trigger_fraction, opt.downgrade_stop_fraction);
   }
 
-  void setup_configurator(cucascade::memory::reservation_manager_configurator& builder) const
+  void setup_configurator(cucascade::memory::reservation_manager_configurator& builder,
+                          cucascade::memory::system_topology_info const& hw) const
   {
     // cucascade builds one numa_region_pinned_host_memory_resource per
     // distinct NUMA node when the configurator sees this call. Relied upon by
@@ -524,7 +527,20 @@ struct host_mem_config {
     builder.set_downgrade_fractions_per_numa_region(downgrade_trigger_fraction,
                                                     downgrade_stop_fraction);
     if (std::holds_alternative<double>(capacity)) {
-      builder.set_usage_limit_ratio_per_numa_region(std::get<double>(capacity));
+      auto const fraction = std::get<double>(capacity);
+      builder.set_usage_limit_ratio_per_numa_region(fraction);
+      if (!hw.gpus.empty() &&
+          std::ranges::all_of(hw.gpus, [](auto const& gpu) { return gpu.numa_node < 0; })) {
+        auto const is_host = [](auto const& node) { return !node.is_device_memory; };
+        if (std::ranges::count_if(hw.numa_nodes, is_host) == 1) {
+          auto const& node = *std::ranges::find_if(hw.numa_nodes, is_host);
+          if (node.id >= 0 && node.has_cpus && node.memory_capacity > 0) {
+            // Resolve the budget without changing unknown affinity's CUDA host allocator.
+            builder.set_per_numa_region_capacity(
+              static_cast<std::size_t>(static_cast<double>(node.memory_capacity) * fraction));
+          }
+        }
+      }
     } else {
       builder.set_per_numa_region_capacity(std::get<std::uint64_t>(capacity));
     }
@@ -610,6 +626,31 @@ operator_params operator_defaults_for(
 
 }  // namespace
 
+namespace {
+
+void configure_wsl_host_allocators(std::vector<cucascade::memory::memory_space_config>& configs)
+{
+  static bool const is_wsl = [] {
+    utsname info{};
+    if (uname(&info) != 0) { return false; }
+    auto const release = std::string_view{info.release};
+    return release.find("microsoft") != std::string_view::npos ||
+           release.find("Microsoft") != std::string_view::npos;
+  }();
+  if (!is_wsl) { return; }
+
+  for (auto& config : configs) {
+    auto* host = std::get_if<cucascade::memory::host_memory_space_config>(&config);
+    if (host == nullptr) { continue; }
+    // WSL needs CUDA-allocated pinned buffers; keep the configured NUMA identity for routing.
+    host->mr_factory_fn = [portable = host->make_portable](int, std::size_t capacity) {
+      return cucascade::memory::make_default_host_memory_resource(-1, capacity, portable);
+    };
+  }
+}
+
+}  // namespace
+
 // ================ sirius_config ================= //
 
 sirius_config::sirius_config()
@@ -630,10 +671,11 @@ void sirius_config::apply_defaults()
   builder.set_number_of_gpus(
     resolve_num_gpus(std::get<size_t>(topo.num_gpus_or_gpu_ids), _hw_topology));
   gpu_cfg.setup_configurator(builder);
-  host_cfg.setup_configurator(builder);
+  host_cfg.setup_configurator(builder, _hw_topology);
   disk_cfg.setup_configurator(builder);
   _memory_space_configs = builder.build(_hw_topology);
-  _operator_params      = operator_params{};
+  configure_wsl_host_allocators(_memory_space_configs);
+  _operator_params = operator_params{};
 }
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
@@ -752,10 +794,12 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
         builder.set_gpu_ids(gpu_ids);
       }
       gpu_cfg.setup_configurator(builder);
-      host_cfg.setup_configurator(builder);
+      host_cfg.setup_configurator(builder, _hw_topology);
       disk_cfg.setup_configurator(builder);
       _memory_space_configs = builder.build(_hw_topology);
     }
+
+    configure_wsl_host_allocators(_memory_space_configs);
 
     bool const explicit_low_level_gpu_capacity =
       !gpu_space_configs.empty() && std::ranges::all_of(gpu_space_configs, [](auto const& gpu) {
