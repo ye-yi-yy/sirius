@@ -108,7 +108,7 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<std::string> names,
   duckdb::shared_ptr<duckdb::PreparedStatementData> cpu_fallback_prepared,
-  bool cpu_plan_reads_s3,
+  plan_source_policy source_policy,
   duckdb::idx_t estimated_cardinality,
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan,
   std::uint64_t validated_plan_pin_epoch)
@@ -118,7 +118,7 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
     query_sql_(std::move(query_sql)),
     result_names_(std::move(names)),
     cpu_fallback_prepared_(std::move(cpu_fallback_prepared)),
-    cpu_plan_reads_s3_(cpu_plan_reads_s3),
+    source_policy_(std::move(source_policy)),
     validated_sirius_plan_(std::move(validated_sirius_plan)),
     validated_plan_pin_epoch_(validated_plan_pin_epoch)
 {
@@ -326,18 +326,15 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // A pre-existing-unavailable error on an S3 query keeps its stable typed
       // message — the S3 branch below must not rewrite it (S3 has no CPU
       // fallback either way, so propagate as-is).
-      if (runtime_unavailable_error &&
-          (cpu_plan_reads_s3_ || sirius::references_sirius_owned_s3_parquet(query_sql_))) {
+      if (runtime_unavailable_error && (source_policy_.reads_sirius_owned_s3() ||
+                                        sirius::references_sirius_owned_s3_parquet(query_sql_))) {
         gpu_error.Throw();
       }
 
-      // S3 is GPU-only: DuckDB's CPU read_parquet cannot serve Sirius-owned s3://,
-      // so surface a clear error instead of a fallback that would fail anyway.
-      if (cpu_plan_reads_s3_ || sirius::references_sirius_owned_s3_parquet(query_sql_)) {
-        throw duckdb::ExecutorException(
-          "S3 CPU fallback is not supported: this query reads s3:// data, GPU execution failed, "
-          "and Sirius has no CPU fallback for S3 data sources. Underlying GPU error: " +
-          gpu_msg);
+      try {
+        require_cpu_replay(source_policy_, query_sql_, gpu_msg);
+      } catch (std::runtime_error const& error) {
+        throw duckdb::ExecutorException(error.what());
       }
 
       // Fallback disabled, or no CPU plan stashed: surface the GPU error. Sanitize

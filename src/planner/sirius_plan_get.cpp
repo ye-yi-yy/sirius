@@ -45,6 +45,7 @@
 #include "op/scan/iceberg_metadata_connection.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "planner/scan_source_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -579,6 +580,12 @@ duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
   return table_filter_set;
 }
 
+std::optional<std::string> registered_iceberg_decline_reason(duckdb::LogicalGet& op,
+                                                             duckdb::ClientContext& context)
+{
+  return iceberg_gpu_scan_decline_reason(op, context);
+}
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet& op)
 {
@@ -613,18 +620,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   auto column_ids = op.GetColumnIds();
 
-  // Only GPU-route known table scan functions; all others (pragma, system catalog
-  // functions, etc.) must fall back to CPU.
-  static const std::unordered_set<std::string> kSupportedScanFunctions = {
-    "seq_scan",
-    "parquet_scan",
-    "read_parquet",
-    "sirius_read_parquet",
-    "iceberg_scan",
-    sirius::exec::kStreamSourceFunctionName};
-  if (kSupportedScanFunctions.find(op.function.name) == kSupportedScanFunctions.end()) {
-    throw duckdb::NotImplementedException("Table function '%s' is not supported in Sirius",
-                                          op.function.name);
+  auto const* source = lookup_scan_source(op, context);
+  if (!source) {
+    throw duckdb::NotImplementedException(
+      "Table function '%s' is not supported in Sirius (unverified callbacks, overload or bind "
+      "data)",
+      op.function.name);
   }
 
   // An iceberg table's data files are parquet, and `iceberg_scan` binds them into the same
@@ -636,8 +637,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   //
   // Ordered ahead of the residency probing below because this path throws: declining first
   // keeps a refused table from paying for pinned-entry lookup and schema resolution.
-  if (op.function.name == "iceberg_scan") {
-    if (auto reason = iceberg_gpu_scan_decline_reason(op, context)) {
+  if (source->decline_reason) {
+    if (auto reason = source->decline_reason(op, context)) {
       throw duckdb::NotImplementedException("iceberg_scan declines the GPU scan path: " + *reason);
     }
   }

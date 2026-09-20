@@ -65,6 +65,8 @@ struct SiriusReadParquetBindData : public FunctionData {
 unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext& context,
                                                         FunctionData const* bind_data);
 
+TableFunction GetSiriusReadParquetFunction();
+
 class SiriusRegistration {
  public:
   /// Register Sirius's extension options. @p defaults supplies the registered default for every

@@ -311,6 +311,19 @@ unique_ptr<NodeStatistics> SiriusReadParquetCardinality(ClientContext&,
   return make_uniq<NodeStatistics>(typed->total_num_rows, typed->total_num_rows);
 }
 
+TableFunction GetSiriusReadParquetFunction()
+{
+  TableFunction sirius_read_parquet("sirius_read_parquet",
+                                    {LogicalType::VARCHAR},
+                                    SiriusReadParquetFunction,
+                                    SiriusReadParquetBind);
+  sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
+  sirius_read_parquet.projection_pushdown = true;
+  sirius_read_parquet.filter_pushdown     = true;
+  sirius_read_parquet.filter_prune        = true;
+  return sirius_read_parquet;
+}
+
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
   // Bind data carries ONLY re-executable input (the SQL template, schema and
@@ -2464,14 +2477,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   // Sirius's footer-only S3 path instead of DuckDB's native read_parquet.
   // Registered so the rewrite's output binds, but INTERNAL — not a public
   // surface: users query S3 Parquet with read_parquet('s3://...'), not this.
-  TableFunction sirius_read_parquet("sirius_read_parquet",
-                                    {LogicalType::VARCHAR},
-                                    SiriusReadParquetFunction,
-                                    SiriusReadParquetBind);
-  sirius_read_parquet.cardinality         = SiriusReadParquetCardinality;
-  sirius_read_parquet.projection_pushdown = true;
-  sirius_read_parquet.filter_pushdown     = true;
-  sirius_read_parquet.filter_prune        = true;
+  auto sirius_read_parquet = GetSiriusReadParquetFunction();
   CreateTableFunctionInfo sirius_read_parquet_info(sirius_read_parquet);
   catalog.CreateTableFunction(transaction, sirius_read_parquet_info);
 

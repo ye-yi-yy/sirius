@@ -66,6 +66,7 @@
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_union.hpp"
+#include "planner/scan_source_registry.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
@@ -440,51 +441,12 @@ void wrap_table_scan_source(
   // GPU_SCAN normalization requires one target per output column. Reject an incomplete schema
   // while transparent execution can still fall back to DuckDB.
   require_complete_native_scan_schema(scan);
-  auto sirius_ctx = context.registered_state
-                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
-                      : nullptr;
-
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> leaf;
-  bool replace_slot = false;
-  if (fn == "seq_scan") {
-    // Native scans apply AST-capable filters post-decode.
-    leaf         = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
-                              scan,
-                              op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::include_ast_row_masks,
-                              sirius_ctx.get());
-    replace_slot = true;
-  } else if (fn == "iceberg_scan") {
-    // `iceberg_scan` rides the parquet ingestible: an iceberg table's data files ARE parquet, and
-    // the iceberg extension resolves its manifests into the same MultiFileBindData file list
-    // read_parquet produces, so the parquet bind data is built from it unchanged. The iceberg
-    // subclass adds only the table's delete data, and its ingestible applies those deletes to
-    // each decoded batch. Equality deletes are still refused by create_plan(LogicalGet&) before
-    // this point.
-    leaf = make_gpu_scan_leaf(build_iceberg_table_info(scan, op_params, context),
-                              scan,
-                              op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
-                              sirius_ctx.get());
-    // The TABLE_SCAN is dropped — its bind_data/metadata were lifted into the table info.
-    replace_slot = true;
-  } else if (fn == "parquet_scan" || fn == "read_parquet" || fn == "sirius_read_parquet") {
-    // Parquet applies AST filters in the reader; post-decode uses membership only.
-    leaf         = make_gpu_scan_leaf(build_parquet_table_info(scan, op_params),
-                              scan,
-                              op_params,
-                              sirius::op::scan::dynamic_filter_apply_mode::membership_masks_only,
-                              sirius_ctx.get());
-    replace_slot = true;
-  } else {
-    throw std::runtime_error(
-      "[sirius_physical_plan_generator::wrap_table_scan_source] Unsupported scan function: " + fn);
+  auto const* entry = lookup_scan_source(scan.function, scan.bind_data.get(), context);
+  if (!entry || !entry->lower) {
+    throw duckdb::NotImplementedException(
+      "Table function '%s' is not supported in Sirius (unverified scan source)", fn);
   }
-  if (replace_slot) {
-    table_scan_slot = std::move(leaf);
-  } else {
-    table_scan_slot->children.push_back(std::move(leaf));
-  }
+  table_scan_slot = entry->lower(scan, op_params, context, entry->filter_mode);
 }
 
 //! Replace a COLUMN_DATA_SCAN, EMPTY_RESULT, or DUMMY_SCAN slot in place with a GPU_VALUES
@@ -975,6 +937,48 @@ bool compressed_materialization_active(duckdb::ClientContext& context)
 }
 
 }  // namespace
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_native_scan(
+  sirius::op::sirius_physical_table_scan& scan,
+  sirius::operator_params const& op_params,
+  duckdb::ClientContext& context,
+  sirius::op::scan::dynamic_filter_apply_mode mode)
+{
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  return make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
+                            scan,
+                            op_params,
+                            mode,
+                            sirius_ctx.get());
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(
+  sirius::op::sirius_physical_table_scan& scan,
+  sirius::operator_params const& op_params,
+  duckdb::ClientContext& context,
+  sirius::op::scan::dynamic_filter_apply_mode mode)
+{
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  return make_gpu_scan_leaf(
+    build_parquet_table_info(scan, op_params), scan, op_params, mode, sirius_ctx.get());
+}
+
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_iceberg_scan(
+  sirius::op::sirius_physical_table_scan& scan,
+  sirius::operator_params const& op_params,
+  duckdb::ClientContext& context,
+  sirius::op::scan::dynamic_filter_apply_mode mode)
+{
+  auto sirius_ctx = context.registered_state
+                      ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                      : nullptr;
+  return make_gpu_scan_leaf(
+    build_iceberg_table_info(scan, op_params, context), scan, op_params, mode, sirius_ctx.get());
+}
 
 void sirius_physical_plan_generator::reject_nested_column_operation(duckdb::Expression const& expr,
                                                                     std::string_view operation)
