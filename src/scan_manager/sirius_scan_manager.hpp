@@ -485,6 +485,15 @@ class sirius_scan_manager {
   ///        still running.
   void reset();
 
+  /// Acquire and retain one shared checkpoint key until reset() for this execution window.
+  void acquire_checkpoint_key(duckdb::AttachedDatabase& database);
+  [[nodiscard]] bool holds_checkpoint_key(duckdb::AttachedDatabase const& database) const noexcept;
+  [[nodiscard]] bool holds_any_checkpoint_key() const noexcept;
+  [[nodiscard]] std::size_t checkpoint_key_count() const noexcept
+  {
+    return _checkpoint_lock_count.load(std::memory_order_acquire);
+  }
+
   /// \brief Start the worker thread pool. Idempotent.
   void start();
 
@@ -835,7 +844,12 @@ class sirius_scan_manager {
 
   /// Prevents DuckDB checkpoints from replacing row groups between pinned
   /// query validation and completion.
-  std::vector<duckdb::unique_ptr<duckdb::StorageLockKey>> _checkpoint_locks;
+  struct checkpoint_lock_entry {
+    duckdb::AttachedDatabase* database;
+    duckdb::unique_ptr<duckdb::StorageLockKey> key;
+  };
+  std::vector<checkpoint_lock_entry> _checkpoint_locks;
+  std::atomic<std::size_t> _checkpoint_lock_count{0};
 
   /// Per-query sequencer for opportunistic fadvise calls.  Built fresh
   /// in @ref prepare_for_query, gets one @c pipeline_slot per scan,

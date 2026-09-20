@@ -15,11 +15,13 @@
  */
 
 #include "op/scan/owning_table_view.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 
 #include <io/sirius_datasource.hpp>
 
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -40,6 +42,8 @@ namespace sirius::op::scan {
  */
 class ingestible_table_info {
  public:
+  scan_contract_id contract_id = 0;
+
   virtual ~ingestible_table_info() = default;
 
   ingestible_table_info(ingestible_table_info const&)            = delete;
@@ -92,6 +96,35 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
 
   virtual std::vector<fadvise_entry> fadvise_entries() const { return {}; }
 
+  [[nodiscard]] virtual std::span<split_materializer_certificate const> certificates() const
+  {
+    return certificates_;
+  }
+
+  [[nodiscard]] virtual std::span<split_dependencies const> dependencies() const
+  {
+    return dependencies_;
+  }
+
+  [[nodiscard]] virtual scan_contract_id contract_id() const { return contract_id_; }
+
+  void set_contract_payload(scan_contract_id contract_id,
+                            std::vector<split_materializer_certificate> certificates,
+                            std::vector<split_dependencies> dependencies)
+  {
+    if (certificates.size() != dependencies.size()) {
+      throw std::invalid_argument("split certificates and dependencies must be parallel");
+    }
+    for (auto const& certificate : certificates) {
+      if (certificate.contract_id != contract_id) {
+        throw std::invalid_argument("split certificate contract does not match split contract");
+      }
+    }
+    contract_id_  = contract_id;
+    certificates_ = std::move(certificates);
+    dependencies_ = std::move(dependencies);
+  }
+
   /**
    * @brief Estimated decoded bytes for projected data columns before row filtering.
    *
@@ -126,6 +159,11 @@ class scan_info : public std::enable_shared_from_this<scan_info> {
     if (ranges.empty()) { return; }
     entries.push_back(fadvise_entry{datasource, std::move(ranges)});
   }
+
+ private:
+  scan_contract_id contract_id_ = 0;
+  std::vector<split_materializer_certificate> certificates_;
+  std::vector<split_dependencies> dependencies_;
 };
 
 //===----------------------------------------------------------------------===//
