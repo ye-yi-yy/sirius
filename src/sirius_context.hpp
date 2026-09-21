@@ -325,7 +325,9 @@ class SiriusContext : public ClientContextState {
     uint64_t provider_internal_skips = 0;
     uint64_t hidden_catalog_skips    = 0;
     uint64_t classification_failures = 0;
+    uint64_t read_view_mismatches    = 0;
     uint64_t certificate_mismatches  = 0;
+    uint64_t execution_rebuilds      = 0;
   };
 
   /// Monotonic counters describing compressed-materialization activity.
@@ -681,6 +683,12 @@ class SiriusContext : public ClientContextState {
   /// \brief Record a fresh split rejected because it belongs to another scan contract.
   void record_transparent_certificate_mismatch() noexcept;
 
+  /// \brief Record a CPU/candidate bound read-view comparison failure.
+  void record_transparent_read_view_mismatch() noexcept;
+
+  /// \brief Record rebuilding a Sirius plan inside an execution window.
+  void record_transparent_execution_rebuild() noexcept;
+
   /// \brief Record a planning attempt declined before the gpu_execution gate.
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
 
@@ -824,7 +832,9 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::atomic<uint64_t> transparent_classification_failure_count_{0};
+  std::atomic<uint64_t> transparent_read_view_mismatch_count_{0};
   std::atomic<uint64_t> transparent_certificate_mismatch_count_{0};
+  std::atomic<uint64_t> transparent_execution_rebuild_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_columns_narrowed_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
   std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};

@@ -152,6 +152,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   std::vector<std::string> contract_file_paths;
   std::shared_ptr<sirius::transparent::read_view_registry> read_views;
   uint64_t scan_node_id                          = 0;
+  duckdb::idx_t table_index                      = duckdb::DConstants::INVALID_INDEX;
   sirius::op::scan::scan_contract_id contract_id = 0;
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;

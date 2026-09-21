@@ -3269,6 +3269,18 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                     Value(""));
   add_sirius_option(config,
                     option_visibility::internal,
+                    "sirius_test_inject_read_view_mismatch",
+                    "inject finalize/execute read-view comparison failures",
+                    LogicalType::VARCHAR,
+                    Value("off"));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_read_view_churn_path",
+                    "path used by read-view churn integration tests",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "sirius_test_inject_provenance_failure",
                     "make connection provenance classification fail on this connection",
                     LogicalType::BOOLEAN,

@@ -34,6 +34,7 @@
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
+#include <transparent/read_view_registry.hpp>
 
 // cudf
 #include <cudf/column/column_factories.hpp>
@@ -737,6 +738,15 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
   }
 
   _file_paths = bind.resolved_file_paths;
+  _evidence_index_by_file.resize(_file_paths.size());
+  std::vector<std::size_t> sorted_indexes(_file_paths.size());
+  std::iota(sorted_indexes.begin(), sorted_indexes.end(), 0);
+  std::sort(sorted_indexes.begin(), sorted_indexes.end(), [&](auto left, auto right) {
+    return _file_paths[left] < _file_paths[right];
+  });
+  for (std::size_t sorted_index = 0; sorted_index < sorted_indexes.size(); ++sorted_index) {
+    _evidence_index_by_file[sorted_indexes[sorted_index]] = sorted_index;
+  }
 }
 
 parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
@@ -769,11 +779,13 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   // mixed-scheme scan opens every file on the right ioctx.  One metadata-scan task
   // per file; row-group chunking and file bundling happen downstream in
   // parquet_batch_coalescer.
-  auto const& file_path = _file_paths[idx];
+  auto const& file_path     = _file_paths[idx];
+  auto const evidence_index = _evidence_index_by_file[idx];
   // The resolver returns a valid ioctx or throws if no backend supports the path.
   auto io_ctx = resolve(file_path);
-  return [this, file_path, idx, io_ctx = std::move(io_ctx)]() -> std::unique_ptr<scan_info> {
-    return build_file_scan_info(file_path, idx, io_ctx);
+  return [this, file_path, idx, evidence_index, io_ctx = std::move(io_ctx)]()
+           -> std::unique_ptr<scan_info> {
+    return build_file_scan_info(file_path, idx, evidence_index, io_ctx);
   };
 }
 
@@ -781,7 +793,10 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
 // build_file_scan_info — per-file footer read + row-group pruning
 //===----------------------------------------------------------------------===//
 std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
-  std::string const& file_path, std::size_t file_index, std::shared_ptr<io::ioctx> const& io_ctx)
+  std::string const& file_path,
+  std::size_t file_index,
+  std::size_t evidence_index,
+  std::shared_ptr<io::ioctx> const& io_ctx)
 {
   auto stream = cudf::get_default_stream();
 
@@ -1195,13 +1210,34 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   out->partition_values = std::move(partition_values);
-  out->set_contract_payload(_info->contract_id,
-                            {{_info->contract_id,
-                              0,
-                              file_path + "|footer=" + std::to_string(footer_len),
-                              "parquet",
-                              "footer"}},
-                            {{file_metadata, out->datasource, std::nullopt}});
+  auto input_identity   = file_path + "|footer=" + std::to_string(footer_len);
+  if (_info->read_views && _info->contract_id != 0) {
+    auto const& entry = _info->read_views->entry(_info->contract_id);
+    if (auto const& evidence = entry.physical_evidence) {
+      if (evidence_index >= evidence->size.size() ||
+          evidence_index >= evidence->last_modified.size() ||
+          evidence_index >= evidence->size_present.size() ||
+          evidence_index >= evidence->last_modified_present.size() ||
+          evidence_index >= evidence->etag.size()) {
+        throw std::logic_error(
+          "physical read-view evidence does not match the bound file inventory");
+      }
+      if (evidence->size_present[evidence_index]) {
+        input_identity += "|size=" + std::to_string(evidence->size[evidence_index]);
+      }
+      if (evidence->last_modified_present[evidence_index]) {
+        input_identity +=
+          "|last_modified=" + std::to_string(evidence->last_modified[evidence_index]);
+      }
+      if (!evidence->etag[evidence_index].empty()) {
+        input_identity += "|etag=" + evidence->etag[evidence_index];
+      }
+    }
+  }
+  out->set_contract_payload(
+    _info->contract_id,
+    {{_info->contract_id, 0, std::move(input_identity), "parquet", "footer"}},
+    {{file_metadata, out->datasource, std::nullopt}});
 
   return out;
 }

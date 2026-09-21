@@ -246,6 +246,7 @@ void populate_parquet_table_info(sirius::op::scan::parquet_ingestible_table_info
   // task skips the hive-partition columns it should inject post-read, mis-sizing the output.
   info->scan_output_arity      = scan_op.types.size();
   info->approximate_batch_size = op_params.scan_task_batch_size;
+  info->read_views             = scan_op.read_views;
 }
 
 std::unique_ptr<sirius::op::scan::parquet_ingestible_table_info> build_parquet_table_info(
@@ -509,7 +510,8 @@ void wrap_table_scan_source(
                                              std::move(columns),
                                              std::move(predicates),
                                              {materializer_kind, entry->registry_profile},
-                                             scan.duckdb_types);
+                                             scan.duckdb_types,
+                                             scan.table_index);
   table_scan_slot = entry->lower(scan, op_params, context, entry->filter_mode);
 }
 

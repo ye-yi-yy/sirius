@@ -48,7 +48,8 @@ struct predicate_contract {
   std::string pushdown_mode;
 };
 struct bound_table_scan {
-  uint64_t scan_node_id = 0;
+  uint64_t scan_node_id     = 0;
+  duckdb::idx_t table_index = duckdb::DConstants::INVALID_INDEX;
   std::shared_ptr<bound_read_view const> view;
   duckdb::vector<duckdb::LogicalType> output_types;
   column_requirements columns;
@@ -75,20 +76,23 @@ struct eligibility_certificate {
   eligibility_verdict verdict               = eligibility_verdict::not_evaluated;
   certificate_evidence_scope evidence_scope = certificate_evidence_scope::none;
   std::string cpu_gpu_view_identity;
+  std::string correspondence;
   evidence_depth depth = evidence_depth::path;
   materializer_contract_identity materializer;
   std::vector<std::string> later_checks;
 };
 
-scan_contract_id allocate_scan_contract(transparent::read_view_registry&,
-                                        std::optional<uint64_t> window_id,
-                                        uint64_t finalize_generation,
-                                        uint64_t scan_node_id,
-                                        std::shared_ptr<bound_read_view const>,
-                                        column_requirements,
-                                        predicate_contract,
-                                        materializer_contract_identity,
-                                        duckdb::vector<duckdb::LogicalType> output_types = {});
+scan_contract_id allocate_scan_contract(
+  transparent::read_view_registry&,
+  std::optional<uint64_t> window_id,
+  uint64_t finalize_generation,
+  uint64_t scan_node_id,
+  std::shared_ptr<bound_read_view const>,
+  column_requirements,
+  predicate_contract,
+  materializer_contract_identity,
+  duckdb::vector<duckdb::LogicalType> output_types = {},
+  duckdb::idx_t table_index                        = duckdb::DConstants::INVALID_INDEX);
 bound_table_scan const& contract_of(transparent::read_view_registry const&, scan_contract_id);
 void validate_split_contract(scan_contract_id expected, scan_info const& split);
 }  // namespace sirius::op::scan

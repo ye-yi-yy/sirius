@@ -88,6 +88,19 @@ struct native_database {
   }
 };
 
+struct temporary_directory {
+  std::filesystem::path path = std::filesystem::temp_directory_path() /
+                               ("sirius_split_certificate_files_" + std::to_string(::getpid()) +
+                                "_" + std::to_string(reinterpret_cast<std::uintptr_t>(this)));
+
+  temporary_directory() { std::filesystem::create_directories(path); }
+  ~temporary_directory()
+  {
+    std::error_code error;
+    std::filesystem::remove_all(path, error);
+  }
+};
+
 std::unique_ptr<duckdb_native_ingestible_table_info> native_info(native_database& fixture,
                                                                  scan_contract_id contract_id,
                                                                  bool all_pruned = false)
@@ -310,6 +323,80 @@ TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][cert
       CHECK(certificate.input_identity == file_identity);
     }
   }
+}
+
+TEST_CASE("Parquet certificates include physical-original file evidence after comparison",
+          "[scan][certificate][read_view]")
+{
+  auto const source =
+    (project_root() / "test/cpp/integration/data/parquet/nation.parquet").string();
+  temporary_directory files;
+  auto const first  = (files.path / "z-nation.parquet").string();
+  auto const second = (files.path / "a-nation.parquet").string();
+  std::filesystem::copy_file(source, first);
+  std::filesystem::copy_file(source, second);
+  std::vector<std::string> paths{first, second};
+  bound_read_identity identity;
+  identity.source      = {"read_parquet", source_kind::parquet_local, "duckdb.read_parquet.v1"};
+  identity.data_view   = file_inventory{2};
+  identity.bound_types = {duckdb::LogicalType::INTEGER};
+  identity.bound_names = {"id"};
+  bound_read_view candidate;
+  candidate.identity = make_bound_read_identity(std::move(identity), paths);
+
+  auto registry = std::make_shared<sirius::transparent::read_view_registry>();
+  auto const contract_id =
+    allocate_scan_contract(*registry,
+                           /*window_id=*/std::nullopt,
+                           /*finalize_generation=*/1,
+                           /*scan_node_id=*/9,
+                           std::make_shared<bound_read_view const>(candidate),
+                           column_requirements{},
+                           predicate_contract{},
+                           {materializer_kind::parquet, "parquet.v1"});
+  bound_read_view physical = candidate;
+  auto evidence            = std::make_shared<file_evidence_arrays>();
+  // Evidence arrays use canonical sorted-path order: a-nation, then z-nation. The ingestible
+  // deliberately consumes the reverse order to verify the position mapping.
+  evidence->size                  = {1234, 4321};
+  evidence->last_modified         = {5678, 8765};
+  evidence->size_present          = {1, 1};
+  evidence->last_modified_present = {1, 1};
+  evidence->etag                  = {"a-tag", "z-tag"};
+  physical.evidence               = evidence;
+  physical.depth                  = evidence_depth::path_size_and_tag;
+  std::vector<bound_read_view> physical_original{physical};
+  registry->publish_supported(
+    certificate_evidence_scope::binding_correspondence, "table_index", physical_original);
+
+  auto info                 = parquet_info(contract_id);
+  info->resolved_file_paths = paths;
+  info->read_views          = registry;
+  auto ingestible           = make_ingestible(std::move(info));
+  auto ioctx                = std::make_shared<sirius::io::kvikio_context>();
+  auto next_identity        = [&]() {
+    auto provider = ingestible->next_split_provider(
+      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    REQUIRE(provider);
+    auto file = provider();
+    REQUIRE(file);
+    REQUIRE(file->certificates().size() == 1);
+    return file->certificates().front().input_identity;
+  };
+  auto const first_identity = next_identity();
+  CHECK(first_identity.find("z-nation.parquet|footer=") != std::string::npos);
+  CHECK(first_identity.find("|size=4321") != std::string::npos);
+  CHECK(first_identity.find("|last_modified=8765") != std::string::npos);
+  CHECK(first_identity.find("|etag=z-tag") != std::string::npos);
+  auto const second_identity = next_identity();
+  CHECK(second_identity.find("a-nation.parquet|footer=") != std::string::npos);
+  CHECK(second_identity.find("|size=1234") != std::string::npos);
+  CHECK(second_identity.find("|last_modified=5678") != std::string::npos);
+  CHECK(second_identity.find("|etag=a-tag") != std::string::npos);
+  auto const& entry = registry->entry(contract_id);
+  CHECK(entry.eligibility.depth == evidence_depth::path_size_and_tag);
+  CHECK(entry.eligibility.correspondence == "table_index");
+  CHECK(entry.physical_evidence == evidence);
 }
 
 TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",

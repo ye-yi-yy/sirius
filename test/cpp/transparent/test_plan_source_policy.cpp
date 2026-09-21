@@ -17,6 +17,7 @@
 #include "exec/stream_plan_bindings.hpp"
 #include "sirius_extension.hpp"
 #include "transparent/plan_source_policy.hpp"
+#include "transparent/read_view_registry.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
@@ -224,6 +225,11 @@ TEST_CASE("Source policy forbids verified stream and Sirius S3 sources",
 
 TEST_CASE("Source policy preserves S3 error text and stream reason", "[transparent][policy]")
 {
+  read_view_comparison mismatch;
+  mismatch.correspondence     = "none";
+  mismatch.reason             = "no_correspondence";
+  auto const mismatch_message = describe_read_view_mismatch(mismatch);
+
   plan_source_policy policy;
   policy.scans.push_back({"remote", byte_source_class::sirius_owned_s3, false, "S3"});
   REQUIRE_THROWS_WITH(
@@ -233,9 +239,13 @@ TEST_CASE("Source policy preserves S3 error text and stream reason", "[transpare
   policy.scans = {
     {"sirius_stream_source", byte_source_class::stream, false, "stream source has no CPU body"}};
   REQUIRE_THROWS_WITH(
-    require_cpu_replay(policy, "", "boom"),
+    require_cpu_replay(policy, "", mismatch_message),
     "CPU fallback is not supported: sirius_stream_source: stream source has no CPU body. "
-    "Underlying GPU error: boom");
+    "Underlying GPU error: read-view mismatch: reason=no_correspondence, correspondence=none, "
+    "original_count=0, candidate_count=0, different_total=0, different_original=0, "
+    "different_candidate=0, "
+    "original_hash=none, candidate_hash=none, original_depth=none, candidate_depth=none, "
+    "only_original=[], only_candidate=[]");
   policy.scans.clear();
   policy.discovery_complete = false;
   REQUIRE_THROWS_WITH(

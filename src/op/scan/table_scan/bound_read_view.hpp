@@ -31,6 +31,7 @@ class ClientContext;
 class DataTable;
 class LogicalGet;
 class LogicalOperator;
+class PhysicalOperator;
 class PhysicalTableScan;
 }  // namespace duckdb
 namespace sirius::op {
@@ -79,6 +80,14 @@ struct read_view_fingerprint {
   bool operator==(read_view_fingerprint const& other) const { return canonical == other.canonical; }
 };
 
+struct read_view_capture_metrics {
+  std::size_t file_count              = 0;
+  std::size_t canonical_capacity      = 0;
+  std::size_t evidence_capacity       = 0;
+  std::size_t transient_path_capacity = 0;
+  std::size_t sort_index_capacity     = 0;
+};
+
 // Only this content is shared after an equal comparison; each capture retains its evidence.
 struct bound_read_identity {
   verified_source_identity source;
@@ -94,6 +103,10 @@ struct bound_read_view {
   uint64_t transaction_id = 0;
   std::shared_ptr<file_evidence_arrays const> evidence;
   evidence_depth depth = evidence_depth::path;
+  read_view_capture_metrics metrics;
+  // Kept outside the stable identity: this says whether correspondence must also prove the
+  // evaluated logical selector, even if capture of that evidence is unexpectedly absent.
+  bool selector_evidence_required = false;
   std::optional<std::string> logical_selector_evidence;
 };
 
@@ -109,11 +122,15 @@ struct logical_bound_read_view_capture {
 
 // Paths are borrowed only while encoding and are not retained beside the canonical text.
 std::shared_ptr<bound_read_identity const> make_bound_read_identity(
-  bound_read_identity, std::span<std::string const> paths);
+  bound_read_identity,
+  std::span<std::string const> paths,
+  read_view_capture_metrics* metrics = nullptr);
 bound_read_view capture_bound_read_view(duckdb::LogicalGet const&, duckdb::ClientContext&);
 std::vector<logical_bound_read_view> capture_bound_read_views(duckdb::LogicalOperator const&,
                                                               duckdb::ClientContext&);
 bound_read_view capture_bound_read_view(duckdb::PhysicalTableScan const&, duckdb::ClientContext&);
+std::vector<bound_read_view> capture_bound_read_views(duckdb::PhysicalOperator const&,
+                                                      duckdb::ClientContext&);
 bound_read_view capture_bound_read_view(sirius::op::sirius_physical_table_scan const&,
                                         duckdb::ClientContext&,
                                         std::span<std::string const> resolved_paths = {});

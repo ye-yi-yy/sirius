@@ -25,6 +25,7 @@
 #include "sirius_extension.hpp"
 #include "transparent/read_view_registry.hpp"
 #include "utils/child_process_environment.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
@@ -33,7 +34,9 @@
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/multi_file/multi_file_function.hpp>
 #include <duckdb/function/table/table_scan.hpp>
+#include <duckdb/main/config.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
+#include <duckdb/main/extension_helper.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -190,6 +193,11 @@ TEST_CASE("Parquet identity includes bound explicit cardinality but not optimize
     con.ExtractPlan("SELECT * FROM read_parquet('" + parquet + "', explicit_cardinality=100)");
   auto& get_100        = first_get(*plan_100);
   auto const bound_100 = capture_bound_read_view(get_100, *con.context);
+  CHECK(bound_100.metrics.file_count == 1);
+  CHECK(bound_100.metrics.canonical_capacity >= canonical_read_view_text(bound_100).size() + 1);
+  CHECK(bound_100.metrics.evidence_capacity > 0);
+  CHECK(bound_100.metrics.transient_path_capacity >= parquet.size() + 1);
+  CHECK(bound_100.metrics.sort_index_capacity == sizeof(std::size_t));
 
   // An optimizer estimate is consumption/planning state, not part of the bound
   // read options. Changing it alone must leave the identity stable.
@@ -431,11 +439,23 @@ TEST_CASE("Dropping and recreating a native table changes read identity",
 TEST_CASE("Scan registry rejects registered replacements before or after first lookup",
           "[scan][contracts][isolated_context]")
 {
-  for (auto const* phase : {"cold", "warm", "cold_same", "warm_same"}) {
+  auto const config = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" /
+                      "s3" / "sirius.yaml";
+  REQUIRE(std::filesystem::is_regular_file(config));
+  for (auto const* phase :
+       {"cold", "warm", "cold_same", "warm_same", "preload", "preload_dynamic"}) {
     INFO(phase);
-    sirius::test::child_process_environment environment{{{"SIRIUS_REGISTRY_TRUST_PHASE", phase}}};
+    bool const preload = std::string_view(phase).starts_with("preload");
+    // The parent test process may leave integration.yaml in the environment after pausing its
+    // shared database.  A child must not reserve that config's 50% GPU pool beside the parent;
+    // callback verification needs only a small Sirius context.
+    sirius::test::child_process_environment environment{
+      {{"SIRIUS_REGISTRY_TRUST_PHASE", phase},
+       {"SIRIUS_TEST_SHARED_CONFIG_OVERRIDE", config.string()},
+       {"SIRIUS_REGISTRY_PRELOAD_CHILD", preload ? "1" : "0"}}};
     std::string executable = "sirius_unittest";
-    std::string filter     = "Scan registry first lookup child";
+    std::string filter     = preload ? "Scan registry rejects replacement before Sirius load child"
+                                     : "Scan registry first lookup child";
     char* arguments[]      = {executable.data(), filter.data(), nullptr};
     pid_t pid{};
     REQUIRE(
@@ -455,6 +475,74 @@ TEST_CASE("Scan registry rejects registered replacements before or after first l
     REQUIRE(WIFEXITED(status));
     CHECK(WEXITSTATUS(status) == 0);
   }
+}
+
+TEST_CASE("Scan registry rejects replacement before Sirius load child", "[.][registry_trust_child]")
+{
+  REQUIRE(sirius::test::g_shared_env == nullptr);
+  duckdb::DBConfig config;
+  config.options.load_extensions = false;
+  config.SetOptionByName("allow_unsigned_extensions", duckdb::Value::BOOLEAN(true));
+  duckdb::DuckDB database(nullptr, &config);
+  duckdb::ExtensionHelper::LoadExtension(database, "parquet");
+  sirius::test::scratch_dir files("registry_preload");
+  {
+    duckdb::Connection setup(database);
+    REQUIRE_FALSE(setup
+                    .Query("COPY (SELECT 1::INTEGER AS i) TO " +
+                           files.file_literal("input.parquet") + " (FORMAT PARQUET)")
+                    ->HasError());
+  }
+  duckdb::ExtensionLoader loader(*database.instance, "registry_preload_test");
+  auto original        = loader.GetTableFunction("read_parquet").functions.functions.front();
+  auto replacement     = original;
+  replacement.function = fake_scan;
+  duckdb::CreateTableFunctionInfo info(replacement);
+  info.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
+  loader.RegisterFunction(std::move(info));
+  REQUIRE(loader.GetTableFunction("read_parquet").functions.functions.front().function ==
+          fake_scan);
+
+  // Explicitly load Sirius only after the replacement is committed to the catalog.
+  setenv("SIRIUS_CONFIG_FILE", std::getenv("SIRIUS_TEST_SHARED_CONFIG_OVERRIDE"), 1);
+  unsetenv("SIRIUS_DISABLE");
+  bool const dynamic = std::string(std::getenv("SIRIUS_REGISTRY_TRUST_PHASE")) == "preload_dynamic";
+  if (dynamic) {
+    auto const executable = std::filesystem::canonical("/proc/self/exe");
+    auto const extension =
+      executable.parent_path().parent_path().parent_path() / "sirius.duckdb_extension";
+    duckdb::Connection load(database);
+    auto result = load.Query("LOAD " + sirius::test::sql_literal(extension.string()));
+    INFO((result->HasError() ? result->GetError() : "loaded"));
+    REQUIRE_FALSE(result->HasError());
+  } else {
+    database.LoadStaticExtension<duckdb::SiriusExtension>();
+  }
+  duckdb::Connection con(database);
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  duckdb::MultiFileBindData bind;
+  CHECK_FALSE(sirius::planner::lookup_scan_source(replacement, &bind, *con.context));
+  auto plan =
+    con.ExtractPlan("SELECT * FROM read_parquet(" + files.file_literal("input.parquet") + ")");
+  auto& get = first_get(*plan);
+  REQUIRE(get.function.function == fake_scan);
+  registry_test_generator generator(*con.context);
+  CHECK_THROWS_WITH(generator.create_plan(get), Catch::Matchers::Contains("unverified callbacks"));
+  REQUIRE_FALSE(con.Query("COMMIT")->HasError());
+  REQUIRE_FALSE(con.Query("SET gpu_execution=true")->HasError());
+  REQUIRE_FALSE(con.Query("SET enable_duckdb_fallback=false")->HasError());
+  auto rejected =
+    con.Query("SELECT i FROM read_parquet(" + files.file_literal("input.parquet") + ")");
+  INFO((rejected->HasError() ? rejected->GetError() : "unexpected admission"));
+  REQUIRE(rejected->HasError());
+  CHECK(rejected->GetError().find("unverified callbacks") != std::string::npos);
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  duckdb::CreateTableFunctionInfo restore(original);
+  restore.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
+  loader.RegisterFunction(std::move(restore));
+  CHECK(sirius::planner::lookup_scan_source(original, &bind, *con.context));
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
 TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_context]")

@@ -1713,6 +1713,78 @@ TEST_CASE_METHOD(GPUExecutionIcebergFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "iceberg selector evidence is required without a hook original",
+                 "[integration][gpu_execution][iceberg][transparent][read_view]")
+{
+  auto path = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
+  struct optimizer_reset {
+    duckdb::Connection& connection;
+    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
+  } reset{*con};
+  con->Query("SET disabled_optimizers = 'extension'");
+  expect_iceberg_rows("SELECT * FROM " + pinned_scan(path) + " ORDER BY count;",
+                      gpu_route::plan_fallback,
+                      {{"apple", "1"}, {"cherry", "3"}, {"elderberry", "5"}});
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "iceberg selector proof failure obeys fallback-off eligibility",
+                 "[integration][gpu_execution][iceberg][transparent][read_view]")
+{
+  auto path  = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
+  auto query = "SELECT * FROM " + pinned_scan(path) + " ORDER BY count";
+  struct optimizer_reset {
+    duckdb::Connection& connection;
+    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
+  } reset{*con};
+  REQUIRE_FALSE(con->Query("SET disabled_optimizers = 'extension'")->HasError());
+  REQUIRE_FALSE(con->Query("SET enable_duckdb_fallback = false")->HasError());
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+
+  auto result = con->Query(query);
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  CHECK(result->GetError().find("reason=selector_unproven") != std::string::npos);
+  CHECK(result->GetError().find("correspondence=single") != std::string::npos);
+
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
+  sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0);
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
+                 "iceberg selector drift between binds is declined",
+                 "[integration][gpu_execution][iceberg][transparent][read_view]")
+{
+  auto path = (get_project_root() / "test/cpp/integration/data/iceberg_snapshot_deletes").string();
+  auto const current = current_snapshot_id(path);
+  REQUIRE(current != 9400000000000001LL);
+  REQUIRE_FALSE(con->Query("CREATE OR REPLACE SEQUENCE read_view_selector START 1")->HasError());
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto query        = "SELECT fruit, count FROM iceberg_scan('" + path +
+               "', snapshot_from_id = CASE WHEN nextval('read_view_selector') % 2 = 1 THEN "
+               "9400000000000001 ELSE " +
+               std::to_string(current) + " END) ORDER BY count";
+
+  auto result = con->Query(query);
+  REQUIRE(result);
+  auto const error = result->HasError() ? result->GetError() : std::string{};
+  INFO(error);
+  REQUIRE_FALSE(result->HasError());
+  auto const after = sirius::test::get_transparent_execution_stats(*con);
+  CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
+  CHECK(after.fallbacks == before.fallbacks + 1);
+  CHECK(after.successful_rebinds == before.successful_rebinds);
+
+  auto rows = collect_rows(result->Cast<duckdb::MaterializedQueryResult>());
+  std::vector<std::vector<std::string>> first{
+    {"apple", "1"}, {"banana", "2"}, {"cherry", "3"}, {"date", "4"}, {"elderberry", "5"}};
+  std::sort(first.begin(), first.end());
+  CHECK(rows == first);
+  REQUIRE_FALSE(con->Query("DROP SEQUENCE read_view_selector")->HasError());
+}
+
+TEST_CASE_METHOD(GPUExecutionIcebergFixture,
                  "gpu_execution iceberg - equality delete sequence numbers",
                  "[integration][gpu_execution][iceberg]")
 {

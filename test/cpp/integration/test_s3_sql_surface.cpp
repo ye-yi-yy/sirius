@@ -3878,6 +3878,178 @@ TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU"
   CHECK(error.find("no filesystem") == std::string::npos);
 }
 
+TEST_CASE("transparent S3 read-view mismatch preserves the source veto",
+          "[s3][integration][sql][gpu_execution][fallback][transparent][read_view]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  REQUIRE_FALSE(fixture.con
+                  .Query("CREATE VIEW v_s3_read_view AS SELECT n_nationkey FROM " +
+                         s3_parquet_scan(*env, "nation"))
+                  ->HasError());
+  REQUIRE_FALSE(
+    fixture.con.Query("SET sirius_test_inject_read_view_mismatch = 'finalize'")->HasError());
+  for (auto const fallback : {true, false}) {
+    REQUIRE_FALSE(
+      fixture.con
+        .Query(std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"))
+        ->HasError());
+    auto const before = sirius::test::get_transparent_execution_stats(fixture.con);
+
+    auto result = fixture.con.Query("SELECT sum(n_nationkey) FROM v_s3_read_view");
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
+    CHECK(error.find("read-view mismatch") != std::string::npos);
+
+    auto const after = sirius::test::get_transparent_execution_stats(fixture.con);
+    CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
+    CHECK(after.fallbacks == before.fallbacks);
+    CHECK(after.executions == before.executions);
+  }
+}
+
+TEST_CASE("transparent S3 eligibility covers copy and SQL-replan correspondence",
+          "[s3][integration][sql][gpu_execution][fallback][transparent][read_view]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  REQUIRE_FALSE(fixture.con
+                  .Query("CREATE VIEW v_s3_matrix AS SELECT n_nationkey FROM " +
+                         s3_parquet_scan(*env, "nation"))
+                  ->HasError());
+  auto const single = "SELECT sum(n_nationkey) FROM v_s3_matrix";
+  auto const multi =
+    "SELECT sum(a.n_nationkey + b.n_nationkey) "
+    "FROM v_s3_matrix a JOIN v_s3_matrix b USING (n_nationkey)";
+  struct optimizer_reset {
+    duckdb::Connection& connection;
+    ~optimizer_reset() { connection.Query("RESET disabled_optimizers"); }
+  } reset{fixture.con};
+
+  for (auto const fallback : {true, false}) {
+    CAPTURE(fallback);
+    REQUIRE_FALSE(
+      fixture.con
+        .Query(std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"))
+        ->HasError());
+    for (auto const& query : {single, multi}) {
+      auto const before = sirius::test::get_transparent_execution_stats(fixture.con);
+      auto result       = fixture.con.Query(query);
+      REQUIRE(result);
+      REQUIRE_FALSE(result->HasError());
+      REQUIRE(result->GetValue(0, 0).ToString() == (query == single ? "300" : "600"));
+      auto const after = sirius::test::get_transparent_execution_stats(fixture.con);
+      sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+      CHECK(after.read_view_mismatches == before.read_view_mismatches);
+    }
+  }
+
+  REQUIRE_FALSE(fixture.con.Query("SET disabled_optimizers = 'extension'")->HasError());
+  for (auto const fallback : {true, false}) {
+    CAPTURE(fallback);
+    REQUIRE_FALSE(
+      fixture.con
+        .Query(std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"))
+        ->HasError());
+
+    auto before = sirius::test::get_transparent_execution_stats(fixture.con);
+    auto result = fixture.con.Query(single);
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+    REQUIRE(result->GetValue(0, 0).ToString() == "300");
+    auto after = sirius::test::get_transparent_execution_stats(fixture.con);
+    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    CHECK(after.read_view_mismatches == before.read_view_mismatches);
+
+    before = after;
+    result = fixture.con.Query(multi);
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
+    CHECK(error.find("reason=no_correspondence") != std::string::npos);
+    CHECK(error.find("correspondence=none") != std::string::npos);
+    after = sirius::test::get_transparent_execution_stats(fixture.con);
+    CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
+    sirius::test::require_transparent_execution_delta(before, after, 0, 0, 0);
+  }
+}
+
+TEST_CASE("transparent S3 execution rebuild preserves template origin and source veto",
+          "[s3][integration][sql][gpu_execution][fallback][transparent][read_view]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+  s3_sql_fixture fixture(*env);
+  auto& con = fixture.con;
+  set_gpu_execution(con, true);
+  REQUIRE_FALSE(con
+                  .Query("CREATE VIEW v_s3_rebuild AS SELECT n_nationkey FROM " +
+                         s3_parquet_scan(*env, "nation"))
+                  ->HasError());
+  struct restore_settings {
+    duckdb::Connection& con;
+    ~restore_settings()
+    {
+      con.Query("RESET disabled_optimizers");
+      con.Query("SET sirius_test_inject_read_view_mismatch = 'off'");
+      con.Query("SET sirius_test_inject_pin_registry_change = false");
+      con.Query("SET enable_duckdb_fallback = true");
+    }
+  } restore{con};
+  REQUIRE_FALSE(con.Query("SET sirius_test_inject_pin_registry_change = true")->HasError());
+  for (bool hooks : {false, true}) {
+    REQUIRE_FALSE(
+      con.Query(hooks ? "RESET disabled_optimizers" : "SET disabled_optimizers = 'extension'")
+        ->HasError());
+    REQUIRE_FALSE(con
+                    .Query(hooks
+                             ? "SET sirius_test_inject_read_view_mismatch = 'execute_copy_fails'"
+                             : "SET sirius_test_inject_read_view_mismatch = 'off'")
+                    ->HasError());
+    for (bool fallback : {true, false}) {
+      REQUIRE_FALSE(
+        con.Query(std::string("SET enable_duckdb_fallback = ") + (fallback ? "true" : "false"))
+          ->HasError());
+      for (bool multi : {false, true}) {
+        // Hooks-off multi-scan queries decline at finalize, already covered above.
+        if (!hooks && multi) continue;
+        CAPTURE(hooks, fallback, multi);
+        auto const before = sirius::test::get_transparent_execution_stats(con);
+        auto result =
+          con.Query(multi ? "SELECT sum(a.n_nationkey + b.n_nationkey) FROM v_s3_rebuild a "
+                            "JOIN v_s3_rebuild b USING (n_nationkey)"
+                          : "SELECT sum(n_nationkey) FROM v_s3_rebuild");
+        REQUIRE(result);
+        INFO((result->HasError() ? result->GetError() : "success"));
+        if (multi) {
+          REQUIRE(result->HasError());
+          CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+          CHECK(result->GetError().find("reason=no_correspondence") != std::string::npos);
+          CHECK(result->GetError().find("correspondence=none") != std::string::npos);
+        } else {
+          REQUIRE_FALSE(result->HasError());
+          CHECK(result->GetValue(0, 0).ToString() == "300");
+        }
+        auto const after = sirius::test::get_transparent_execution_stats(con);
+        CHECK(after.execution_rebuilds == before.execution_rebuilds + 1);
+        CHECK(after.read_view_mismatches == before.read_view_mismatches + (multi ? 1 : 0));
+        sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+      }
+    }
+  }
+}
+
 TEST_CASE("S3 read_parquet is rejected when transparent GPU execution is disabled",
           "[s3][integration][sql][gpu_execution][transparent]")
 {

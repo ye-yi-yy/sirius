@@ -31,6 +31,7 @@
 #include <duckdb/common/serializer/binary_deserializer.hpp>
 #include <duckdb/common/serializer/binary_serializer.hpp>
 #include <duckdb/common/serializer/memory_stream.hpp>
+#include <duckdb/common/types/hash.hpp>
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/planner/logical_operator.hpp>
@@ -42,7 +43,9 @@
 #include <parquet_reader.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <iomanip>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -50,14 +53,41 @@
 
 namespace sirius::op::scan {
 namespace {
+void decimal(std::string& out, uint64_t value)
+{
+  char buffer[std::numeric_limits<uint64_t>::digits10 + 1];
+  auto const [end, error] = std::to_chars(std::begin(buffer), std::end(buffer), value);
+  if (error != std::errc{}) throw std::runtime_error("read-view integer encoding failed");
+  out.append(buffer, end);
+}
+
+std::size_t decimal_digits(std::size_t value)
+{
+  std::size_t result = 1;
+  while (value >= 10) {
+    value /= 10;
+    ++result;
+  }
+  return result;
+}
+
 void append(std::string& out, char tag, std::string_view value)
 {
   out += tag;
-  out += std::to_string(value.size());
+  decimal(out, value.size());
   out += ':';
   out.append(value);
 }
-void number(std::string& out, uint64_t value) { append(out, 'u', std::to_string(value)); }
+void number(std::string& out, uint64_t value)
+{
+  char buffer[std::numeric_limits<uint64_t>::digits10 + 1];
+  auto const [end, error] = std::to_chars(std::begin(buffer), std::end(buffer), value);
+  if (error != std::errc{}) throw std::runtime_error("read-view integer encoding failed");
+  out += 'u';
+  decimal(out, static_cast<uint64_t>(end - buffer));
+  out += ':';
+  out.append(buffer, end);
+}
 
 void boolean(std::string& out, bool value) { append(out, 'b', value ? "1" : "0"); }
 
@@ -284,6 +314,29 @@ struct capture_input {
   bool collect_evidence;
 };
 
+struct path_encoding_info {
+  bool sorted               = true;
+  std::size_t encoded_bytes = 0;
+};
+
+path_encoding_info analyze_paths(std::span<std::string const> paths, bool known_sorted = false)
+{
+  path_encoding_info result;
+  std::string const* previous = nullptr;
+  for (auto const& path : paths) {
+    result.encoded_bytes += path.size() + decimal_digits(path.size()) + 2;
+    if (!known_sorted && previous && *previous > path) result.sorted = false;
+    previous = &path;
+  }
+  return result;
+}
+
+std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
+  bound_read_identity,
+  std::span<std::string const>,
+  path_encoding_info,
+  read_view_capture_metrics*);
+
 bound_read_view capture(capture_input input, duckdb::ClientContext& context)
 {
   auto const* source = planner::lookup_scan_source(input.function, input.bind_data, context);
@@ -294,7 +347,9 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
   bound_read_view view;
   view.transaction_id = transaction_id(context);
   std::vector<std::string> owned_paths;
-  std::span<std::string const> paths = input.resolved_paths;
+  std::span<std::string const> paths         = input.resolved_paths;
+  std::size_t transient_path_string_capacity = 0;
+  std::size_t evidence_tag_string_capacity   = 0;
 
   if (source->kind == source_kind::duckdb_native) {
     auto const* typed = dynamic_cast<duckdb::TableScanBindData const*>(input.bind_data);
@@ -324,6 +379,7 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     if (!typed) throw std::runtime_error("Sirius S3 capture has no typed bind data");
     if (paths.empty()) {
       owned_paths.push_back(typed->uri);
+      transient_path_string_capacity += owned_paths.back().capacity() + 1;
       paths = owned_paths;
     }
     identity.bound_types = typed->bound_types;
@@ -335,11 +391,52 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     if (!typed || !typed->file_list) {
       throw std::runtime_error("parquet capture has no MultiFileBindData file list");
     }
-    std::vector<duckdb::OpenFileInfo> files;
+    std::shared_ptr<file_evidence_arrays> unsorted_evidence;
+    bool any_size = false;
+    bool any_tag  = false;
+    if (input.collect_evidence) unsorted_evidence = std::make_shared<file_evidence_arrays>();
     if (paths.empty()) {
+      auto const file_count = typed->file_list->GetTotalFileCount();
+      owned_paths.reserve(file_count);
+      if (unsorted_evidence) {
+        unsorted_evidence->size.reserve(file_count);
+        unsorted_evidence->last_modified.reserve(file_count);
+        unsorted_evidence->size_present.reserve(file_count);
+        unsorted_evidence->last_modified_present.reserve(file_count);
+        unsorted_evidence->etag.reserve(file_count);
+      }
       for (auto const& file : typed->file_list->Files()) {
         owned_paths.push_back(file.path);
-        if (input.collect_evidence) files.push_back(file);
+        transient_path_string_capacity += owned_paths.back().capacity() + 1;
+        if (!unsorted_evidence) continue;
+        unsorted_evidence->size.push_back(0);
+        unsorted_evidence->last_modified.push_back(0);
+        unsorted_evidence->size_present.push_back(0);
+        unsorted_evidence->last_modified_present.push_back(0);
+        unsorted_evidence->etag.emplace_back();
+        evidence_tag_string_capacity += unsorted_evidence->etag.back().capacity() + 1;
+        if (!file.extended_info) continue;
+        auto const index    = unsorted_evidence->size.size() - 1;
+        auto const& options = file.extended_info->options;
+        if (auto found = options.find("file_size");
+            found != options.end() && !found->second.IsNull()) {
+          unsorted_evidence->size[index]         = found->second.GetValue<int64_t>();
+          unsorted_evidence->size_present[index] = 1;
+          any_size                               = true;
+        }
+        if (auto found = options.find("last_modified");
+            found != options.end() && !found->second.IsNull()) {
+          unsorted_evidence->last_modified[index] =
+            found->second.GetValue<duckdb::timestamp_t>().value;
+          unsorted_evidence->last_modified_present[index] = 1;
+          any_tag                                         = true;
+        }
+        if (auto found = options.find("etag"); found != options.end() && !found->second.IsNull()) {
+          evidence_tag_string_capacity -= unsorted_evidence->etag[index].capacity() + 1;
+          unsorted_evidence->etag[index] = duckdb::StringValue::Get(found->second);
+          evidence_tag_string_capacity += unsorted_evidence->etag[index].capacity() + 1;
+          any_tag = true;
+        }
       }
       paths = owned_paths;
     }
@@ -352,55 +449,84 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
 
     if (input.collect_evidence) {
       std::vector<std::size_t> order(paths.size());
-      std::iota(order.begin(), order.end(), 0);
-      std::sort(order.begin(), order.end(), [&](auto left, auto right) {
-        return paths[left] < paths[right];
-      });
-      auto evidence = std::make_shared<file_evidence_arrays>();
-      evidence->size.resize(paths.size());
-      evidence->last_modified.resize(paths.size());
-      evidence->size_present.resize(paths.size());
-      evidence->last_modified_present.resize(paths.size());
-      evidence->etag.resize(paths.size());
-      bool any_size = false;
-      bool any_tag  = false;
-      for (std::size_t i = 0; i < order.size(); ++i) {
-        auto const file_index = order[i];
-        if (!files[file_index].extended_info) continue;
-        auto const& options = files[file_index].extended_info->options;
-        if (auto found = options.find("file_size");
-            found != options.end() && !found->second.IsNull()) {
-          evidence->size[i]         = found->second.GetValue<int64_t>();
-          evidence->size_present[i] = 1;
-          any_size                  = true;
+      if (!std::is_sorted(paths.begin(), paths.end())) {
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](auto left, auto right) {
+          return paths[left] < paths[right];
+        });
+        constexpr auto visited = std::size_t{1} << (sizeof(std::size_t) * 8 - 1);
+        if (order.size() >= visited) {
+          throw std::length_error("Read-view file inventory is too large to sort");
         }
-        if (auto found = options.find("last_modified");
-            found != options.end() && !found->second.IsNull()) {
-          evidence->last_modified[i]         = found->second.GetValue<duckdb::timestamp_t>().value;
-          evidence->last_modified_present[i] = 1;
+        // Invert sorted-position -> original-position in place. The high bit marks completed
+        // cycles, so evidence sorting retains exactly one F-element index allocation.
+        for (std::size_t start = 0; start < order.size(); ++start) {
+          if ((order[start] & visited) != 0) continue;
+          auto current = start;
+          auto next    = order[current];
+          while (next != start) {
+            auto const following = order[next];
+            order[next]          = current | visited;
+            current              = next;
+            next                 = following;
+          }
+          order[start] = current | visited;
         }
-        if (auto found = options.find("etag"); found != options.end() && !found->second.IsNull()) {
-          evidence->etag[i] = found->second.GetValue<std::string>();
-          any_tag           = true;
+        for (auto& index : order)
+          index &= ~visited;
+        for (std::size_t current = 0; current < order.size(); ++current) {
+          while (order[current] != current) {
+            auto const target = order[current];
+            std::swap(owned_paths[current], owned_paths[target]);
+            std::swap(unsorted_evidence->size[current], unsorted_evidence->size[target]);
+            std::swap(unsorted_evidence->last_modified[current],
+                      unsorted_evidence->last_modified[target]);
+            std::swap(unsorted_evidence->size_present[current],
+                      unsorted_evidence->size_present[target]);
+            std::swap(unsorted_evidence->last_modified_present[current],
+                      unsorted_evidence->last_modified_present[target]);
+            std::swap(unsorted_evidence->etag[current], unsorted_evidence->etag[target]);
+            std::swap(order[current], order[target]);
+          }
         }
       }
-      view.evidence = std::move(evidence);
-      view.depth    = any_tag    ? evidence_depth::path_size_and_tag
-                      : any_size ? evidence_depth::path_and_size
-                                 : evidence_depth::path;
+      view.metrics.sort_index_capacity = order.capacity() * sizeof(std::size_t);
+      view.evidence                    = std::move(unsorted_evidence);
+      view.depth                       = any_tag    ? evidence_depth::path_size_and_tag
+                                         : any_size ? evidence_depth::path_and_size
+                                                    : evidence_depth::path;
     }
   }
 
-  if (source->selector_outside_bind_data && input.named_parameters) {
+  auto const path_info    = analyze_paths(paths, input.collect_evidence);
+  view.metrics.file_count = paths.size();
+  view.metrics.transient_path_capacity =
+    owned_paths.capacity() * sizeof(std::string) + transient_path_string_capacity;
+  if (view.evidence) {
+    view.metrics.evidence_capacity =
+      view.evidence->size.capacity() * sizeof(int64_t) +
+      view.evidence->last_modified.capacity() * sizeof(int64_t) +
+      view.evidence->size_present.capacity() * sizeof(uint8_t) +
+      view.evidence->last_modified_present.capacity() * sizeof(uint8_t) +
+      view.evidence->etag.capacity() * sizeof(std::string) + evidence_tag_string_capacity;
+  }
+  view.selector_evidence_required = source->selector_outside_bind_data;
+  if (view.selector_evidence_required && input.named_parameters) {
     view.logical_selector_evidence = selector_evidence(input.parameters, *input.named_parameters);
   }
-  view.identity = make_bound_read_identity(std::move(identity), paths);
+  view.identity =
+    make_bound_read_identity_preanalyzed(std::move(identity), paths, path_info, &view.metrics);
+  view.metrics.canonical_capacity = view.identity->fingerprint.canonical.capacity() + 1;
   return view;
 }
 }  // namespace
 
-std::shared_ptr<bound_read_identity const> make_bound_read_identity(
-  bound_read_identity identity, std::span<std::string const> paths)
+namespace {
+std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
+  bound_read_identity identity,
+  std::span<std::string const> paths,
+  path_encoding_info path_info,
+  read_view_capture_metrics* metrics)
 {
   if (identity.bound_types.size() != identity.bound_names.size()) {
     throw std::invalid_argument("Bound read schema has different type and name counts");
@@ -434,27 +560,39 @@ std::shared_ptr<bound_read_identity const> make_bound_read_identity(
   } else if (auto const* files = std::get_if<file_inventory>(&identity.data_view)) {
     if (files->count != paths.size()) throw std::invalid_argument("Read-view file count mismatch");
     number(text, files->count);
-    std::vector<size_t> order(paths.size());
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return paths[a] < paths[b]; });
-    size_t path_bytes = 0;
-    for (auto const& path : paths)
-      path_bytes += path.size() + std::to_string(path.size()).size() + 2;
-    text.reserve(text.size() + path_bytes + tail.size());
-    for (auto index : order)
-      append(text, 'p', paths[index]);
+    text.reserve(text.size() + path_info.encoded_bytes + tail.size());
+    if (path_info.sorted) {
+      for (auto const& path : paths)
+        append(text, 'p', path);
+    } else {
+      std::vector<size_t> order(paths.size());
+      if (metrics) {
+        metrics->sort_index_capacity =
+          std::max(metrics->sort_index_capacity, order.capacity() * sizeof(size_t));
+      }
+      std::iota(order.begin(), order.end(), 0);
+      std::sort(
+        order.begin(), order.end(), [&](size_t a, size_t b) { return paths[a] < paths[b]; });
+      for (auto index : order)
+        append(text, 'p', paths[index]);
+    }
   } else {
     if (!paths.empty()) throw std::invalid_argument("Stream read view has file inventory");
     number(text, std::get<stream_identity>(identity.data_view).stream_id);
   }
   text += tail;
-  uint64_t hash = 14695981039346656037ULL;
-  for (unsigned char byte : text) {
-    hash ^= byte;
-    hash *= 1099511628211ULL;
-  }
-  identity.fingerprint.hash = hash;
+  identity.fingerprint.hash = duckdb::Hash(text.data(), text.size());
   return std::make_shared<bound_read_identity const>(std::move(identity));
+}
+}  // namespace
+
+std::shared_ptr<bound_read_identity const> make_bound_read_identity(
+  bound_read_identity identity,
+  std::span<std::string const> paths,
+  read_view_capture_metrics* metrics)
+{
+  return make_bound_read_identity_preanalyzed(
+    std::move(identity), paths, analyze_paths(paths), metrics);
 }
 
 std::string canonical_value_text(duckdb::Value const& value)
@@ -504,6 +642,25 @@ bound_read_view capture_bound_read_view(duckdb::PhysicalTableScan const& get,
                                         duckdb::ClientContext& context)
 {
   return capture({get.function, get.bind_data.get(), get.parameters, nullptr, {}, true}, context);
+}
+
+std::vector<bound_read_view> capture_bound_read_views(duckdb::PhysicalOperator const& root,
+                                                      duckdb::ClientContext& context)
+{
+  std::vector<bound_read_view> captured;
+  auto visit = [&](auto&& self, duckdb::PhysicalOperator const& op) -> void {
+    if (op.type == duckdb::PhysicalOperatorType::TABLE_SCAN) {
+      auto const& get = op.Cast<duckdb::PhysicalTableScan>();
+      if (planner::lookup_scan_source(get, context)) {
+        captured.push_back(capture_bound_read_view(get, context));
+      }
+    }
+    for (auto const& child : op.GetChildren()) {
+      self(self, child.get());
+    }
+  };
+  visit(visit, root);
+  return captured;
 }
 
 bound_read_view capture_bound_read_view(sirius::op::sirius_physical_table_scan const& get,

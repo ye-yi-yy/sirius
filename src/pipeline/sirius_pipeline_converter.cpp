@@ -560,7 +560,8 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
           << " hash=" << (identity ? identity->fingerprint.hash : 0)
           << " depth=" << dump_evidence_depth(entry.eligibility.depth)
           << " profile=" << entry.eligibility.materializer.profile
-          << " policy=" << contract.predicates.pushdown_mode
+          << " policy=" << contract.predicates.pushdown_mode << " correspondence="
+          << (entry.eligibility.correspondence.empty() ? "none" : entry.eligibility.correspondence)
           << " verdict=" << dump_verdict(entry.eligibility.verdict)
           << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
           << " outputs=" << contract.output_types.size() << "\n";
@@ -606,7 +607,8 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
         << " hash=" << (identity ? identity->fingerprint.hash : 0)
         << " depth=" << dump_evidence_depth(entry.eligibility.depth)
         << " profile=" << entry.eligibility.materializer.profile
-        << " policy=" << contract.predicates.pushdown_mode
+        << " policy=" << contract.predicates.pushdown_mode << " correspondence="
+        << (entry.eligibility.correspondence.empty() ? "none" : entry.eligibility.correspondence)
         << " verdict=" << dump_verdict(entry.eligibility.verdict)
         << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
         << " outputs=" << contract.output_types.size()

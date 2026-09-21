@@ -42,6 +42,7 @@
 #include "transparent/connection_provenance.hpp"
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/plan_source_policy.hpp"
+#include "transparent/read_view_registry.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "util/duckdb_error_message.hpp"
 #include "vss/cuvs_index_cache.hpp"
@@ -1185,8 +1186,10 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .hidden_catalog_skips = transparent_hidden_catalog_skip_count_.load(std::memory_order_relaxed),
     .classification_failures =
       transparent_classification_failure_count_.load(std::memory_order_relaxed),
+    .read_view_mismatches = transparent_read_view_mismatch_count_.load(std::memory_order_relaxed),
     .certificate_mismatches =
       transparent_certificate_mismatch_count_.load(std::memory_order_relaxed),
+    .execution_rebuilds = transparent_execution_rebuild_count_.load(std::memory_order_relaxed),
   };
 }
 
@@ -1230,6 +1233,16 @@ void SiriusContext::record_transparent_runtime_fallback() noexcept
 void SiriusContext::record_transparent_certificate_mismatch() noexcept
 {
   transparent_certificate_mismatch_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_transparent_read_view_mismatch() noexcept
+{
+  transparent_read_view_mismatch_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_transparent_execution_rebuild() noexcept
+{
+  transparent_execution_rebuild_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
 SiriusContext::compressed_materialization_stats
@@ -1381,6 +1394,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       return RebindQueryInfo::DO_NOT_REBIND;
     }
   }
+  auto const candidate_source = logical_plan ? sirius::transparent::candidate_origin::copy
+                                             : sirius::transparent::candidate_origin::replan;
   // Mirror the optimizer hook's gpu_execution gate: when transparent execution
   // is disabled (e.g. compare_gpu_vs_cpu's CPU run after SET gpu_execution=false),
   // never rewrite the physical plan even if we could.
@@ -1418,6 +1433,23 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     if (current_query_sql.empty()) { return RebindQueryInfo::DO_NOT_REBIND; }
     try {
       InternalQueryGuard guard(context);  // suppress recursive optimizer hooks
+      duckdb::Value churn_setting;
+      if (context.TryGetCurrentSetting("sirius_test_read_view_churn_path", churn_setting) &&
+          !churn_setting.IsNull() && !churn_setting.ToString().empty()) {
+        auto const destination = std::filesystem::path(churn_setting.ToString());
+        std::optional<std::filesystem::path> source;
+        for (auto const& entry : std::filesystem::directory_iterator(destination.parent_path())) {
+          if (entry.is_regular_file() && entry.path() != destination &&
+              entry.path().extension() == ".parquet") {
+            source = entry.path();
+            break;
+          }
+        }
+        if (!source) {
+          throw std::runtime_error("read-view churn hook found no source parquet file");
+        }
+        std::filesystem::copy_file(*source, destination);
+      }
       Parser parser(context.GetParserOptions());
       parser.ParseQuery(current_query_sql);
       if (parser.statements.size() != 1) { return RebindQueryInfo::DO_NOT_REBIND; }
@@ -1474,6 +1506,10 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // its nested bind never re-enters the slot, and inside this try so a
     // runtime-unavailable error takes the existing fallback split below.
     SlotGuard plan_window(*this, context);
+    auto physical_original_views =
+      prepared.physical_plan
+        ? sirius::op::scan::capture_bound_read_views(prepared.physical_plan->Root(), context)
+        : std::vector<sirius::op::scan::bound_read_view>{};
     // Validate that the captured logical plan is GPU-translatable before we
     // install a reusable transparent execution operator for prepared statements.
     //
@@ -1510,6 +1546,39 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
     }
 
+    duckdb::Value read_view_injection;
+    if (context.TryGetCurrentSetting("sirius_test_inject_read_view_mismatch",
+                                     read_view_injection) &&
+        !read_view_injection.IsNull()) {
+      auto const stage = read_view_injection.ToString();
+      if (stage == "finalize" || stage == "swap") {
+        planner->read_views->inject_mismatch_for_testing(stage == "swap");
+      }
+    }
+
+    auto comparison = sirius::transparent::compare_read_views(
+      candidate_source,
+      logical_original_views ? &*logical_original_views : nullptr,
+      physical_original_views,
+      *planner->read_views);
+    if (!comparison.equal) {
+      auto message = sirius::transparent::describe_read_view_mismatch(comparison);
+      record_transparent_read_view_mismatch();
+      SIRIUS_LOG_INFO(
+        "Transparent execution read-view comparison failed ({}): {}",
+        candidate_source == sirius::transparent::candidate_origin::copy ? "copy" : "replan",
+        message);
+      throw NotImplementedException(message);
+    }
+    sirius::transparent::share_equal_read_view_identities(
+      logical_original_views ? &*logical_original_views : nullptr,
+      physical_original_views,
+      *planner->read_views);
+    planner->read_views->publish_supported(
+      sirius::op::scan::certificate_evidence_scope::binding_correspondence,
+      comparison.correspondence,
+      physical_original_views);
+
     SIRIUS_LOG_INFO("Transparent execution: Sirius physical plan generated successfully");
 
     // Stash DuckDB's CPU plan before overwriting it, wrapped in a minimal
@@ -1526,7 +1595,9 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
     auto& sirius_op        = new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
       std::move(logical_plan),
+      candidate_source,
       std::move(logical_original_views),
+      std::move(physical_original_views),
       current_query_sql,
       prepared.types,
       prepared.names,
@@ -1563,8 +1634,10 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
     record_transparent_fallback();
-    SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}",
-                    sirius::sanitized_message(e));
+    auto const message = sirius::sanitized_message(e);
+    if (!message.starts_with("read-view mismatch:")) {
+      SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}", message);
+    }
   } catch (std::exception& e) {
     sirius::transparent::require_cpu_replay(
       source_policy, current_query_sql, sirius::sanitized_message(e));

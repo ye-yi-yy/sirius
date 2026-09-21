@@ -31,10 +31,13 @@
 #include <duckdb/main/extension_helper.hpp>
 #include <duckdb/main/extension_manager.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <link.h>
+#include <parquet_extension.hpp>
 #include <parquet_multi_file_info.hpp>
 
 #include <array>
 #include <mutex>
+#include <typeinfo>
 
 namespace sirius::planner {
 namespace {
@@ -144,7 +147,7 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Client
     config.options.load_extensions = false;
     config.options.maximum_threads = 1;
     duckdb::DuckDB reference(nullptr, &config);
-    duckdb::ExtensionHelper::LoadExtension(reference, "parquet");
+    reference.LoadStaticExtension<duckdb::ParquetExtension>();
     duckdb::ExtensionLoader loader(*reference.instance, "iceberg");
     init(loader);
     auto entry = loader.TryGetTableFunction("iceberg_scan");
@@ -153,12 +156,61 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Client
   return {};
 }
 
+#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
+void* host_factory(duckdb::ClientContext& context, char const* symbol)
+{
+  // The system catalog object is created by the host, independently of mutable function
+  // registrations. Its dynamic type locates that DuckDB module even for Python's RTLD_LOCAL
+  // import. Do not locate the host through a candidate callback or promote it to RTLD_GLOBAL.
+  auto& catalog = duckdb::Catalog::GetSystemCatalog(context);
+  Dl_info owner{};
+  void* owner_map{};
+  if (!::dladdr1(&typeid(catalog), &owner, &owner_map, RTLD_DL_LINKMAP) || !owner_map)
+    return nullptr;
+  auto const* module = static_cast<link_map const*>(owner_map);
+  // Use the loader's own name so NOLOAD finds its existing record without probing a file.
+  // The main executable has an empty name: use its main handle, never reopen its disk path.
+  auto const* name = module->l_name && module->l_name[0] ? module->l_name : nullptr;
+  auto* handle     = ::dlopen(name, RTLD_NOW | RTLD_NOLOAD);
+  if (!handle) return nullptr;
+  auto close = [](void* value) { ::dlclose(value); };
+  std::unique_ptr<void, decltype(close)> guard(handle, close);
+  auto* factory = ::dlsym(handle, symbol);
+  Dl_info implementation{};
+  // A handle can also resolve symbols from dependencies. Only this host may grant trust.
+  if (!factory || !::dladdr(factory, &implementation) ||
+      implementation.dli_fbase != owner.dli_fbase) {
+    return nullptr;
+  }
+  return factory;
+}
+#endif
+
 duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& name,
                                                           duckdb::ClientContext& context)
 {
+#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
+  // The loadable extension links a hidden DuckDB copy. Its factory addresses are not the
+  // host's. Resolve the host's exported factories (pinned DuckDB C++ ABI), never an entry in
+  // the caller's mutable catalog. Missing host symbols leave the source unverified.
+  if (name == "seq_scan") {
+    using factory = duckdb::TableFunction (*)();
+    auto get      = reinterpret_cast<factory>(
+      host_factory(context, "_ZN6duckdb17TableScanFunction11GetFunctionEv"));
+    return get ? duckdb::vector<duckdb::TableFunction>{get()}
+               : duckdb::vector<duckdb::TableFunction>{};
+  }
+  if (name == "parquet_scan" || name == "read_parquet") {
+    using factory = duckdb::TableFunctionSet (*)();
+    auto get      = reinterpret_cast<factory>(
+      host_factory(context, "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv"));
+    return get ? get().functions : duckdb::vector<duckdb::TableFunction>{};
+  }
+#else
   if (name == "seq_scan") return {duckdb::TableScanFunction::GetFunction()};
   if (name == "parquet_scan" || name == "read_parquet")
     return duckdb::ParquetScanFunction::GetFunctionSet().functions;
+#endif
   if (name == "sirius_read_parquet") return {duckdb::GetSiriusReadParquetFunction()};
   if (name == "sirius_stream_source") return {exec::get_stream_source_function()};
   return iceberg_reference_functions(context);

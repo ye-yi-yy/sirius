@@ -623,7 +623,8 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
                                              std::move(columns),
                                              {},
                                              std::move(materializer),
-                                             op.returned_types);
+                                             op.returned_types,
+                                             op.table_index);
   auto source =
     duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(binding.types,
                                                                     op.EstimateCardinality(context),
@@ -1030,6 +1031,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     node->mvcc_pin_serves_scan = mvcc_pin_serves_scan;
     node->read_views           = read_views;
     node->scan_node_id         = next_scan_node_id++;
+    node->table_index          = op.table_index;
     // first check if an additional projection is necessary
     if (column_ids.size() == op.returned_types.size()) {
       bool projection_necessary = false;
@@ -1105,6 +1107,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   node->mvcc_pin_serves_scan = mvcc_pin_serves_scan;
   node->read_views           = read_views;
   node->scan_node_id         = next_scan_node_id++;
+  node->table_index          = op.table_index;
   if (filter) {
     filter->children.push_back(std::move(node));
     return filter;
