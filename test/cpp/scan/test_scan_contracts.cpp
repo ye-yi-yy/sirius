@@ -14,12 +14,16 @@
  * limitations under the License.
  */
 
+#include "exec/stream_bind_catalog.hpp"
 #include "exec/stream_plan_bindings.hpp"
+#include "helper/type_conversions.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
+#include "op/sirius_physical_streaming_source.hpp"
 #include "planner/scan_source_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_extension.hpp"
+#include "transparent/read_view_registry.hpp"
 #include "utils/child_process_environment.hpp"
 #include "utils/sirius_test_env.hpp"
 
@@ -172,6 +176,36 @@ TEST_CASE("Read-view identity changes with bound schema and options", "[scan][co
   }
 }
 
+TEST_CASE("Parquet identity includes bound explicit cardinality but not optimizer estimates",
+          "[scan][contracts][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  auto const parquet =
+    std::string(SIRIUS_PROJECT_ROOT) + "/test/cpp/integration/data/parquet/lineitem.parquet";
+
+  auto plan_100 =
+    con.ExtractPlan("SELECT * FROM read_parquet('" + parquet + "', explicit_cardinality=100)");
+  auto& get_100        = first_get(*plan_100);
+  auto const bound_100 = capture_bound_read_view(get_100, *con.context);
+
+  // An optimizer estimate is consumption/planning state, not part of the bound
+  // read options. Changing it alone must leave the identity stable.
+  ++get_100.estimated_cardinality;
+  auto const reestimated_100 = capture_bound_read_view(get_100, *con.context);
+  CHECK(canonical_read_view_text(bound_100) == canonical_read_view_text(reestimated_100));
+
+  // explicit_cardinality is different: DuckDB serializes it as a bound parquet
+  // option, so r18 requires it to remain in the identity.
+  auto plan_200 =
+    con.ExtractPlan("SELECT * FROM read_parquet('" + parquet + "', explicit_cardinality=200)");
+  auto const bound_200 = capture_bound_read_view(first_get(*plan_200), *con.context);
+  CHECK(canonical_read_view_text(bound_100) != canonical_read_view_text(bound_200));
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+}
+
 TEST_CASE("Native read-view identity includes catalog schema and table incarnation",
           "[scan][contracts]")
 {
@@ -290,6 +324,71 @@ TEST_CASE("Logical scan copy retains table index and verified source",
   auto& copied_get = copy->Cast<duckdb::LogicalGet>();
   REQUIRE(copied_get.table_index == get.table_index);
   REQUIRE(sirius::planner::lookup_scan_source(copied_get, *con.context));
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE("Physical scan lowering records its finalize generation",
+          "[scan][contracts][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+
+  auto const parquet =
+    std::string(SIRIUS_PROJECT_ROOT) + "/test/cpp/integration/data/parquet/lineitem.parquet";
+  auto logical = con.ExtractPlan("SELECT * FROM read_parquet('" + parquet + "')");
+  registry_test_generator generator(*con.context,
+                                    sirius::planner::scan_contract_provenance{std::nullopt, 77});
+  REQUIRE(generator.create_plan(std::move(logical)) != nullptr);
+  REQUIRE(generator.read_views->entries().size() == 1);
+  CHECK_FALSE(generator.read_views->entries().front().window_id.has_value());
+  CHECK(generator.read_views->entries().front().finalize_generation == 77);
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE("Physical stream lowering records its window without file checks",
+          "[scan][contracts][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+
+  auto catalog = duckdb::make_shared_ptr<sirius::exec::stream_bind_catalog>();
+  con.context->registered_state->Insert(sirius::exec::stream_bind_catalog::kStateKey, catalog);
+  auto registered_catalog = sirius::exec::catalog_for(*con.context);
+  registered_catalog->declare(
+    1,
+    sirius::exec::stream_input_binding{
+      {"a"},
+      sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER}),
+      std::make_shared<cucascade::shared_data_repository>(),
+      {0},
+      nullptr});
+
+  auto& entry = duckdb::Catalog::GetSystemCatalog(*con.context)
+                  .GetEntry<duckdb::TableFunctionCatalogEntry>(
+                    *con.context, DEFAULT_SCHEMA, "sirius_stream_source");
+  auto function = entry.functions.functions.front();
+  duckdb::LogicalGet get(1,
+                         std::move(function),
+                         duckdb::make_uniq<sirius::exec::stream_source_bind_data>(1),
+                         {duckdb::LogicalType::INTEGER},
+                         {"a"});
+  get.SetColumnIds({duckdb::ColumnIndex(0)});
+  get.estimated_cardinality = 1;
+
+  registry_test_generator generator(*con.context,
+                                    sirius::planner::scan_contract_provenance{{42}, 0});
+  auto physical = generator.create_plan(get);
+  REQUIRE(physical != nullptr);
+  REQUIRE(physical->type == sirius::op::SiriusPhysicalOperatorType::STREAMING_SOURCE);
+  auto const& source         = physical->Cast<sirius::op::sirius_physical_streaming_source>();
+  auto const& contract_entry = source.read_views()->entry(source.contract_id());
+  CHECK(contract_entry.window_id == 42);
+  CHECK(contract_entry.finalize_generation == 0);
+  CHECK(contract_entry.eligibility.later_checks.empty());
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 

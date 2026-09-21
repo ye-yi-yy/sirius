@@ -1,0 +1,417 @@
+/*
+ * Copyright 2026, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
+#include "op/scan/gpu_ingestible_types.hpp"
+#include "op/scan/parquet_gpu_ingestible.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
+#include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
+
+#include <catch.hpp>
+#include <duckdb.hpp>
+#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
+#include <duckdb/main/client_context.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/table_filter.hpp>
+#include <duckdb/storage/data_table.hpp>
+#include <duckdb/storage/storage_manager.hpp>
+#include <io/kvikio/kvikio_context.hpp>
+#include <unistd.h>
+
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <span>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+using namespace sirius::op::scan;
+
+std::filesystem::path project_root()
+{
+#ifdef SIRIUS_PROJECT_ROOT
+  return std::filesystem::path{SIRIUS_PROJECT_ROOT};
+#else
+  return std::filesystem::current_path();
+#endif
+}
+
+void exec_ok(duckdb::Connection& con, std::string const& query)
+{
+  auto result = con.Query(query);
+  REQUIRE(result);
+  if (result->HasError()) { INFO(result->GetError()); }
+  REQUIRE_FALSE(result->HasError());
+}
+
+struct native_database {
+  std::filesystem::path path = std::filesystem::temp_directory_path() /
+                               ("sirius_split_certificate_" + std::to_string(::getpid()) + "_" +
+                                std::to_string(reinterpret_cast<std::uintptr_t>(this)) + ".duckdb");
+  std::unique_ptr<duckdb::DuckDB> database;
+  std::unique_ptr<duckdb::Connection> connection;
+
+  native_database()
+  {
+    std::filesystem::remove(path);
+    database   = std::make_unique<duckdb::DuckDB>(path.string());
+    connection = std::make_unique<duckdb::Connection>(*database);
+  }
+
+  ~native_database()
+  {
+    connection.reset();
+    database.reset();
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    std::filesystem::remove(path.string() + ".wal", error);
+  }
+};
+
+std::unique_ptr<duckdb_native_ingestible_table_info> native_info(native_database& fixture,
+                                                                 scan_contract_id contract_id,
+                                                                 bool all_pruned = false)
+{
+  auto& con = *fixture.connection;
+  if (!con.context->transaction.HasActiveTransaction()) { exec_ok(con, "BEGIN TRANSACTION"); }
+  auto& context = *con.context;
+  auto& catalog = duckdb::Catalog::GetCatalog(context, "");
+  duckdb::CatalogTransaction transaction(catalog, context);
+  auto& schema = catalog.GetSchema(transaction, "main");
+  auto entry   = schema.GetEntry(transaction, duckdb::CatalogType::TABLE_ENTRY, "items");
+  REQUIRE(entry);
+  auto& storage = entry->Cast<duckdb::DuckTableEntry>().GetStorage();
+
+  auto info          = std::make_unique<duckdb_native_ingestible_table_info>();
+  info->contract_id  = contract_id;
+  info->storage      = &storage;
+  info->context      = con.context.get();
+  info->db_path      = storage.GetAttached().GetStorageManager().GetDBPath();
+  info->catalog_name = "memory";
+  info->schema_name  = "main";
+  info->table_name   = "items";
+  info->projected_cols.push_back({duckdb::StorageIndex(0), false});
+  info->column_ids.push_back(duckdb::ColumnIndex(0));
+  info->names.push_back("id");
+  auto type = sirius::logical_type::make(sirius::type_id::INTEGER);
+  info->projected_types.push_back(type);
+  info->returned_types.push_back(type);
+  info->output_types.push_back(type);
+  if (all_pruned) {
+    info->table_filters             = duckdb::make_uniq<duckdb::TableFilterSet>();
+    info->table_filters->filters[0] = duckdb::make_uniq<duckdb::ConstantFilter>(
+      duckdb::ExpressionType::COMPARE_LESSTHAN, duckdb::Value::INTEGER(-1));
+  }
+  return info;
+}
+
+std::unique_ptr<parquet_ingestible_table_info> parquet_info(scan_contract_id contract_id)
+{
+  auto info                 = std::make_unique<parquet_ingestible_table_info>();
+  info->contract_id         = contract_id;
+  info->resolved_file_paths = {
+    (project_root() / "test/cpp/integration/data/parquet/nation.parquet").string()};
+  info->names = {"n_nationkey", "n_name", "n_regionkey", "n_comment"};
+  info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
+  info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::VARCHAR));
+  info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
+  info->returned_types.push_back(sirius::logical_type::make(sirius::type_id::VARCHAR));
+  info->column_ids.push_back(duckdb::ColumnIndex(0));
+  info->scan_output_arity = 1;
+  return info;
+}
+
+bound_read_view test_view()
+{
+  bound_read_identity identity;
+  identity.source      = {"read_parquet", source_kind::parquet_local, "duckdb.read_parquet.v1"};
+  identity.data_view   = file_inventory{1};
+  identity.bound_types = {duckdb::LogicalType::INTEGER};
+  identity.bound_names = {"id"};
+  bound_read_view view;
+  std::vector<std::string> paths{"one.parquet"};
+  view.identity = make_bound_read_identity(std::move(identity), paths);
+  return view;
+}
+
+class certificate_test_split final : public scan_info {
+ public:
+  explicit certificate_test_split(scan_contract_id id) : id_(id)
+  {
+    certificates_.push_back(
+      split_materializer_certificate{id, 7, "one.parquet|footer=128", "projection=0", "host"});
+    dependencies_.emplace_back();
+  }
+
+  [[nodiscard]] std::span<split_materializer_certificate const> certificates() const override
+  {
+    return certificates_;
+  }
+
+  [[nodiscard]] std::span<split_dependencies const> dependencies() const override
+  {
+    return dependencies_;
+  }
+
+  [[nodiscard]] scan_contract_id contract_id() const override { return id_; }
+
+ private:
+  scan_contract_id id_;
+  std::vector<split_materializer_certificate> certificates_;
+  std::vector<split_dependencies> dependencies_;
+};
+
+}  // namespace
+
+TEST_CASE("Scan contract handles are process-wide monotonic and name immutable entries",
+          "[scan][certificate]")
+{
+  sirius::transparent::read_view_registry first_registry;
+  sirius::transparent::read_view_registry second_registry;
+  auto view = std::make_shared<bound_read_view const>(test_view());
+
+  auto const first  = allocate_scan_contract(first_registry,
+                                            /*window_id=*/11,
+                                            /*finalize_generation=*/0,
+                                            /*scan_node_id=*/3,
+                                            view,
+                                            column_requirements{},
+                                            predicate_contract{},
+                                             {materializer_kind::parquet, "parquet.v1"});
+  auto const second = allocate_scan_contract(second_registry,
+                                             /*window_id=*/12,
+                                             /*finalize_generation=*/0,
+                                             /*scan_node_id=*/4,
+                                             view,
+                                             column_requirements{},
+                                             predicate_contract{},
+                                             {materializer_kind::parquet, "parquet.v1"});
+
+  REQUIRE(first != 0);
+  REQUIRE(second > first);
+  REQUIRE(contract_of(first_registry, first).contract_id == first);
+  REQUIRE(contract_of(first_registry, first).scan_node_id == 3);
+  REQUIRE(first_registry.entry_for_scan_node(3).contract.contract_id == first);
+  REQUIRE(first_registry.entries().size() == 1);
+  CHECK(first_registry.entries()[0].window_id == 11);
+  CHECK(first_registry.entries()[0].finalize_generation == 0);
+  CHECK(first_registry.entries()[0].eligibility.verdict == eligibility_verdict::not_evaluated);
+  CHECK(first_registry.entries()[0].eligibility.evidence_scope == certificate_evidence_scope::none);
+  REQUIRE_THROWS(contract_of(first_registry, second));
+  REQUIRE_THROWS(first_registry.entry_for_scan_node(4));
+  REQUIRE_THROWS_WITH(allocate_scan_contract(first_registry,
+                                             /*window_id=*/11,
+                                             /*finalize_generation=*/0,
+                                             /*scan_node_id=*/3,
+                                             view,
+                                             column_requirements{},
+                                             predicate_contract{},
+                                             {materializer_kind::parquet, "parquet.v1"}),
+                      Catch::Matchers::Contains("duplicate scan node"));
+}
+
+TEST_CASE("Split certificates expose parallel dependencies and unevaluated eligibility",
+          "[scan][certificate]")
+{
+  certificate_test_split split(41);
+  REQUIRE(split.contract_id() == 41);
+  REQUIRE(split.certificates().size() == 1);
+  REQUIRE(split.dependencies().size() == split.certificates().size());
+  CHECK(split.certificates()[0].contract_id == split.contract_id());
+  CHECK(split.certificates()[0].input_identity == "one.parquet|footer=128");
+
+  eligibility_certificate eligibility;
+  eligibility.contract_id = split.contract_id();
+  CHECK(eligibility.verdict == eligibility_verdict::not_evaluated);
+  CHECK(eligibility.evidence_scope == certificate_evidence_scope::none);
+}
+
+TEST_CASE("Scan contract later checks are materializer-specific", "[scan][certificate]")
+{
+  struct expectation {
+    materializer_kind kind;
+    std::vector<std::string> later_checks;
+  };
+  auto const expectations = std::vector<expectation>{
+    {materializer_kind::duckdb_native, {"segments_per_range"}},
+    {materializer_kind::parquet, {"footer_per_file"}},
+    {materializer_kind::iceberg, {"footer_per_file"}},
+    {materializer_kind::stream, {}},
+  };
+
+  for (std::size_t index = 0; index < expectations.size(); ++index) {
+    sirius::transparent::read_view_registry registry;
+    auto const& expected = expectations[index];
+    auto const id        = allocate_scan_contract(registry,
+                                           /*window_id=*/101,
+                                           /*finalize_generation=*/0,
+                                           /*scan_node_id=*/index,
+                                           std::make_shared<bound_read_view const>(test_view()),
+                                                  {},
+                                                  {},
+                                                  {expected.kind, "test.v1"});
+    CHECK(registry.entry(id).eligibility.later_checks == expected.later_checks);
+  }
+}
+
+TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][certificate]")
+{
+  constexpr scan_contract_id contract_id = 51;
+  auto ingestible                        = make_ingestible(parquet_info(contract_id));
+  auto ioctx                             = std::make_shared<sirius::io::kvikio_context>();
+  auto provider                          = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  REQUIRE(provider);
+  auto file = provider();
+  REQUIRE(file);
+  REQUIRE(file->contract_id() == contract_id);
+  REQUIRE(file->certificates().size() == 1);
+  REQUIRE(file->dependencies().size() == 1);
+  auto const file_identity = file->certificates().front().input_identity;
+  CHECK(file_identity.find("nation.parquet|footer=") != std::string::npos);
+  CHECK(file_identity.find("size=") == std::string::npos);
+  CHECK(file_identity.find("etag=") == std::string::npos);
+
+  auto coalescer = ingestible->create_batch_coalescer();
+  auto splits    = coalescer->push(std::move(file));
+  auto tail      = coalescer->flush();
+  for (auto& split : tail) {
+    splits.push_back(std::move(split));
+  }
+  REQUIRE_FALSE(splits.empty());
+  for (auto const& split : splits) {
+    auto const* parquet_split = dynamic_cast<parquet_split_info const*>(split.get());
+    REQUIRE(parquet_split);
+    REQUIRE(split->contract_id() == contract_id);
+    REQUIRE(split->certificates().size() == parquet_split->rg_slices.size());
+    REQUIRE(split->dependencies().size() == split->certificates().size());
+    for (auto const& certificate : split->certificates()) {
+      CHECK(certificate.contract_id == contract_id);
+      CHECK(certificate.input_identity == file_identity);
+    }
+  }
+}
+
+TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
+          "[scan][certificate]")
+{
+  constexpr scan_contract_id contract_id = 61;
+  native_database fixture;
+  exec_ok(*fixture.connection, "CREATE TABLE items(id INTEGER)");
+  exec_ok(*fixture.connection, "INSERT INTO items SELECT range FROM range(300000)");
+  exec_ok(*fixture.connection, "CHECKPOINT");
+
+  auto ingestible          = make_ingestible(native_info(fixture, contract_id));
+  auto ioctx               = std::make_shared<sirius::io::kvikio_context>();
+  auto coalescer           = ingestible->create_batch_coalescer();
+  std::size_t input_slices = 0;
+  std::vector<std::unique_ptr<scan_info>> splits;
+  while (auto provider = ingestible->next_split_provider(
+           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+    auto range = provider();
+    REQUIRE(range);
+    auto const* native_range = dynamic_cast<duckdb_native_scan_info const*>(range.get());
+    REQUIRE(native_range);
+    REQUIRE(range->contract_id() == contract_id);
+    REQUIRE(range->certificates().size() == native_range->row_groups.size());
+    REQUIRE(range->dependencies().size() == range->certificates().size());
+    input_slices += range->certificates().size();
+    auto emitted = coalescer->push(std::move(range));
+    for (auto& split : emitted) {
+      splits.push_back(std::move(split));
+    }
+  }
+  auto tail = coalescer->flush();
+  for (auto& split : tail) {
+    splits.push_back(std::move(split));
+  }
+
+  REQUIRE(input_slices > 1);
+  std::size_t output_slices = 0;
+  for (auto const& split : splits) {
+    auto const* native_split = dynamic_cast<duckdb_native_scan_info const*>(split.get());
+    REQUIRE(native_split);
+    REQUIRE(split->contract_id() == contract_id);
+    REQUIRE(split->certificates().size() == native_split->row_groups.size());
+    REQUIRE(split->dependencies().size() == split->certificates().size());
+    for (auto const& certificate : split->certificates()) {
+      CHECK(certificate.contract_id == contract_id);
+      CHECK(certificate.input_identity.find(fixture.path.string()) == 0);
+      CHECK(certificate.input_identity.find("|checkpoint=pending|row_group=") != std::string::npos);
+    }
+    output_slices += split->certificates().size();
+  }
+  CHECK(output_slices == input_slices);
+}
+
+TEST_CASE("An all-pruned native scan keeps its contract on the empty fallback split",
+          "[scan][certificate]")
+{
+  constexpr scan_contract_id contract_id = 62;
+  native_database fixture;
+  exec_ok(*fixture.connection, "CREATE TABLE items(id INTEGER)");
+  exec_ok(*fixture.connection, "INSERT INTO items SELECT range FROM range(300000)");
+  exec_ok(*fixture.connection, "CHECKPOINT");
+
+  auto ingestible = make_ingestible(native_info(fixture, contract_id, /*all_pruned=*/true));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto coalescer  = ingestible->create_batch_coalescer();
+  std::vector<std::unique_ptr<scan_info>> splits;
+  while (auto provider = ingestible->next_split_provider(
+           [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
+    auto emitted = coalescer->push(provider());
+    for (auto& split : emitted) {
+      splits.push_back(std::move(split));
+    }
+  }
+  auto tail = coalescer->flush();
+  for (auto& split : tail) {
+    splits.push_back(std::move(split));
+  }
+
+  REQUIRE(splits.size() == 1);
+  auto const* empty = dynamic_cast<duckdb_native_scan_info const*>(splits.front().get());
+  REQUIRE(empty);
+  CHECK(empty->row_groups.empty());
+  CHECK(empty->contract_id() == contract_id);
+  CHECK(empty->certificates().empty());
+  CHECK(empty->dependencies().empty());
+}
+
+TEST_CASE("Split consumption rejects a foreign projection contract", "[scan][certificate]")
+{
+  duckdb::SiriusContext observer;
+  sirius_gpu_scan_operator scan{/*types=*/{},
+                                /*estimated_cardinality=*/0,
+                                /*ingestible=*/nullptr,
+                                /*compressed_materialization_observer=*/&observer,
+                                /*read_views=*/nullptr,
+                                /*contract_id=*/71};
+  scan_operator_input foreign_input(std::make_unique<certificate_test_split>(72));
+  auto const before = observer.get_transparent_execution_stats();
+
+  REQUIRE_THROWS_WITH(scan.execute(foreign_input, rmm::cuda_stream_view{}),
+                      Catch::Matchers::Contains("contract"));
+  auto const after = observer.get_transparent_execution_stats();
+  CHECK(after.certificate_mismatches == before.certificate_mismatches + 1);
+}

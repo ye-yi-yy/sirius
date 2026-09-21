@@ -29,7 +29,13 @@
 namespace duckdb {
 class ClientContext;
 class DataTable;
+class LogicalGet;
+class LogicalOperator;
+class PhysicalTableScan;
 }  // namespace duckdb
+namespace sirius::op {
+class sirius_physical_table_scan;
+}
 namespace sirius::op::scan {
 enum class source_kind : uint8_t { duckdb_native, parquet_local, parquet_s3, stream_source };
 enum class evidence_depth : uint8_t { path, path_and_size, path_size_and_tag };
@@ -91,9 +97,26 @@ struct bound_read_view {
   std::optional<std::string> logical_selector_evidence;
 };
 
+struct logical_bound_read_view {
+  duckdb::idx_t table_index;
+  bound_read_view view;
+};
+
+struct logical_bound_read_view_capture {
+  uint64_t planning_generation = 0;
+  std::vector<logical_bound_read_view> views;
+};
+
 // Paths are borrowed only while encoding and are not retained beside the canonical text.
 std::shared_ptr<bound_read_identity const> make_bound_read_identity(
   bound_read_identity, std::span<std::string const> paths);
+bound_read_view capture_bound_read_view(duckdb::LogicalGet const&, duckdb::ClientContext&);
+std::vector<logical_bound_read_view> capture_bound_read_views(duckdb::LogicalOperator const&,
+                                                              duckdb::ClientContext&);
+bound_read_view capture_bound_read_view(duckdb::PhysicalTableScan const&, duckdb::ClientContext&);
+bound_read_view capture_bound_read_view(sirius::op::sirius_physical_table_scan const&,
+                                        duckdb::ClientContext&,
+                                        std::span<std::string const> resolved_paths = {});
 std::string canonical_read_view_text(bound_read_view const&);
 std::string canonical_value_text(duckdb::Value const&);
 }  // namespace sirius::op::scan

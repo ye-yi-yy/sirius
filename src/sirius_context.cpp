@@ -1185,6 +1185,8 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .hidden_catalog_skips = transparent_hidden_catalog_skip_count_.load(std::memory_order_relaxed),
     .classification_failures =
       transparent_classification_failure_count_.load(std::memory_order_relaxed),
+    .certificate_mismatches =
+      transparent_certificate_mismatch_count_.load(std::memory_order_relaxed),
   };
 }
 
@@ -1223,6 +1225,11 @@ void SiriusContext::record_transparent_execution() noexcept
 void SiriusContext::record_transparent_runtime_fallback() noexcept
 {
   transparent_runtime_fallback_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_transparent_certificate_mismatch() noexcept
+{
+  transparent_certificate_mismatch_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
 SiriusContext::compressed_materialization_stats
@@ -1365,8 +1372,10 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   // Binder properties retain hidden catalog references even when hooks are disabled
   // or optimization removes scans. Decide before the GPU gate and SQL replan.
   unique_ptr<LogicalOperator> logical_plan;
+  std::optional<sirius::op::scan::logical_bound_read_view_capture> logical_original_views;
   if (conn_state) {
-    logical_plan = conn_state->take_captured_plan_if_current();
+    logical_plan           = conn_state->take_captured_plan_if_current();
+    logical_original_views = conn_state->take_captured_original_views_if_current();
     if (sirius::transparent::should_use_duckdb(context, nullptr, &prepared.properties) !=
         sirius::transparent::decline_reason::none) {
       return RebindQueryInfo::DO_NOT_REBIND;
@@ -1473,7 +1482,12 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // directly and consumes it; we then re-plan from `unbound_statement` for
     // the actual execution path. PhysicalSiriusExecution falls back to
     // re-planning per execute when its `logical_plan_` is null.
-    sirius::planner::sirius_physical_plan_generator planner(context);
+    auto planner = conn_state
+                     ? std::make_unique<sirius::planner::sirius_physical_plan_generator>(
+                         context,
+                         sirius::planner::scan_contract_provenance{
+                           std::nullopt, conn_state->planning_generation()})
+                     : std::make_unique<sirius::planner::sirius_physical_plan_generator>(context);
     duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
     bool plan_is_copyable = true;
     try {
@@ -1487,12 +1501,12 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     auto const validated_plan_pin_epoch = get_scan_manager().pin_registry_epoch();
     duckdb::unique_ptr<sirius::op::sirius_physical_operator> validated_sirius_plan;
     if (plan_is_copyable) {
-      validated_sirius_plan = planner.create_plan(std::move(validation_plan));
+      validated_sirius_plan = planner->create_plan(std::move(validation_plan));
     } else {
       // Validate by consuming the freshly re-planned logical_plan; the
       // PhysicalSiriusExecution operator re-plans from the SQL string we
       // cached above when the one-shot validated plan has been consumed.
-      validated_sirius_plan = planner.create_plan(std::move(logical_plan));
+      validated_sirius_plan = planner->create_plan(std::move(logical_plan));
       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
     }
 
@@ -1512,6 +1526,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
     auto& sirius_op        = new_physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
       std::move(logical_plan),
+      std::move(logical_original_views),
       current_query_sql,
       prepared.types,
       prepared.names,

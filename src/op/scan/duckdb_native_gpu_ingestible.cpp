@@ -79,10 +79,13 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     if (!_have_template) {
       _datasource    = scan_info->datasource;
       _block_manager = scan_info->block_manager;
+      _contract_id   = scan_info->contract_id();
       _have_template = true;
     }
 
+    std::size_t row_group_position = 0;
     for (auto& rg : scan_info->row_groups) {
+      auto const certificate_position = row_group_position++;
       if (rg.row_count == 0) { continue; }
 
       auto const rg_bytes = rg.decoded_bytes_budget;
@@ -108,6 +111,10 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
         }
       }
       _acc.push_back(std::move(rg));
+      if (certificate_position < scan_info->certificates().size()) {
+        _certificates.push_back(scan_info->certificates()[certificate_position]);
+        _dependencies.push_back(scan_info->dependencies()[certificate_position]);
+      }
     }
     return emitted;
   }
@@ -124,7 +131,8 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
       auto split           = std::make_unique<duckdb_native_scan_info>();
       split->datasource    = _datasource->duplicate();
       split->block_manager = _block_manager;
-      _produced_any        = true;
+      split->set_contract_payload(_contract_id, {}, {});
+      _produced_any = true;
       out.push_back(std::move(split));
     }
     return out;
@@ -137,6 +145,7 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     split->row_groups    = std::move(_acc);
     split->datasource    = _datasource->duplicate();
     split->block_manager = _block_manager;
+    split->set_contract_payload(_contract_id, std::move(_certificates), std::move(_dependencies));
     _acc.clear();
     _acc_bytes = 0;
     std::fill(_col_bytes.begin(), _col_bytes.end(), 0);
@@ -150,10 +159,13 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
 
   std::vector<std::size_t> _col_bytes;
   std::vector<duckdb_row_group_metadata> _acc;
+  std::vector<split_materializer_certificate> _certificates;
+  std::vector<split_dependencies> _dependencies;
   std::size_t _acc_bytes = 0;
 
-  bool _have_template = false;
-  bool _produced_any  = false;
+  bool _have_template           = false;
+  bool _produced_any            = false;
+  scan_contract_id _contract_id = 0;
   std::shared_ptr<sirius::io::sirius_datasource> _datasource;
   duckdb::SingleFileBlockManager const* _block_manager = nullptr;
 };
@@ -318,6 +330,21 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
     split->row_groups    = std::move(range.row_groups);
     split->datasource    = io_ctx->open_datasource(_info->db_path);
     split->block_manager = _block_manager;
+    std::vector<split_materializer_certificate> certificates;
+    std::vector<split_dependencies> dependencies;
+    certificates.reserve(split->row_groups.size());
+    dependencies.reserve(split->row_groups.size());
+    for (auto const& row_group : split->row_groups) {
+      certificates.push_back({_info->contract_id,
+                              static_cast<uint64_t>(row_group.row_group_index),
+                              _info->db_path + "|checkpoint=pending|row_group=" +
+                                std::to_string(row_group.row_group_index),
+                              "duckdb_native",
+                              "segments"});
+      dependencies.push_back({nullptr, split->datasource, std::nullopt});
+    }
+    split->set_contract_payload(
+      _info->contract_id, std::move(certificates), std::move(dependencies));
     return split;
   };
 }

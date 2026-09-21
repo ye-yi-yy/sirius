@@ -2278,20 +2278,42 @@ TEST_CASE("Per-connection state isolates and expires the transparent capture",
   // WRONGLY consumes the stale capture records a successful rebind (+1) and
   // also nulls the slot, so "capture is null" alone is ambiguous — the
   // zero-rebind delta across the Prepare is the discriminating assertion.
-  auto plan = con.ExtractPlan("SELECT 42;");
+  REQUIRE(run_ok(con, "CREATE TABLE hook_original(original_name INTEGER);"));
+  auto const capture_sql =
+    "SELECT * FROM hook_original left_side JOIN hook_original right_side USING (original_name);";
+  auto plan = con.ExtractPlan(capture_sql);
   REQUIRE(plan != nullptr);
+
+  // The optimizer hook itself (rather than Sirius candidate lowering) captured
+  // the registered LogicalGet and read its bound schema from bind data.
+  auto original_views = conn_state->take_captured_original_views_if_current();
+  REQUIRE(original_views.has_value());
+  REQUIRE(original_views->views.size() == 2);
+  CHECK(original_views->views[0].table_index != original_views->views[1].table_index);
+  for (auto const& original : original_views->views) {
+    REQUIRE(original.view.identity != nullptr);
+    CHECK(original.view.identity->bound_names == duckdb::vector<std::string>{"original_name"});
+  }
+
+  // Taking is consumption, not merely moving from the stored optional. A second
+  // take in the same planning generation must not expose an engaged, moved-from
+  // capture.
+  REQUIRE_FALSE(conn_state->take_captured_original_views_if_current().has_value());
+
   conn_state->set_captured_plan(std::move(plan));
+  conn_state->set_captured_original_views(original_views->views);
 
   auto const before_prepare      = sirius_ctx->get_transparent_execution_stats();
   auto& client_config            = duckdb::ClientConfig::GetConfig(client_ctx);
   client_config.enable_optimizer = false;
-  auto prepared                  = con.Prepare("SELECT 42;");  // SAME SQL as the capture
+  auto prepared                  = con.Prepare(capture_sql);  // SAME SQL as the capture
   client_config.enable_optimizer = true;
   REQUIRE_FALSE(prepared->HasError());
   auto const after_prepare = sirius_ctx->get_transparent_execution_stats();
 
   REQUIRE(after_prepare.successful_rebinds == before_prepare.successful_rebinds);
   REQUIRE(conn_state->take_captured_plan_if_current() == nullptr);
+  REQUIRE_FALSE(conn_state->take_captured_original_views_if_current().has_value());
 }
 
 TEST_CASE("Sirius configuration enables dense count join by default and accepts a YAML override",

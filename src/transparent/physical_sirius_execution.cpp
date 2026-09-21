@@ -104,6 +104,7 @@ duckdb::unique_ptr<duckdb::QueryResult> run_cpu_fallback_plan(
 PhysicalSiriusExecution::PhysicalSiriusExecution(
   duckdb::PhysicalPlan& physical_plan,
   duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan,
+  std::optional<sirius::op::scan::logical_bound_read_view_capture> logical_original_views,
   std::string query_sql,
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<std::string> names,
@@ -115,6 +116,7 @@ PhysicalSiriusExecution::PhysicalSiriusExecution(
   : duckdb::PhysicalOperator(
       physical_plan, PhysicalSiriusExecution::TYPE, std::move(types), estimated_cardinality),
     logical_plan_(std::move(logical_plan)),
+    logical_original_views_(std::move(logical_original_views)),
     query_sql_(std::move(query_sql)),
     result_names_(std::move(names)),
     cpu_fallback_prepared_(std::move(cpu_fallback_prepared)),
@@ -258,7 +260,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           duckdb::Optimizer optimizer(*duckdb_planner.binder, context.client);
           fresh_plan = optimizer.Optimize(std::move(duckdb_planner.plan));
         }
-        sirius::planner::sirius_physical_plan_generator planner(context.client);
+        sirius::planner::sirius_physical_plan_generator planner(
+          context.client, {{sirius::value_of(window->query_id())}, 0});
         sirius_plan = planner.create_plan(std::move(fresh_plan));
       }
 

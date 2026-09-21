@@ -1623,7 +1623,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
         delta_splits = cut_delta_splits_for_op(*delta_request,
                                                duckdb_info->projected_cols,
                                                io_ctx->open_datasource(duckdb_info->db_path),
-                                               sf_bm);
+                                               sf_bm,
+                                               assignment.op->contract_id());
         SIRIUS_LOG_INFO(
           "[sirius_scan_manager] operator '{}' serves {} insert-delta split(s) of pinned entry "
           "'{}' ({} delta row(s))",

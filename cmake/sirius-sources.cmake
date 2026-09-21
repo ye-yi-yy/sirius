@@ -1,5 +1,6 @@
 # cmake-format: off
 set(EXTENSION_SOURCES
+    src/transparent/read_view_registry.cpp
     src/transparent/plan_source_policy.cpp
     src/planner/scan_source_registry.cpp
     src/op/scan/table_scan/bound_read_view.cpp

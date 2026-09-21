@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "transparent/plan_source_policy.hpp"
 
@@ -46,6 +47,7 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   PhysicalSiriusExecution(
     duckdb::PhysicalPlan& physical_plan,
     duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan,
+    std::optional<sirius::op::scan::logical_bound_read_view_capture> logical_original_views,
     std::string query_sql,
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<std::string> names,
@@ -78,6 +80,10 @@ class PhysicalSiriusExecution : public duckdb::PhysicalOperator {
   /// first execute we may discover Copy() throws and need to clear this so
   /// future executes skip straight to the replan path.
   mutable duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan_;
+
+  /// Optimizer-hook originals, generation-stamped and keyed by LogicalGet table index.
+  /// Commit C compares its rebuilt candidates against this retained capture.
+  std::optional<sirius::op::scan::logical_bound_read_view_capture> logical_original_views_;
 
   /// Original SQL string used to re-plan when `logical_plan_` cannot be
   /// copied (e.g. queries against table functions whose bind_data does not

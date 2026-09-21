@@ -29,6 +29,12 @@ class sirius_datasource;
 }
 
 namespace sirius::op::scan {
+class scan_info;
+}
+namespace sirius::transparent {
+class read_view_registry;
+}
+namespace sirius::op::scan {
 using scan_contract_id = uint64_t;
 
 struct column_requirements {
@@ -73,4 +79,16 @@ struct eligibility_certificate {
   materializer_contract_identity materializer;
   std::vector<std::string> later_checks;
 };
+
+scan_contract_id allocate_scan_contract(transparent::read_view_registry&,
+                                        std::optional<uint64_t> window_id,
+                                        uint64_t finalize_generation,
+                                        uint64_t scan_node_id,
+                                        std::shared_ptr<bound_read_view const>,
+                                        column_requirements,
+                                        predicate_contract,
+                                        materializer_contract_identity,
+                                        duckdb::vector<duckdb::LogicalType> output_types = {});
+bound_table_scan const& contract_of(transparent::read_view_registry const&, scan_contract_id);
+void validate_split_contract(scan_contract_id expected, scan_info const& split);
 }  // namespace sirius::op::scan

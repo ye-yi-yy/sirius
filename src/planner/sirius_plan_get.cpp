@@ -50,6 +50,7 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
 
 #include <algorithm>
 #include <map>
@@ -607,8 +608,29 @@ sirius_physical_plan_generator::create_streaming_source_plan(duckdb::LogicalGet&
       static_cast<unsigned long long>(column_ids.size()));
   }
 
-  auto source = duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(
-    binding.types, op.EstimateCardinality(context), binding.repository, binding.expected_senders);
+  auto view = std::make_shared<sirius::op::scan::bound_read_view const>(
+    sirius::op::scan::capture_bound_read_view(op, context));
+  sirius::op::scan::column_requirements columns;
+  columns.column_ids = op.GetColumnIds();
+  sirius::op::scan::materializer_contract_identity materializer{
+    sirius::op::scan::materializer_kind::stream, "sirius.stream.v1"};
+  auto const contract_id =
+    sirius::op::scan::allocate_scan_contract(*read_views,
+                                             contract_provenance.window_id,
+                                             contract_provenance.finalize_generation,
+                                             next_scan_node_id++,
+                                             std::move(view),
+                                             std::move(columns),
+                                             {},
+                                             std::move(materializer),
+                                             op.returned_types);
+  auto source =
+    duckdb::make_uniq<sirius::op::sirius_physical_streaming_source>(binding.types,
+                                                                    op.EstimateCardinality(context),
+                                                                    binding.repository,
+                                                                    binding.expected_senders,
+                                                                    read_views,
+                                                                    contract_id);
 
   // Plan owns op; catalog.built back-pointer for session registration.
   catalog->set_built(bind->stream_id, source.get());
@@ -1002,9 +1024,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
       op.estimated_cardinality,
       std::move(op.extra_info),
       std::move(op.parameters),
-      std::move(op.virtual_columns));
+      std::move(op.virtual_columns),
+      op.returned_types);
     node->named_parameters     = std::move(op.named_parameters);
     node->mvcc_pin_serves_scan = mvcc_pin_serves_scan;
+    node->read_views           = read_views;
+    node->scan_node_id         = next_scan_node_id++;
     // first check if an additional projection is necessary
     if (column_ids.size() == op.returned_types.size()) {
       bool projection_necessary = false;
@@ -1068,7 +1093,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     op.estimated_cardinality,
     std::move(op.extra_info),
     std::move(op.parameters),
-    std::move(op.virtual_columns));
+    std::move(op.virtual_columns),
+    original_types);
   if (!physical_types.empty() && physical_types.size() == node->types.size()) {
     node->set_physical_types(std::move(physical_types));
     node->sidecar_from_gpu_tier_pin =
@@ -1077,6 +1103,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   }
   node->named_parameters     = std::move(op.named_parameters);
   node->mvcc_pin_serves_scan = mvcc_pin_serves_scan;
+  node->read_views           = read_views;
+  node->scan_node_id         = next_scan_node_id++;
   if (filter) {
     filter->children.push_back(std::move(node));
     return filter;

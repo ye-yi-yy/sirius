@@ -283,7 +283,7 @@ unique_ptr<FunctionData> SiriusReadParquetBind(ClientContext& context,
   auto bind_result = sirius_ctx->get_scan_manager().describe_parquet(uri);
   return_types     = std::move(bind_result.return_types);
   names            = std::move(bind_result.names);
-  return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows);
+  return make_uniq<SiriusReadParquetBindData>(uri, bind_result.total_num_rows, return_types, names);
 }
 
 // Execute callback for sirius_read_parquet. The real scan runs through the
@@ -628,10 +628,10 @@ static void RegisterLegacyGPUFunctions(CatalogTransaction& transaction, Catalog&
 #endif  // SIRIUS_ENABLE_LEGACY
 
 static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPlan(
-  ClientContext& context, unique_ptr<LogicalOperator>& logical_plan)
+  ClientContext& context, unique_ptr<LogicalOperator>& logical_plan, sirius::query_id_t query_id)
 {
   sirius::planner::sirius_physical_plan_generator physical_planner =
-    sirius::planner::sirius_physical_plan_generator(context);
+    sirius::planner::sirius_physical_plan_generator(context, {{sirius::value_of(query_id)}, 0});
   auto physical_plan = physical_planner.create_plan(std::move(logical_plan));
   return physical_plan;
 }
@@ -756,7 +756,8 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
           query_plan = data.ExtractPlan(context);
         }
         SIRIUS_LOG_DEBUG("Query plan:\n{}", query_plan->ToString());
-        auto sirius_physical_plan = SiriusGeneratePhysicalPlan(context, query_plan);
+        auto sirius_physical_plan =
+          SiriusGeneratePhysicalPlan(context, query_plan, window->query_id());
         SIRIUS_LOG_DEBUG("Done generating sirius physical plan");
 
         auto prepared     = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);

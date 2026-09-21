@@ -31,8 +31,10 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_streaming_source.hpp"
 #include "pipeline/repository_wiring.hpp"
 #include "sirius/exception.hpp"
+#include "transparent/read_view_registry.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -493,6 +495,48 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
   return "?";
 }
 
+char const* dump_source_kind(op::scan::source_kind kind)
+{
+  switch (kind) {
+    case op::scan::source_kind::duckdb_native: return "duckdb_native";
+    case op::scan::source_kind::parquet_local: return "parquet_local";
+    case op::scan::source_kind::parquet_s3: return "parquet_s3";
+    case op::scan::source_kind::stream_source: return "stream_source";
+  }
+  return "unknown";
+}
+
+char const* dump_evidence_depth(op::scan::evidence_depth depth)
+{
+  switch (depth) {
+    case op::scan::evidence_depth::path: return "path";
+    case op::scan::evidence_depth::path_and_size: return "path_and_size";
+    case op::scan::evidence_depth::path_size_and_tag: return "path_size_and_tag";
+  }
+  return "unknown";
+}
+
+char const* dump_verdict(op::scan::eligibility_verdict verdict)
+{
+  switch (verdict) {
+    case op::scan::eligibility_verdict::not_evaluated: return "not_evaluated";
+    case op::scan::eligibility_verdict::supported: return "supported";
+    case op::scan::eligibility_verdict::unsupported: return "unsupported";
+    case op::scan::eligibility_verdict::incomplete: return "incomplete";
+  }
+  return "unknown";
+}
+
+char const* dump_evidence_scope(op::scan::certificate_evidence_scope scope)
+{
+  switch (scope) {
+    case op::scan::certificate_evidence_scope::none: return "none";
+    case op::scan::certificate_evidence_scope::binding_correspondence:
+      return "binding_correspondence";
+  }
+  return "unknown";
+}
+
 //! Scan identity: serialize what the ingestible will scan, so a conversion that drops
 //! identity fields (e.g. the duckdb-native pin-cache qualified name, or a parquet file
 //! list) fails the dump byte-diff instead of passing on an identical operator-type chain.
@@ -500,8 +544,32 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
 //! the scan manager later matches against pinned entries.
 void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_operator& op)
 {
+  if (op.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
+    auto const& stream = op.Cast<op::sirius_physical_streaming_source>();
+    if (stream.contract_id() != 0 && stream.read_views()) {
+      auto const& entry    = stream.read_views()->entry(stream.contract_id());
+      auto const& contract = entry.contract;
+      auto const* identity =
+        contract.view && contract.view->identity ? contract.view->identity.get() : nullptr;
+      out << "      contract: handle=" << contract.contract_id << " node=" << contract.scan_node_id
+          << " window="
+          << (entry.window_id ? std::to_string(*entry.window_id) : std::string{"none"})
+          << " finalize_generation=" << entry.finalize_generation
+          << " source=" << (identity ? identity->source.function_name : "unknown")
+          << " kind=" << (identity ? dump_source_kind(identity->source.kind) : "unknown")
+          << " hash=" << (identity ? identity->fingerprint.hash : 0)
+          << " depth=" << dump_evidence_depth(entry.eligibility.depth)
+          << " profile=" << entry.eligibility.materializer.profile
+          << " policy=" << contract.predicates.pushdown_mode
+          << " verdict=" << dump_verdict(entry.eligibility.verdict)
+          << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
+          << " outputs=" << contract.output_types.size() << "\n";
+    }
+    return;
+  }
   if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
-  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible().table_info();
+  auto const& scan = op.Cast<op::scan::sirius_gpu_scan_operator>();
+  auto const& info = scan.get_ingestible().table_info();
   // Iceberg first: its table info derives from parquet's, so the parquet branch would match it
   // and describe an iceberg scan as a plain parquet one. The delete-file count belongs in the
   // identity — two scans of the same files that apply different deletes are not the same scan.
@@ -524,6 +592,28 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
     out << "      scan: duckdb table=" << nat->catalog_name << "." << nat->schema_name << "."
         << nat->table_name << "\n";
   }
+
+  if (scan.contract_id() != 0 && scan.read_views()) {
+    auto const& entry    = scan.read_views()->entry(scan.contract_id());
+    auto const& contract = entry.contract;
+    auto const* identity =
+      contract.view && contract.view->identity ? contract.view->identity.get() : nullptr;
+    out << "      contract: handle=" << contract.contract_id << " node=" << contract.scan_node_id
+        << " window=" << (entry.window_id ? std::to_string(*entry.window_id) : std::string{"none"})
+        << " finalize_generation=" << entry.finalize_generation
+        << " source=" << (identity ? identity->source.function_name : "unknown")
+        << " kind=" << (identity ? dump_source_kind(identity->source.kind) : "unknown")
+        << " hash=" << (identity ? identity->fingerprint.hash : 0)
+        << " depth=" << dump_evidence_depth(entry.eligibility.depth)
+        << " profile=" << entry.eligibility.materializer.profile
+        << " policy=" << contract.predicates.pushdown_mode
+        << " verdict=" << dump_verdict(entry.eligibility.verdict)
+        << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
+        << " outputs=" << contract.output_types.size()
+        << " columns=" << contract.columns.column_ids.size()
+        << " projections=" << contract.columns.projection_ids.size()
+        << " rowid=" << contract.columns.requires_row_id << "\n";
+  }
 }
 
 //! One `[pipeline N]` block: source/sink/operators with per-scan identity, shared by the
@@ -532,6 +622,7 @@ void dump_pipeline_block(std::ostringstream& out, std::size_t index, const siriu
 {
   out << "[pipeline " << index << "]\n";
   out << "  source: " << dump_op_name(p.get_source().get()) << "\n";
+  if (p.get_source()) { dump_scan_identity(out, *p.get_source()); }
   out << "  sink: " << dump_op_name(p.get_sink().get()) << "\n";
   const auto ops = p.get_operators();
   out << "  operators (" << ops.size() << "):\n";

@@ -22,6 +22,7 @@
 #include "memory/resource_ref_utils.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/dynamic_filter/dynamic_filter_stats.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/task_scheduler.hpp"
 #include "planner/query.hpp"
@@ -96,7 +97,11 @@ class SiriusConnectionState : public ClientContextState {
   }
 
   /// A new query on this connection invalidates any leftover capture.
-  void QueryBegin(ClientContext& context) final { captured_plan_.reset(); }
+  void QueryBegin(ClientContext& context) final
+  {
+    captured_plan_.reset();
+    captured_original_views_.reset();
+  }
 
   void QueryEnd() final { pinned_update_guard_.reset(); }
 
@@ -120,8 +125,11 @@ class SiriusConnectionState : public ClientContextState {
   {
     ++planning_generation_;
     captured_plan_.reset();
+    captured_original_views_.reset();
     decline_reason_ = sirius::transparent::decline_reason::none;
   }
+
+  [[nodiscard]] uint64_t planning_generation() const noexcept { return planning_generation_; }
 
   /// \brief Current classification; provider_internal remains latched.
   [[nodiscard]] sirius::transparent::connection_provenance provenance() const noexcept
@@ -170,6 +178,23 @@ class SiriusConnectionState : public ClientContextState {
     captured_generation_ = planning_generation_;
   }
 
+  void set_captured_original_views(std::vector<sirius::op::scan::logical_bound_read_view> views)
+  {
+    captured_original_views_ =
+      sirius::op::scan::logical_bound_read_view_capture{planning_generation_, std::move(views)};
+  }
+
+  std::optional<sirius::op::scan::logical_bound_read_view_capture>
+  take_captured_original_views_if_current()
+  {
+    if (!captured_original_views_ ||
+        captured_original_views_->planning_generation != planning_generation_) {
+      captured_original_views_.reset();
+      return std::nullopt;
+    }
+    return std::exchange(captured_original_views_, std::nullopt);
+  }
+
   /// \brief Consume the capture iff it belongs to the CURRENT planning attempt;
   /// a stale capture (generation mismatch) is dropped and nullptr is returned,
   /// which sends OnFinalizePrepare down its existing replan-from-SQL path.
@@ -184,7 +209,11 @@ class SiriusConnectionState : public ClientContextState {
 
   /// \brief Drop the capture without touching the generation (used by
   /// OnFinalizePrepare's not-taking-over early-outs).
-  void clear_captured_plan() noexcept { captured_plan_.reset(); }
+  void clear_captured_plan() noexcept
+  {
+    captured_plan_.reset();
+    captured_original_views_.reset();
+  }
 
   void set_pending_query_label(std::string label) { pending_query_label_ = std::move(label); }
   [[nodiscard]] std::optional<std::string> take_pending_query_label()
@@ -242,6 +271,7 @@ class SiriusConnectionState : public ClientContextState {
   uint64_t classified_generation_ = ~uint64_t{0};  ///< sentinel: no attempt classified yet
   /// Optimizer-hook capture for the current planning attempt of THIS connection.
   unique_ptr<LogicalOperator> captured_plan_;
+  std::optional<sirius::op::scan::logical_bound_read_view_capture> captured_original_views_;
   sirius::transparent::connection_provenance provenance_ =
     sirius::transparent::connection_provenance::unclassified;
   sirius::transparent::decline_reason decline_reason_ = sirius::transparent::decline_reason::none;
@@ -295,6 +325,7 @@ class SiriusContext : public ClientContextState {
     uint64_t provider_internal_skips = 0;
     uint64_t hidden_catalog_skips    = 0;
     uint64_t classification_failures = 0;
+    uint64_t certificate_mismatches  = 0;
   };
 
   /// Monotonic counters describing compressed-materialization activity.
@@ -647,6 +678,9 @@ class SiriusContext : public ClientContextState {
   /// via DuckDB CPU fallback (same transaction).
   void record_transparent_runtime_fallback() noexcept;
 
+  /// \brief Record a fresh split rejected because it belongs to another scan contract.
+  void record_transparent_certificate_mismatch() noexcept;
+
   /// \brief Record a planning attempt declined before the gpu_execution gate.
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
 
@@ -790,6 +824,7 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::atomic<uint64_t> transparent_classification_failure_count_{0};
+  std::atomic<uint64_t> transparent_certificate_mismatch_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_columns_narrowed_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
   std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};

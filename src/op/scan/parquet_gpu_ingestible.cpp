@@ -253,11 +253,13 @@ class parquet_batch_coalescer : public batch_coalescer {
  public:
   parquet_batch_coalescer(std::size_t cap,
                           std::shared_ptr<cudf::io::parquet_reader_options> reader_options,
-                          std::shared_ptr<scan_plan const> plan)
+                          std::shared_ptr<scan_plan const> plan,
+                          scan_contract_id contract_id)
     : _cap(cap),
       _reader_options(std::move(reader_options)),
       _plan(std::move(plan)),
-      _needs_assembly(needs_output_assembly(*_plan))
+      _needs_assembly(needs_output_assembly(*_plan)),
+      _contract_id(contract_id)
   {
   }
 
@@ -280,7 +282,10 @@ class parquet_batch_coalescer : public batch_coalescer {
         file->partition_values,
         file->disable_filter_pushdown,
         file->reader_options,
-        file->file_index};
+        file->file_index,
+        std::vector<split_materializer_certificate>(file->certificates().begin(),
+                                                    file->certificates().end()),
+        std::vector<split_dependencies>(file->dependencies().begin(), file->dependencies().end())};
     }
 
     if (!_slices.empty() && (_partition_values != file->partition_values ||
@@ -315,6 +320,12 @@ class parquet_batch_coalescer : public batch_coalescer {
                            cur_comp,
                            std::move(slice_ds),
                            file->file_index);
+      if (!file->certificates().empty()) {
+        auto certificate     = file->certificates().front();
+        certificate.split_id = _next_split_id++;
+        _certificates.push_back(std::move(certificate));
+        _dependencies.push_back(file->dependencies().front());
+      }
       _produced_any      = true;
       _acc_working_bytes = memory::saturating_add(_acc_working_bytes, cur_working);
       _acc_run_count     = memory::saturating_add(_acc_run_count, run_count);
@@ -377,7 +388,12 @@ class parquet_batch_coalescer : public batch_coalescer {
       _partition_values   = _empty_split_fallback->partition_values;
       _disable_pushdown   = _empty_split_fallback->disable_filter_pushdown;
       _run_reader_options = _empty_split_fallback->reader_options;
-      _produced_any       = true;
+      _certificates       = _empty_split_fallback->certificates;
+      _dependencies       = _empty_split_fallback->dependencies;
+      for (auto& certificate : _certificates) {
+        certificate.split_id = _next_split_id++;
+      }
+      _produced_any = true;
       out.push_back(emit_current());
     }
     return out;
@@ -393,6 +409,7 @@ class parquet_batch_coalescer : public batch_coalescer {
     split->disable_filter_pushdown = _disable_pushdown;
     split->needs_assembly          = _needs_assembly;
     split->partition_values        = _partition_values;
+    split->set_contract_payload(_contract_id, std::move(_certificates), std::move(_dependencies));
     _slices.clear();
     _acc_working_bytes = 0;
     _acc_run_count     = 0;
@@ -404,8 +421,12 @@ class parquet_batch_coalescer : public batch_coalescer {
   std::shared_ptr<cudf::io::parquet_reader_options> _reader_options;
   std::shared_ptr<scan_plan const> _plan;
   const bool _needs_assembly;
+  const scan_contract_id _contract_id;
 
   std::vector<row_group_slice> _slices;
+  std::vector<split_materializer_certificate> _certificates;
+  std::vector<split_dependencies> _dependencies;
+  uint64_t _next_split_id        = 1;
   std::size_t _acc_working_bytes = 0;
   std::size_t _acc_run_count     = 0;
   int64_t _acc_rows              = 0;
@@ -426,6 +447,8 @@ class parquet_batch_coalescer : public batch_coalescer {
     bool disable_filter_pushdown;
     std::shared_ptr<cudf::io::parquet_reader_options> reader_options;
     std::size_t file_index;
+    std::vector<split_materializer_certificate> certificates;
+    std::vector<split_dependencies> dependencies;
   };
   std::optional<fallback_file> _empty_split_fallback;
   bool _produced_any = false;
@@ -724,7 +747,7 @@ parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;
 std::unique_ptr<batch_coalescer> parquet_gpu_ingestible::create_batch_coalescer() const
 {
   return std::make_unique<parquet_batch_coalescer>(
-    _info->approximate_batch_size, _reader_options, _plan);
+    _info->approximate_batch_size, _reader_options, _plan, _info->contract_id);
 }
 
 //===----------------------------------------------------------------------===//
@@ -781,16 +804,18 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   // Obtain footer metadata — from the datasource's cached parquet_metadata when
   // present, else by fetching and parsing the footer.
   std::shared_ptr<cudf::io::parquet::FileMetaData const> file_metadata;
+  std::size_t footer_len = 0;
   if (sirius_ds) {
     if (auto cached = sirius_ds->metadata()) {
       if (auto pm = std::dynamic_pointer_cast<parquet_metadata>(std::move(cached))) {
         file_metadata = pm->file_metadata();
+        footer_len    = pm->footer_byte_len();
       }
     }
   }
   if (!file_metadata) {
-    auto footer           = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
-    auto const footer_len = footer->size();
+    auto footer = cudf::io::parquet::fetch_footer_to_host(*sirius_ds);
+    footer_len  = footer->size();
     // The carrier projection is only known to match this file after the footer
     // is parsed, so the parse itself runs without a column selection.
     hybrid_scan_reader footer_reader(cudf::host_span<uint8_t const>(footer->data(), footer->size()),
@@ -1170,6 +1195,13 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   }
 
   out->partition_values = std::move(partition_values);
+  out->set_contract_payload(_info->contract_id,
+                            {{_info->contract_id,
+                              0,
+                              file_path + "|footer=" + std::to_string(footer_len),
+                              "parquet",
+                              "footer"}},
+                            {{file_metadata, out->datasource, std::nullopt}});
 
   return out;
 }

@@ -11,8 +11,10 @@
 #include "io/rest/s3/sigv4_authorizer.hpp"
 #include "io/s3/s3_object_ref.hpp"
 #include "io/s3/sirius_httpfs.hpp"
+#include "op/scan/table_scan/bound_read_view.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
+#include "utils/parquet_fixture_utils.hpp"
 #include "utils/s3_container.hpp"
 #include "utils/tpch_queries.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
@@ -29,6 +31,7 @@
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 
 #include <algorithm>
 #include <array>
@@ -280,6 +283,19 @@ std::string read_text_file(fs::path const& path)
   std::ostringstream out;
   out << in.rdbuf();
   return out.str();
+}
+
+std::vector<std::uint8_t> read_binary_file(fs::path const& path)
+{
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  REQUIRE(in);
+  auto const size = in.tellg();
+  REQUIRE(size >= 0);
+  std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+  in.seekg(0);
+  in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+  REQUIRE(in);
+  return bytes;
 }
 
 void load_sirius_extension(duckdb::DuckDB& db)
@@ -3905,6 +3921,8 @@ TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for card
   CHECK(typed->total_num_rows == expected_orders_rows);
   CHECK_FALSE(return_types.empty());
   CHECK_FALSE(names.empty());
+  CHECK(typed->bound_types == return_types);
+  CHECK(typed->bound_names == names);
   REQUIRE(table_function.cardinality != nullptr);
 
   auto stats = table_function.cardinality(*fixture.con.context, bind_data.get());
@@ -3913,6 +3931,79 @@ TEST_CASE("internal sirius_read_parquet bind returns row-count metadata for card
   CHECK(stats->estimated_cardinality == expected_orders_rows);
   CHECK(stats->has_max_cardinality);
   CHECK(stats->max_cardinality == expected_orders_rows);
+}
+
+TEST_CASE("Sirius S3 capture uses the fresh schema from a name-only rebind",
+          "[s3][integration][sql][planner-metadata][scan][contracts]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  sirius::test::scratch_dir scratch{"s3_name_only_rebind"};
+  auto const first_path  = scratch.path() / "first.parquet";
+  auto const second_path = scratch.path() / "second.parquet";
+  require_query_ok(fixture.con,
+                   "COPY (SELECT 1::INTEGER AS original_name) TO " +
+                     sql_quote(first_path.string()) + " (FORMAT PARQUET)");
+  require_query_ok(fixture.con,
+                   "COPY (SELECT 1::INTEGER AS rebound_name) TO " +
+                     sql_quote(second_path.string()) + " (FORMAT PARQUET)");
+
+  auto const first_key  = "rebind/name-only-first.parquet";
+  auto const second_key = "rebind/name-only-second.parquet";
+  if (!sirius::test::put_s3_container_object(first_key, read_binary_file(first_path))) {
+    SUCCEED("managed MinIO is required for the name-only rebind test");
+    return;
+  }
+  REQUIRE(sirius::test::put_s3_container_object(second_key, read_binary_file(second_path)));
+
+  auto const first_uri  = s3_uri(env->bucket, first_key);
+  auto const second_uri = s3_uri(env->bucket, second_key);
+  duckdb::TableFunction first_function;
+  duckdb::vector<duckdb::LogicalType> first_types;
+  duckdb::vector<std::string> first_names;
+  auto first_bind = bind_sirius_read_parquet(
+    *fixture.con.context, first_uri, first_function, first_types, first_names);
+  REQUIRE(first_bind != nullptr);
+  REQUIRE(first_names == duckdb::vector<std::string>{"original_name"});
+  duckdb::LogicalGet first_get(
+    /*table_index=*/91, std::move(first_function), std::move(first_bind), first_types, first_names);
+  first_get.parameters.emplace_back(first_uri);
+  sirius::op::scan::bound_read_view first_captured;
+  fixture.con.context->RunFunctionInTransaction([&] {
+    first_captured = sirius::op::scan::capture_bound_read_view(first_get, *fixture.con.context);
+  });
+  REQUIRE(first_captured.identity != nullptr);
+  REQUIRE(first_captured.identity->bound_names == first_names);
+
+  duckdb::TableFunction rebound_function;
+  duckdb::vector<duckdb::LogicalType> rebound_types;
+  duckdb::vector<std::string> rebound_names;
+  auto rebound_bind = bind_sirius_read_parquet(
+    *fixture.con.context, second_uri, rebound_function, rebound_types, rebound_names);
+  REQUIRE(rebound_bind != nullptr);
+  REQUIRE(rebound_types == first_types);
+  REQUIRE(rebound_names == duckdb::vector<std::string>{"rebound_name"});
+
+  // Model the node state that makes B1 important: a rebind has replaced the
+  // bind payload, while LogicalGet::names still reflects the previous bind.
+  duckdb::LogicalGet rebound_get(/*table_index=*/91,
+                                 std::move(rebound_function),
+                                 std::move(rebound_bind),
+                                 rebound_types,
+                                 first_names);
+  rebound_get.parameters.emplace_back(second_uri);
+  REQUIRE(rebound_get.names == first_names);
+
+  sirius::op::scan::bound_read_view captured;
+  fixture.con.context->RunFunctionInTransaction([&] {
+    captured = sirius::op::scan::capture_bound_read_view(rebound_get, *fixture.con.context);
+  });
+  REQUIRE(captured.identity != nullptr);
+  CHECK(captured.identity->bound_types == rebound_types);
+  CHECK(captured.identity->bound_names == rebound_names);
+  CHECK(captured.identity->bound_names != rebound_get.names);
 }
 
 TEST_CASE("internal sirius_read_parquet exposes S3 row count to DuckDB EXPLAIN",
