@@ -14,6 +14,7 @@
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
+#include "utils/isolated_checkpoint_test.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/s3_container.hpp"
 #include "utils/tpch_queries.hpp"
@@ -4485,4 +4486,93 @@ TEST_CASE("gpu_execution large S3 lineitem join matches local CPU without prefet
     large_lineitem_orders_join_query(s3_large_lineitem_scan(*env), s3_parquet_scan(*env, "orders")),
     large_lineitem_orders_join_query(local_parquet_file_scan(large->local_path),
                                      local_parquet_scan(*env, "orders")));
+}
+
+TEST_CASE("native walk failure in a mixed S3 plan preserves execution-time source veto",
+          "[s3][integration][sql][native][checkpoint]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+  if (sirius::test::run_isolated()) { return; }
+  for (bool explicit_path : {false, true}) {
+    s3_sql_fixture fixture(*env);
+    set_gpu_execution(fixture.con, true);
+    auto path = fs::temp_directory_path() / ("sirius_native_s3_" + std::to_string(::getpid()) +
+                                             (explicit_path ? "_explicit.db" : "_transparent.db"));
+    REQUIRE_FALSE(fs::exists(path));
+    require_query_ok(fixture.con, "ATTACH '" + path.string() + "' AS lease_native");
+    require_query_ok(fixture.con,
+                     "CREATE TABLE lease_native.main.native_lease_t AS SELECT range::BIGINT i "
+                     "FROM range(300000)");
+    require_query_ok(fixture.con, "CHECKPOINT lease_native");
+    require_query_ok(fixture.con, "SET enable_duckdb_fallback = true");
+    require_query_ok(fixture.con, "SET sirius_test_inject_native_walk_failure = 'native_lease_t'");
+    auto context = sirius::test::get_registered_sirius_context(fixture.con);
+    auto before  = context->get_transparent_execution_stats();
+    auto sql     = "SELECT count(*) FROM lease_native.main.native_lease_t n JOIN " +
+               s3_parquet_scan(*env, "nation") + " s ON n.i = s.n_nationkey";
+    auto result = fixture.con.Query(explicit_path ? gpu_execution_sql(sql) : sql);
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+    CHECK(result->GetError().find("injected native metadata walk failure") != std::string::npos);
+    CHECK(result->GetError().find("GPU plan generation failed:") == std::string::npos);
+    auto after = context->get_transparent_execution_stats();
+    CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    CHECK(after.lease_held_at_replay == before.lease_held_at_replay);
+    if (!explicit_path) {
+      CHECK(after.successful_rebinds == before.successful_rebinds + 1);
+      CHECK(after.fallbacks == before.fallbacks);
+      CHECK(after.executions == before.executions + 1);
+    }
+    require_query_ok(fixture.con, "DETACH lease_native");
+    fs::remove(path);
+  }
+}
+
+TEST_CASE("never-entered native and S3 windows preserve the runtime-unavailable error",
+          "[s3][integration][sql][native][checkpoint]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+  if (sirius::test::run_isolated()) { return; }
+  for (bool explicit_path : {false, true}) {
+    s3_sql_fixture fixture(*env);
+    set_gpu_execution(fixture.con, true);
+    auto path = fs::temp_directory_path() / ("sirius_unavailable_s3_" + std::to_string(::getpid()) +
+                                             (explicit_path ? "_explicit.db" : "_transparent.db"));
+    REQUIRE_FALSE(fs::exists(path));
+    require_query_ok(fixture.con, "ATTACH '" + path.string() + "' AS lease_native");
+    require_query_ok(fixture.con,
+                     "CREATE TABLE lease_native.main.native_lease_t AS SELECT range::BIGINT i "
+                     "FROM range(300000)");
+    require_query_ok(fixture.con, "CHECKPOINT lease_native");
+    require_query_ok(fixture.con, "SET enable_duckdb_fallback = true");
+    require_query_ok(fixture.con, "SET sirius_test_mark_runtime_unavailable_before_window = true");
+    auto context = sirius::test::get_registered_sirius_context(fixture.con);
+    auto before  = context->get_transparent_execution_stats();
+    auto sql     = "SELECT count(*) FROM lease_native.main.native_lease_t n JOIN " +
+               s3_parquet_scan(*env, "nation") + " s ON n.i = s.n_nationkey";
+    auto result = fixture.con.Query(explicit_path ? gpu_execution_sql(sql) : sql);
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    INFO(result->GetError());
+    CHECK(result->GetErrorType() == duckdb::ExceptionType::EXECUTOR);
+    CHECK(result->GetError().find("Sirius GPU runtime is unavailable") != std::string::npos);
+    CHECK(result->GetError().find("S3 CPU fallback is not supported") == std::string::npos);
+    CHECK(context->get_runtime_health() == duckdb::SiriusContext::runtime_health::UNAVAILABLE);
+    CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
+    auto after = context->get_transparent_execution_stats();
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    CHECK(after.lease_held_at_replay == before.lease_held_at_replay);
+    if (!explicit_path) {
+      CHECK(after.successful_rebinds == before.successful_rebinds + 1);
+      CHECK(after.fallbacks == before.fallbacks);
+      CHECK(after.executions == before.executions + 1);
+    }
+    // The poisoned runtime is destroyed with this fixture. Files are unique to this child.
+    fs::remove(path);
+  }
 }

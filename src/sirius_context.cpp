@@ -62,6 +62,8 @@
 #include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
 #include <duckdb/execution/operator/persistent/physical_update.hpp>
 #include <duckdb/execution/physical_plan_generator.hpp>
+#include <duckdb/main/connection.hpp>
+#include <duckdb/transaction/meta_transaction.hpp>
 #include <io/types.hpp>
 #include <io/uring/uring_ioctx.hpp>
 #include <sys/resource.h>
@@ -381,6 +383,109 @@ bool SiriusContext::is_internal_query_active(ClientContext& context) noexcept
   return conn_state && conn_state->is_internal_query_active();
 }
 
+void SiriusContext::InternalQueryGuard::before_transaction_start(ClientContext& outer,
+                                                                 bool read_only) const
+{
+  if (read_only) { return; }
+  auto sirius_context = outer.registered_state->Get<SiriusContext>("sirius_state");
+  if (sirius_context && sirius_context->get_scan_manager().holds_any_checkpoint_key()) {
+    throw NotImplementedException(
+      "Sirius refused a non-read-only internal transaction while a checkpoint lease is held");
+  }
+}
+
+struct SiriusContext::internal_connection::implementation {
+  explicit implementation(ClientContext& outer) : connection(*outer.db), guard(*connection.context)
+  {
+    guard.before_transaction_start(outer, true);
+    auto result = connection.Query("BEGIN TRANSACTION READ ONLY");
+    if (!result || result->HasError()) {
+      throw InvalidInputException(
+        "Sirius internal connection could not start a read-only transaction: " +
+        string(result ? result->GetError() : "null result"));
+    }
+    if (!connection.context->transaction.HasActiveTransaction() ||
+        !MetaTransaction::Get(*connection.context).IsReadOnly()) {
+      throw InternalException("Sirius internal connection did not enter a read-only transaction");
+    }
+    transaction_open = true;
+  }
+
+  ~implementation() noexcept
+  {
+    if (!transaction_open || !connection.context->transaction.HasActiveTransaction()) { return; }
+    try {
+      auto result = connection.Query("COMMIT");
+      if (!result || result->HasError()) { connection.Query("ROLLBACK"); }
+    } catch (...) {
+      try {
+        connection.Query("ROLLBACK");
+      } catch (...) {
+      }
+    }
+  }
+
+  Connection connection;
+  InternalQueryGuard guard;
+  bool transaction_open = false;
+};
+
+SiriusContext::internal_connection::internal_connection(unique_ptr<implementation> impl) noexcept
+  : impl_(std::move(impl))
+{
+}
+
+SiriusContext::internal_connection::internal_connection(internal_connection&&) noexcept = default;
+SiriusContext::internal_connection& SiriusContext::internal_connection::operator=(
+  internal_connection&&) noexcept                                   = default;
+SiriusContext::internal_connection::~internal_connection() noexcept = default;
+
+unique_ptr<MaterializedQueryResult> SiriusContext::internal_connection::Query(const string& sql)
+{
+  auto& context = *impl_->connection.context;
+  if (!context.transaction.HasActiveTransaction() || !MetaTransaction::Get(context).IsReadOnly()) {
+    throw InvalidInputException("Sirius internal connection lost its read-only transaction");
+  }
+  // Accept only the metadata queries and session settings used by the two callers. In
+  // particular, no transaction control, prepared EXECUTE or multi-statement escape is exposed.
+  Parser parser(context.GetParserOptions());
+  parser.ParseQuery(sql);
+  if (parser.statements.size() != 1 ||
+      (parser.statements[0]->type != StatementType::SELECT_STATEMENT &&
+       parser.statements[0]->type != StatementType::SET_STATEMENT)) {
+    throw InvalidInputException("Sirius internal connection accepts one SELECT or SET statement");
+  }
+  return impl_->connection.Query(std::move(parser.statements[0]));
+}
+
+SiriusContext::internal_connection SiriusContext::open_internal_connection(ClientContext& outer)
+{
+  return internal_connection(make_uniq<internal_connection::implementation>(outer));
+}
+
+void SiriusContext::observe_native_checkpoint_for_testing(ClientContext& context,
+                                                          std::string_view phase,
+                                                          uint64_t iteration)
+{
+  if (!native_checkpoint_hook_for_testing) { return; }
+  Value enabled;
+  if (context.TryGetCurrentSetting("sirius_test_sync_native_checkpoint", enabled) &&
+      !enabled.IsNull() && enabled.GetValue<bool>()) {
+    native_checkpoint_hook_for_testing(context, phase, iteration);
+  }
+}
+
+void SiriusContext::before_cpu_replay_for_testing(ClientContext& context)
+{
+  Value enabled;
+  if (context.TryGetCurrentSetting("sirius_test_sync_cpu_replay", enabled) && !enabled.IsNull() &&
+      enabled.GetValue<bool>()) {
+    if (!cpu_replay_hook_for_testing)
+      throw InvalidInputException("Missing CPU replay test rendezvous");
+    cpu_replay_hook_for_testing();
+  }
+}
+
 void SiriusContext::throw_runtime_unavailable() const
 {
   // IS-A ExecutorException: deliberately non-invalidating (INTERNAL/FATAL
@@ -415,7 +520,9 @@ void SiriusContext::begin_execution_window(ClientContext& context,
   // GPU admission runs later, in sirius_engine::initialize_internal().
 }
 
-void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag)
+std::size_t SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id,
+                                                 std::string_view end_tag,
+                                                 bool inject_failure)
 {
   // Observability inside the cleanup is best-effort: only the mandatory steps
   // (query/drain/repository/scan/task resets) may throw out of this function
@@ -483,6 +590,10 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
   // Drop scan-manager providers for this query. Repositories are already
   // cleared above, so downstream data_batches that referenced sliced
   // host_data_representation are gone before the providers go away.
+  if (inject_failure && scan_manager_ && scan_manager_->holds_any_checkpoint_key()) {
+    throw std::runtime_error("injected checkpoint cleanup failure before scan-manager reset");
+  }
+  auto const keys_released = scan_manager_ ? scan_manager_->checkpoint_key_count() : 0;
   if (scan_manager_) { scan_manager_->reset(); }
 
   // NOTE: task_creator_->reset(query_id) already ran at the top of this function. That reset is
@@ -495,13 +606,14 @@ void SiriusContext::run_mandatory_cleanup(sirius::query_id_t query_id, std::stri
     log_pool_stats(end_tag);
   } catch (...) {  // best-effort observability
   }
+  return keys_released;
 }
 
 void SiriusContext::run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
                                                    std::string_view end_tag) noexcept
 {
   try {
-    run_mandatory_cleanup(query_id, end_tag);
+    (void)run_mandatory_cleanup(query_id, end_tag);
   } catch (std::exception& e) {
     mark_runtime_unavailable();
     drop_query_runtime_state_best_effort(query_id);
@@ -571,6 +683,10 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
                                                           std::string_view window_label)
   : ctx_(ctx), window_id_(sirius::make_query_id(0)), connection_id_(0), query_ordinal_(0)
 {
+  Value inject;
+  inject_cleanup_failure_ =
+    context.TryGetCurrentSetting("sirius_test_inject_checkpoint_cleanup_failure", inject) &&
+    !inject.IsNull() && inject.GetValue<bool>();
   if (auto conn_state = get_sirius_connection_state(context)) {
     connection_id_ = conn_state->connection_id();
     query_ordinal_ = conn_state->current_query_ordinal();
@@ -599,6 +715,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   log_window_event("begin", "-");
   try {
     ctx_.begin_execution_window(context, window_id_, window_label, begin_tag_);
+    lease_release_.state = lease_release_state::cleanup_failed;
   } catch (std::exception& e) {
     // A failed begin may have left the shared runtime part-mutated. This must
     // NEVER be classified as an ordinary GPU failure (which entry points would
@@ -607,6 +724,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
     // catch blocks rethrow it as-is instead of falling back.
     state_ = scope_state::FAILED;
     ctx_.mark_runtime_unavailable();
+    lease_release_.state = lease_release_state::begin_failed;
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();
@@ -616,6 +734,7 @@ SiriusContext::StandaloneQueryScope::StandaloneQueryScope(SiriusContext& ctx,
   } catch (...) {
     state_ = scope_state::FAILED;
     ctx_.mark_runtime_unavailable();
+    lease_release_.state = lease_release_state::begin_failed;
     ctx_.run_mandatory_cleanup_backstop(window_id_, end_tag_);
     log_window_event("end", "begin_failed");
     ctx_.release_query_lifecycle_slot();
@@ -637,7 +756,9 @@ void SiriusContext::StandaloneQueryScope::finish()
   } releaser{ctx_};
 
   try {
-    ctx_.run_mandatory_cleanup(window_id_, end_tag_);
+    lease_release_.keys_released =
+      ctx_.run_mandatory_cleanup(window_id_, end_tag_, inject_cleanup_failure_);
+    lease_release_.state = lease_release_state::released;
   } catch (...) {
     // A mandatory-cleanup failure means the shared runtime can no longer be
     // trusted; the destructor must NOT run a second pass over half-cleaned
@@ -1190,6 +1311,9 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
     .certificate_mismatches =
       transparent_certificate_mismatch_count_.load(std::memory_order_relaxed),
     .execution_rebuilds = transparent_execution_rebuild_count_.load(std::memory_order_relaxed),
+    .checkpoint_revalidation_failures =
+      checkpoint_revalidation_failure_count_.load(std::memory_order_relaxed),
+    .lease_held_at_replay = lease_held_at_replay_count_.load(std::memory_order_relaxed),
   };
 }
 
@@ -1243,6 +1367,16 @@ void SiriusContext::record_transparent_read_view_mismatch() noexcept
 void SiriusContext::record_transparent_execution_rebuild() noexcept
 {
   transparent_execution_rebuild_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_checkpoint_revalidation_failure() noexcept
+{
+  checkpoint_revalidation_failure_count_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_lease_held_at_replay() noexcept
+{
+  lease_held_at_replay_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
 SiriusContext::compressed_materialization_stats

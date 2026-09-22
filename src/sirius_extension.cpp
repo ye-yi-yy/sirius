@@ -71,6 +71,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "planner/scan_source_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
@@ -82,8 +83,10 @@ extern "C" int cudaProfilerStop();
 #include <api/compressed_table_io.hpp>
 #include <api/simpatico_codegen.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 // #include "from_substrait.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
 #include "gpu_buffer_manager.hpp"
@@ -739,6 +742,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
     ErrorData gpu_error;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
+    auto lease_release = duckdb::SiriusContext::StandaloneQueryScope::lease_release_result{};
 
     // The execution window: fresh plan extraction, Sirius physical plan
     // generation, execution and mandatory cleanup all happen inside one scope
@@ -747,7 +751,15 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
     {
       std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
       try {
-        if (sirius_ctx) { window.emplace(*sirius_ctx, context, "gpu_execution"); }
+        if (sirius_ctx) {
+          Value mark_unavailable;
+          if (context.TryGetCurrentSetting("sirius_test_mark_runtime_unavailable_before_window",
+                                           mark_unavailable) &&
+              !mark_unavailable.IsNull() && mark_unavailable.GetValue<bool>()) {
+            sirius_ctx->mark_runtime_unavailable();
+          }
+          window.emplace(*sirius_ctx, context, "gpu_execution");
+        }
 
         unique_ptr<LogicalOperator> query_plan;
         {
@@ -791,6 +803,7 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
       // destructor backstop.
       if (window) {
         window->finish();
+        lease_release = window->lease_release();
         window.reset();
       }
     }
@@ -807,6 +820,15 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
       }
       if (!duckdb_fallback_enabled(context)) {
         throw std::runtime_error("SiriusExecuteQuery error: " + gpu_error.RawMessage());
+      }
+      if (sirius_ctx) { sirius_ctx->before_cpu_replay_for_testing(context); }
+      if (lease_release.state !=
+            duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::released &&
+          lease_release.state !=
+            duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::not_entered) {
+        if (sirius_ctx) { sirius_ctx->record_lease_held_at_replay(); }
+        throw std::runtime_error(
+          "SiriusExecuteQuery error: checkpoint-lease cleanup did not complete before CPU replay");
       }
       SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", gpu_error.RawMessage());
       print_cpu_fallback_banner();
@@ -1377,13 +1399,28 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
     // DuckTransaction.
     auto& pinned_catalog      = Catalog::GetCatalog(context, info->catalog_name);
     duckdb_pin_v_base         = DuckTransaction::Get(context, pinned_catalog).start_time;
+    auto& attached_database   = info->storage->GetAttached();
     auto const* block_manager = dynamic_cast<SingleFileBlockManager const*>(
-      &info->storage->GetAttached().GetStorageManager().GetBlockManager());
+      &attached_database.GetStorageManager().GetBlockManager());
     if (block_manager == nullptr) {
       throw InvalidInputException("pin_table: DuckDB-native pins require a single-file database");
     }
-    duckdb_pin_checkpoint_iteration = block_manager->GetCheckpointIteration();
-    ingestible                      = sirius::op::scan::make_ingestible(std::move(info));
+    ingestible = sirius::op::scan::make_ingestible(std::move(info));
+    scan_mgr.acquire_checkpoint_key(attached_database);
+    ingestible->ensure_metadata_prepared();
+    sirius_ctx->observe_native_checkpoint_for_testing(
+      context,
+      "pin_prepared",
+      std::static_pointer_cast<sirius::op::scan::duckdb_native_gpu_ingestible>(ingestible)
+        ->checkpoint_iteration());
+    Value pin_pause_ms;
+    if (context.TryGetCurrentSetting("sirius_test_pause_pin_after_prepare_ms", pin_pause_ms) &&
+        !pin_pause_ms.IsNull() && pin_pause_ms.GetValue<uint64_t>() > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(pin_pause_ms.GetValue<uint64_t>()));
+    }
+    duckdb_pin_checkpoint_iteration =
+      std::static_pointer_cast<sirius::op::scan::duckdb_native_gpu_ingestible>(ingestible)
+        ->checkpoint_iteration();
   } else {  // parquet
     auto& fs   = FileSystem::GetFileSystem(context);
     auto files = fs.GlobFiles(data.args.path);
@@ -3275,6 +3312,66 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                     Value("off"));
   add_sirius_option(config,
                     option_visibility::internal,
+                    "sirius_test_pause_native_after_prepare_ms",
+                    "pause before a native execution window is entered",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_pause_after_native_leaf_ms",
+                    "pause after lowering a native leaf while no checkpoint key is held",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_pause_native_decode_ms",
+                    "pause after native metadata preparation while its checkpoint key is held",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_native_walk_failure",
+                    "fail a native metadata walk for '*' or the named table",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_native_decode_failure",
+                    "fail native decode for '*' or the named table after its lease is taken",
+                    LogicalType::VARCHAR,
+                    Value(""));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_sync_native_checkpoint",
+                    "enable the native checkpoint test observer for this session",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_sync_cpu_replay",
+                    "wait at the CPU replay test rendezvous after this window releases its slot",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_inject_checkpoint_cleanup_failure",
+                    "fail cleanup before scan-manager reset while checkpoint keys remain held",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_pause_pin_after_prepare_ms",
+                    "pause pin_table after its native walk while its checkpoint key is held",
+                    LogicalType::UBIGINT,
+                    Value::UBIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::internal,
+                    "sirius_test_mark_runtime_unavailable_before_window",
+                    "latch runtime unavailability immediately before execution-window entry",
+                    LogicalType::BOOLEAN,
+                    Value::BOOLEAN(false));
+  add_sirius_option(config,
+                    option_visibility::internal,
                     "sirius_test_read_view_churn_path",
                     "path used by read-view churn integration tests",
                     LogicalType::VARCHAR,
@@ -3680,6 +3777,7 @@ static void LoadInternal(ExtensionLoader& loader)
   // per-connection options register with.
   SiriusRegistration::InitialGPUConfigs(config, callback_ptr->get_loaded_config());
   SiriusRegistration::RegisterGPUFunctions(db);
+  if (!sirius_disabled) { sirius::planner::register_scan_source_callbacks(db); }
 
   // Register the s3:// FileSystem so DuckDB's native read_parquet('s3://') binds
   // by reading the parquet footer through Sirius's routed REST ioctx. This makes

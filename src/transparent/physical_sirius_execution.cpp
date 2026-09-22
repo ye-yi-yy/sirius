@@ -36,6 +36,9 @@
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
 
+#include <chrono>
+#include <thread>
+
 namespace sirius::transparent {
 
 // ---------------------------------------------------------------------------
@@ -175,12 +178,27 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     duckdb::ErrorData gpu_error;
     bool gpu_failed                = false;
     bool runtime_unavailable_error = false;
+    auto lease_release = duckdb::SiriusContext::StandaloneQueryScope::lease_release_result{};
     // The execution window: begin mutations and slot acquire in one scope on
     // this thread; finished (mandatory cleanup and release) below, before the
     // first Fetch exposes the result, so an abandoned result holds nothing.
     std::optional<duckdb::SiriusContext::StandaloneQueryScope> window;
     try {
       if (state.sirius_context) {
+        state.sirius_context->observe_native_checkpoint_for_testing(context.client,
+                                                                    "before_window");
+        duckdb::Value pause_ms;
+        if (context.client.TryGetCurrentSetting("sirius_test_pause_native_after_prepare_ms",
+                                                pause_ms) &&
+            !pause_ms.IsNull() && pause_ms.GetValue<uint64_t>() > 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms.GetValue<uint64_t>()));
+        }
+        duckdb::Value mark_unavailable;
+        if (context.client.TryGetCurrentSetting(
+              "sirius_test_mark_runtime_unavailable_before_window", mark_unavailable) &&
+            !mark_unavailable.IsNull() && mark_unavailable.GetValue<bool>()) {
+          state.sirius_context->mark_runtime_unavailable();
+        }
         window.emplace(*state.sirius_context, context.client, "transparent_execution");
       }
       if (!validated_sirius_plan_ && !logical_plan_ && query_sql_.empty()) {
@@ -361,6 +379,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
     // backstop instead.
     if (window) {
       window->finish();
+      lease_release = window->lease_release();
       window.reset();
     }
 
@@ -394,6 +413,18 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           throw duckdb::ExecutorException("Sirius GPU execution failed: " + gpu_msg);
         }
         gpu_error.Throw("Sirius GPU execution failed: ");
+      }
+
+      if (state.sirius_context) {
+        state.sirius_context->before_cpu_replay_for_testing(context.client);
+      }
+      if (lease_release.state !=
+            duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::released &&
+          lease_release.state !=
+            duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::not_entered) {
+        if (state.sirius_context) { state.sirius_context->record_lease_held_at_replay(); }
+        throw duckdb::ExecutorException(
+          "Sirius CPU replay refused because checkpoint-lease cleanup did not complete");
       }
 
       // Fall back: run the stored CPU plan on a private executor bound to the same

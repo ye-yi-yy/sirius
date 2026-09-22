@@ -79,7 +79,9 @@
 #include <duckdb/common/serializer/memory_stream.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <numeric>
+#include <thread>
 #include <utility>
 
 namespace sirius::planner {
@@ -108,9 +110,13 @@ std::vector<std::string> resolve_parquet_scan_file_paths(
         multi_file_bind->file_list->IsEmpty()) {
       return {};
     }
+    auto files = multi_file_bind->file_list->GetAllFiles();
     std::vector<std::string> file_paths;
-    for (auto const& file : multi_file_bind->file_list->GetAllFiles()) {
-      file_paths.push_back(file.path);
+    file_paths.reserve(files.size());
+    // The bulk snapshot owns these strings; transfer them without copying each path again.
+    // The bound file list remains untouched for independent original/candidate captures.
+    for (auto& file : files) {
+      file_paths.push_back(std::move(file.path));
     }
     return file_paths;
   }
@@ -376,11 +382,10 @@ build_duckdb_native_table_info(sirius::op::sirius_physical_table_scan& scan_op,
       info->table_filters->filters[col_idx] = filt->Copy();
     }
   }
-  info->column_ids          = scan_op.column_ids;
-  info->projection_ids      = scan_op.projection_ids;
-  info->returned_types      = scan_op.returned_types;
-  info->output_types        = scan_op.types;
-  info->defer_metadata_walk = scan_op.mvcc_pin_serves_scan;
+  info->column_ids     = scan_op.column_ids;
+  info->projection_ids = scan_op.projection_ids;
+  info->returned_types = scan_op.returned_types;
+  info->output_types   = scan_op.types;
   return info;
 }
 
@@ -1020,11 +1025,21 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_native_scan(
   auto sirius_ctx = context.registered_state
                       ? context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                       : nullptr;
-  return make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
-                            scan,
-                            op_params,
-                            mode,
-                            sirius_ctx.get());
+  auto leaf       = make_gpu_scan_leaf(build_duckdb_native_table_info(scan, op_params, context),
+                                 scan,
+                                 op_params,
+                                 mode,
+                                 sirius_ctx.get());
+  if (sirius_ctx) { sirius_ctx->observe_native_checkpoint_for_testing(context, "native_leaf"); }
+  // TEST-ONLY c7 seam: the native leaf exists, but execution preparation has not started and
+  // therefore no checkpoint key may exist. A later Iceberg leaf can still open its internal
+  // read-only metadata connection without forming a FORCE CHECKPOINT wait cycle.
+  duckdb::Value pause_ms;
+  if (context.TryGetCurrentSetting("sirius_test_pause_after_native_leaf_ms", pause_ms) &&
+      !pause_ms.IsNull() && pause_ms.GetValue<uint64_t>() > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms.GetValue<uint64_t>()));
+  }
+  return leaf;
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_parquet_scan(

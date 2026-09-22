@@ -144,9 +144,6 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Host-tier-backed and never-sidecared scans leave it false.
   bool sidecar_from_gpu_tier_pin = false;
 
-  //! A pinned entry serves this scan, so the ingestible's metadata walk can be deferred.
-  bool mvcc_pin_serves_scan = false;
-
   //! Candidate binding captured from the exact scan object lowered at S1.
   std::shared_ptr<sirius::op::scan::bound_read_view const> bound_view;
   std::vector<std::string> contract_file_paths;

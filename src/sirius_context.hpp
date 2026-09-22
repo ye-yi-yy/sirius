@@ -41,6 +41,7 @@
 #include <duckdb/planner/logical_operator.hpp>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -69,6 +70,9 @@ class sirius_engine;
 }  // namespace sirius
 
 namespace duckdb {
+
+class Connection;
+class MaterializedQueryResult;
 
 /// \brief Per-connection Sirius state, registered on every ClientContext under
 /// its own key ("sirius_connection_state").
@@ -322,12 +326,14 @@ class SiriusContext : public ClientContextState {
     // counts plan-time (create_plan) fallbacks that never reached the GPU.
     uint64_t runtime_fallbacks = 0;
     // One count per declined planning attempt, including when gpu_execution is off.
-    uint64_t provider_internal_skips = 0;
-    uint64_t hidden_catalog_skips    = 0;
-    uint64_t classification_failures = 0;
-    uint64_t read_view_mismatches    = 0;
-    uint64_t certificate_mismatches  = 0;
-    uint64_t execution_rebuilds      = 0;
+    uint64_t provider_internal_skips          = 0;
+    uint64_t hidden_catalog_skips             = 0;
+    uint64_t classification_failures          = 0;
+    uint64_t read_view_mismatches             = 0;
+    uint64_t certificate_mismatches           = 0;
+    uint64_t execution_rebuilds               = 0;
+    uint64_t checkpoint_revalidation_failures = 0;
+    uint64_t lease_held_at_replay             = 0;
   };
 
   /// Monotonic counters describing compressed-materialization activity.
@@ -424,9 +430,43 @@ class SiriusContext : public ClientContextState {
     InternalQueryGuard(const InternalQueryGuard&)            = delete;
     InternalQueryGuard& operator=(const InternalQueryGuard&) = delete;
 
+    /// Fail closed before a Sirius-owned internal connection starts a non-read-only transaction
+    /// while the outer execution window holds a native checkpoint lease.
+    void before_transaction_start(ClientContext& outer, bool read_only) const;
+
    private:
     shared_ptr<SiriusConnectionState> state_;
   };
+
+  /// Framework-owned Sirius-internal DuckDB connection. Its transaction is explicitly
+  /// read-only, and InternalQueryGuard remains active for the connection's entire lifetime.
+  struct internal_connection {
+    internal_connection(internal_connection&&) noexcept;
+    internal_connection& operator=(internal_connection&&) noexcept;
+    ~internal_connection() noexcept;
+    internal_connection(const internal_connection&)            = delete;
+    internal_connection& operator=(const internal_connection&) = delete;
+
+    unique_ptr<MaterializedQueryResult> Query(const string& sql);
+
+   private:
+    struct implementation;
+    explicit internal_connection(unique_ptr<implementation> impl) noexcept;
+    unique_ptr<implementation> impl_;
+    friend class SiriusContext;
+  };
+
+  [[nodiscard]] static internal_connection open_internal_connection(ClientContext& outer);
+
+  // Installed and cleared with no replay in flight; only invoked by the internal test option.
+  // Set before a test starts its workers; reset only after they have joined.
+  std::function<void(ClientContext&, std::string_view, uint64_t)>
+    native_checkpoint_hook_for_testing;
+  void observe_native_checkpoint_for_testing(ClientContext& context,
+                                             std::string_view phase,
+                                             uint64_t iteration = 0);
+  std::function<void()> cpu_replay_hook_for_testing;
+  void before_cpu_replay_for_testing(ClientContext& context);
 
   /// \brief Whether the given connection is inside an internal-query bracket.
   [[nodiscard]] static bool is_internal_query_active(ClientContext& context) noexcept;
@@ -511,6 +551,17 @@ class SiriusContext : public ClientContextState {
    */
   class StandaloneQueryScope {
    public:
+    enum class lease_release_state : uint8_t {
+      not_entered,
+      released,
+      begin_failed,
+      cleanup_failed
+    };
+    struct lease_release_result {
+      lease_release_state state = lease_release_state::not_entered;
+      std::size_t keys_released = 0;
+    };
+
     StandaloneQueryScope(SiriusContext& ctx, ClientContext& context, std::string_view window_label);
     ~StandaloneQueryScope() noexcept;
     StandaloneQueryScope(const StandaloneQueryScope&)            = delete;
@@ -529,6 +580,7 @@ class SiriusContext : public ClientContextState {
     /// Pass it to the execution path (sirius_execute_query) so operators wire into this
     /// query's manager rather than a shared one.
     [[nodiscard]] sirius::query_id_t query_id() const noexcept { return window_id_; }
+    [[nodiscard]] lease_release_result lease_release() const noexcept { return lease_release_; }
 
    private:
     enum class scope_state : uint8_t { ACTIVE, FINISHED, FAILED };
@@ -547,6 +599,8 @@ class SiriusContext : public ClientContextState {
     char begin_tag_[192] = {};
     char end_tag_[192]   = {};
     scope_state state_   = scope_state::ACTIVE;
+    lease_release_result lease_release_;
+    bool inject_cleanup_failure_ = false;
   };
 
   /// \brief Terminate the Sirius context, releasing all resources.
@@ -688,6 +742,8 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Record rebuilding a Sirius plan inside an execution window.
   void record_transparent_execution_rebuild() noexcept;
+  void record_checkpoint_revalidation_failure() noexcept;
+  void record_lease_held_at_replay() noexcept;
 
   /// \brief Record a planning attempt declined before the gpu_execution gate.
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
@@ -737,7 +793,9 @@ class SiriusContext : public ClientContextState {
   /// telemetry and logging inside are best-effort and never abort the
   /// remaining steps. @p query_id selects which query's repositories to drop;
   /// @p end_tag keys the pool-stats log line to the window.
-  void run_mandatory_cleanup(sirius::query_id_t query_id, std::string_view end_tag);
+  [[nodiscard]] std::size_t run_mandatory_cleanup(sirius::query_id_t query_id,
+                                                  std::string_view end_tag,
+                                                  bool inject_failure = false);
   /// noexcept variant for the StandaloneQueryScope destructor backstop: one
   /// attempt; on failure marks the runtime UNAVAILABLE.
   void run_mandatory_cleanup_backstop(sirius::query_id_t query_id,
@@ -835,6 +893,8 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_read_view_mismatch_count_{0};
   std::atomic<uint64_t> transparent_certificate_mismatch_count_{0};
   std::atomic<uint64_t> transparent_execution_rebuild_count_{0};
+  std::atomic<uint64_t> checkpoint_revalidation_failure_count_{0};
+  std::atomic<uint64_t> lease_held_at_replay_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_columns_narrowed_count_{0};
   std::atomic<uint64_t> compressed_materialization_scan_columns_restored_count_{0};
   std::atomic<uint64_t> compressed_materialization_pin_columns_narrowed_count_{0};

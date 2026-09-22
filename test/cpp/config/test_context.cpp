@@ -277,6 +277,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
+    REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
@@ -287,6 +288,9 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 0);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 0);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 0);
+    auto native_option = con.Query("SET sirius_test_sync_native_checkpoint = true");
+    REQUIRE(native_option);
+    REQUIRE(native_option->HasError());
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE(result->HasError());
@@ -327,6 +331,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 0);
+    REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 0);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 0);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 0);
@@ -344,6 +349,7 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     REQUIRE(setting_count(con, "sirius_test_inject_transparent_gpu_error") == 1);
+    REQUIRE(setting_count(con, "sirius_test_sync_native_checkpoint") == 1);
     REQUIRE(setting_count(con, "enable_pinned_zone_map_pruning") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_filter") == 1);
     REQUIRE(setting_count(con, "enable_dynamic_zone_map_filter") == 1);
@@ -354,6 +360,11 @@ TEST_CASE("Test-only settings require explicit process opt-in",
     REQUIRE(setting_count(con, "dense_count_join_max_bytes") == 1);
     REQUIRE(setting_count(con, "dense_count_join_memory_fraction") == 1);
     REQUIRE(setting_count(con, "concat_batch_bytes") == 1);
+    duckdb::Value native_enabled;
+    auto native_setting =
+      con.context->TryGetCurrentSetting("sirius_test_sync_native_checkpoint", native_enabled);
+    REQUIRE(static_cast<bool>(native_setting));
+    REQUIRE_FALSE(native_enabled.GetValue<bool>());
     auto result = con.Query("SET sirius_test_inject_transparent_gpu_error = 'boom'");
     REQUIRE(result != nullptr);
     REQUIRE_FALSE(result->HasError());

@@ -29,6 +29,7 @@
 #include <op/scan/scan_plan.hpp>
 #include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_scan_operator_data.hpp>
+#include <sirius_context.hpp>
 
 // duckdb
 #include <duckdb/storage/single_file_block_manager.hpp>
@@ -232,20 +233,13 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
   }
 
   _chunk_row_groups = metadata_parse_chunk();
-  if (bind.defer_metadata_walk) {
-    // Seed _num_ranges in case the split provider is consulted first; the walk rewrites it.
-    _walk_deferred = true;
-    _num_ranges.store(std::max<std::size_t>(
-                        1,
-                        utils::ceil_div(bind.storage->GetRowGroupCollection()->GetRowGroupCount(),
-                                        _chunk_row_groups)),
-                      std::memory_order_relaxed);
-    SIRIUS_LOG_DEBUG(
-      "[duckdb_native_gpu_ingestible] deferring metadata walk for pin-served scan of '{}'",
-      bind.table_name);
-  } else {
-    run_metadata_walk();
-  }
+  // Every native walk is deferred to execution preparation. Seed _num_ranges only as an
+  // off-thread safety value; ensure_metadata_prepared() replaces it before publication.
+  _num_ranges.store(
+    std::max<std::size_t>(1,
+                          utils::ceil_div(bind.storage->GetRowGroupCollection()->GetRowGroupCount(),
+                                          _chunk_row_groups)),
+    std::memory_order_relaxed);
 }
 
 //! PartitionStatistics touches ClientContext/LocalStorage (not thread-safe), so this must stay
@@ -253,18 +247,44 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
 void duckdb_native_gpu_ingestible::run_metadata_walk()
 {
   auto const& bind = *_info;
-  _plan            = prepare_duckdb_native_walk(*bind.storage,
-                                     *bind.context,
-                                     bind.projected_cols,
-                                     bind.projected_types,
-                                     bind.table_filters.get(),
-                                     &bind.column_ids);
-  if (!_plan.viable) {
-    SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}",
-                     _plan.viability_failure_reason);
-    throw std::runtime_error("duckdb-native scan rejected query: " +
-                             _plan.viability_failure_reason);
+  duckdb::Value injected_failure;
+  if (bind.context->TryGetCurrentSetting("sirius_test_inject_native_walk_failure",
+                                         injected_failure) &&
+      !injected_failure.IsNull()) {
+    auto const target = injected_failure.ToString();
+    if (target == "*" || (!target.empty() && target == bind.table_name)) {
+      throw std::runtime_error(
+        "duckdb-native scan rejected query: injected native metadata walk "
+        "failure for '" +
+        bind.table_name + "'");
+    }
   }
+  auto const iteration_before = _block_manager->GetCheckpointIteration();
+  auto plan                   = prepare_duckdb_native_walk(*bind.storage,
+                                         *bind.context,
+                                         bind.projected_cols,
+                                         bind.projected_types,
+                                         bind.table_filters.get(),
+                                         &bind.column_ids);
+  if (!plan.viable) {
+    SIRIUS_LOG_DEBUG("[duckdb_native_gpu_ingestible] non-viable: {}",
+                     plan.viability_failure_reason);
+    throw std::runtime_error("duckdb-native scan rejected query: " + plan.viability_failure_reason);
+  }
+  auto const iteration_after = _block_manager->GetCheckpointIteration();
+  if (iteration_after != iteration_before) {
+    try {
+      if (auto sirius_context =
+            bind.context->registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+        sirius_context->record_checkpoint_revalidation_failure();
+      }
+    } catch (...) {
+    }
+    throw std::runtime_error(
+      "duckdb-native checkpoint iteration changed during metadata preparation");
+  }
+  _plan                 = std::move(plan);
+  _checkpoint_iteration = iteration_before;
   // Slice [0, n_row_groups) into parse ranges; each becomes one thunk (Phase 2).
   // Always at least one range: a zero-row-group table must still push one (empty)
   // scan_info so the coalescer seeds its template and emits the empty split —
@@ -276,12 +296,35 @@ void duckdb_native_gpu_ingestible::run_metadata_walk()
 
 void duckdb_native_gpu_ingestible::ensure_metadata_prepared()
 {
-  if (!_walk_deferred || _walk_ready.load(std::memory_order_acquire)) { return; }
+  auto sirius_context =
+    _info->context->registered_state
+      ? _info->context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+      : nullptr;
+  if (!sirius_context ||
+      !sirius_context->get_scan_manager().holds_checkpoint_key(attached_database())) {
+    throw std::logic_error("native metadata preparation requires a held shared checkpoint key");
+  }
+  if (_walk_ready.load(std::memory_order_acquire)) { return; }
   // call_once re-arms after an exception, so a failed walk is retried rather than latched.
   std::call_once(_walk_once, [this] {
     run_metadata_walk();
+    duckdb::Value injected_failure;
+    if (_info->context->TryGetCurrentSetting("sirius_test_inject_native_decode_failure",
+                                             injected_failure) &&
+        !injected_failure.IsNull()) {
+      auto const target      = injected_failure.ToString();
+      _inject_decode_failure = target == "*" || (!target.empty() && target == _info->table_name);
+    }
     _walk_ready.store(true, std::memory_order_release);
   });
+}
+
+std::uint64_t duckdb_native_gpu_ingestible::checkpoint_iteration() const
+{
+  if (metadata_walk_pending()) {
+    throw std::logic_error("checkpoint iteration requested before native metadata preparation");
+  }
+  return _checkpoint_iteration;
 }
 
 duckdb_native_gpu_ingestible::~duckdb_native_gpu_ingestible() = default;
@@ -337,11 +380,12 @@ duckdb_native_gpu_ingestible::next_split_provider(io::ioctx_resolver resolve)
     for (auto const& row_group : split->row_groups) {
       certificates.push_back({_info->contract_id,
                               static_cast<uint64_t>(row_group.row_group_index),
-                              _info->db_path + "|checkpoint=pending|row_group=" +
-                                std::to_string(row_group.row_group_index),
+                              _info->db_path +
+                                "|checkpoint=" + std::to_string(_checkpoint_iteration) +
+                                "|row_group=" + std::to_string(row_group.row_group_index),
                               "duckdb_native",
                               "segments"});
-      dependencies.push_back({nullptr, split->datasource, std::nullopt});
+      dependencies.push_back({nullptr, split->datasource, _checkpoint_iteration});
     }
     split->set_contract_payload(
       _info->contract_id, std::move(certificates), std::move(dependencies));
@@ -360,6 +404,27 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   std::shared_ptr<const like_multiliteral_cache> /*like_cache*/)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
+  if (_inject_decode_failure) {
+    throw std::runtime_error("injected native decode failure for '" + _info->table_name + "'");
+  }
+  auto const expected_iteration = std::find_if(
+    split.dependencies().begin(), split.dependencies().end(), [](auto const& dependency) {
+      return dependency.checkpoint_iteration.has_value();
+    });
+  if (expected_iteration != split.dependencies().end()) {
+    auto const materialize_iteration = _block_manager->GetCheckpointIteration();
+    if (materialize_iteration != *expected_iteration->checkpoint_iteration) {
+      try {
+        if (auto sirius_context =
+              _info->context->registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+          sirius_context->record_checkpoint_revalidation_failure();
+        }
+      } catch (...) {
+      }
+      throw std::runtime_error(
+        "duckdb-native checkpoint iteration changed before metadata materialization");
+    }
+  }
   if (!split.datasource && !split.host_backed_only) {
     throw std::runtime_error("[duckdb_native_gpu_ingestible] scan_info has no datasource");
   }

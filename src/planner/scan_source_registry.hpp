@@ -25,6 +25,7 @@
 #include <span>
 
 namespace duckdb {
+class DatabaseInstance;
 class LogicalGet;
 class PhysicalTableScan;
 }  // namespace duckdb
@@ -72,6 +73,9 @@ scan_source_entry const* lookup_scan_source(duckdb::TableFunction const&,
                                             duckdb::FunctionData const*,
                                             duckdb::ClientContext&);
 std::span<scan_source_entry const> registered_scan_sources();
+
+// Register at Sirius load; bootstrap Iceberg trust during extension loading, never in lookup.
+void register_scan_source_callbacks(duckdb::DatabaseInstance&);
 
 // These wrappers keep the existing format builders and admission gates at their original sites.
 duckdb::unique_ptr<op::sirius_physical_operator> lower_native_scan(

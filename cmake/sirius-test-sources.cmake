@@ -1,5 +1,7 @@
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/scan/test_table_scan_r1_t6.cpp
+    test/cpp/scan/test_native_checkpoint_lease.cpp
     test/cpp/transparent/test_read_view_comparison.cpp
     test/cpp/integration/test_transparent_read_view.cpp
     test/cpp/scan/test_split_certificates.cpp

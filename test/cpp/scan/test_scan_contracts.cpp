@@ -33,10 +33,12 @@
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
 #include <duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp>
 #include <duckdb/common/multi_file/multi_file_function.hpp>
+#include <duckdb/common/multi_file/multi_file_list.hpp>
 #include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/main/extension_helper.hpp>
+#include <duckdb/main/extension_manager.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -166,6 +168,43 @@ TEST_CASE("Read-view file inventory is a collision-safe multiset", "[scan][contr
           canonical_read_view_text(file_view({"a"})));
 }
 
+TEST_CASE("Read-view path encoding preserves the length-delimited bytes", "[scan][contracts]")
+{
+  for (auto paths : std::vector<std::vector<std::string>>{{},
+                                                          {""},
+                                                          {"a", "b", "a"},
+                                                          {std::string("a\0b", 3), "'\n", "|:"},
+                                                          {std::string(9, 'a'),
+                                                           std::string(10, 'b'),
+                                                           std::string(99, 'c'),
+                                                           std::string(100, 'd')}}) {
+    auto view = file_view(paths);
+    std::sort(paths.begin(), paths.end());
+    // file_view always uses the same source, schema, and selector. Derive the
+    // fixed header/tail from the empty inventory and encode the paths independently.
+    auto empty = canonical_read_view_text(file_view({}));
+    // Use the known variant index and locate its following count without relying on
+    // delimiter searches inside arbitrary path bytes.
+    auto empty_identity = file_view({}).identity;
+    auto encode_number  = [](std::size_t value) {
+      auto digits = std::to_string(value);
+      return "u" + std::to_string(digits.size()) + ":" + digits;
+    };
+    auto source_prefix = std::string("v18:sirius.read-view.1s12:read_parquet") +
+                         encode_number(static_cast<uint8_t>(source_kind::parquet_local)) +
+                         "s22:duckdb.read_parquet.v1" +
+                         encode_number(empty_identity->data_view.index());
+    REQUIRE(empty.starts_with(source_prefix + encode_number(0)));
+    auto expected = source_prefix + encode_number(paths.size());
+    for (auto const& path : paths) {
+      expected += "p" + std::to_string(path.size()) + ":";
+      expected += path;
+    }
+    expected += empty.substr(source_prefix.size() + encode_number(0).size());
+    CHECK(canonical_read_view_text(view) == expected);
+  }
+}
+
 TEST_CASE("Read-view identity changes with bound schema and options", "[scan][contracts]")
 {
   auto base = file_view({"a"});
@@ -197,7 +236,7 @@ TEST_CASE("Parquet identity includes bound explicit cardinality but not optimize
   CHECK(bound_100.metrics.canonical_capacity >= canonical_read_view_text(bound_100).size() + 1);
   CHECK(bound_100.metrics.evidence_capacity > 0);
   CHECK(bound_100.metrics.transient_path_capacity >= parquet.size() + 1);
-  CHECK(bound_100.metrics.sort_index_capacity == sizeof(std::size_t));
+  CHECK(bound_100.metrics.sort_index_capacity == 0);
 
   // An optimizer estimate is consumption/planning state, not part of the bound
   // read options. Changing it alone must leave the identity stable.
@@ -211,6 +250,99 @@ TEST_CASE("Parquet identity includes bound explicit cardinality but not optimize
     con.ExtractPlan("SELECT * FROM read_parquet('" + parquet + "', explicit_cardinality=200)");
   auto const bound_200 = capture_bound_read_view(first_get(*plan_200), *con.context);
   CHECK(canonical_read_view_text(bound_100) != canonical_read_view_text(bound_200));
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE("Parquet captures preserve sorted evidence and independent inventories",
+          "[scan][contracts][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  auto const parquet =
+    std::string(SIRIUS_PROJECT_ROOT) + "/test/cpp/integration/data/parquet/lineitem.parquet";
+  auto plan  = con.ExtractPlan("SELECT * FROM read_parquet('" + parquet + "')");
+  auto& get  = first_get(*plan);
+  auto& bind = get.bind_data->Cast<duckdb::MultiFileBindData>();
+
+  duckdb::vector<duckdb::OpenFileInfo> files;
+  for (int i = 0; i < 3; ++i) {
+    duckdb::OpenFileInfo file(std::string(100, static_cast<char>('a' + i)));
+    if (i != 1) {
+      file.extended_info       = duckdb::make_shared_ptr<duckdb::ExtendedOpenFileInfo>();
+      auto& options            = file.extended_info->options;
+      options["file_size"]     = duckdb::Value::BIGINT(100 + i);
+      options["last_modified"] = duckdb::Value::TIMESTAMP(duckdb::timestamp_t(200 + i));
+      options["etag"]          = duckdb::Value(std::string(50, static_cast<char>('x' + i)));
+    }
+    files.push_back(std::move(file));
+  }
+  std::vector<std::string> paths{files[0].path, files[1].path, files[2].path};
+  std::vector<int> order{0, 1, 2};
+  bound_read_view previous;
+  do {
+    duckdb::vector<duckdb::OpenFileInfo> shuffled;
+    for (auto i : order)
+      shuffled.push_back(files[i]);
+    bind.file_list = duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(std::move(shuffled));
+    auto resolved  = sirius::planner::resolve_parquet_scan_file_paths(
+      get.function.name, get.bind_data.get(), get.parameters);
+    REQUIRE(resolved.size() == order.size());
+    for (std::size_t i = 0; i < order.size(); ++i)
+      CHECK(resolved[i] == paths[order[i]]);
+    // Resolving the candidate's paths must not move from the actual bound inventory.
+    CHECK(sirius::planner::resolve_parquet_scan_file_paths(
+            get.function.name, get.bind_data.get(), get.parameters) == resolved);
+    auto view     = capture_bound_read_view(get, *con.context);
+    auto expected = make_bound_read_identity(*view.identity, paths);
+    CHECK(view.identity->fingerprint.canonical == expected->fingerprint.canonical);
+    CHECK(view.identity->fingerprint.hash == expected->fingerprint.hash);
+    REQUIRE(view.evidence);
+    CHECK(view.evidence->size == std::vector<int64_t>{100, 0, 102});
+    CHECK(view.evidence->last_modified == std::vector<int64_t>{200, 0, 202});
+    CHECK(view.evidence->size_present == std::vector<uint8_t>{1, 0, 1});
+    CHECK(view.evidence->last_modified_present == std::vector<uint8_t>{1, 0, 1});
+    CHECK(view.evidence->etag ==
+          std::vector<std::string>{std::string(50, 'x'), "", std::string(50, 'z')});
+    CHECK(view.depth == evidence_depth::path_size_and_tag);
+    if (std::is_sorted(order.begin(), order.end())) {
+      CHECK(view.metrics.sort_index_capacity == 0);
+    } else {
+      CHECK(view.metrics.sort_index_capacity == 3 * sizeof(std::size_t));
+    }
+    if (previous.identity) {
+      CHECK(previous.identity.get() != view.identity.get());
+      CHECK(previous.evidence.get() != view.evidence.get());
+    }
+    previous = std::move(view);
+  } while (std::next_permutation(order.begin(), order.end()));
+
+  // ExtendedOpenFileInfo is shared by the snapshot; captured evidence must still own its tags.
+  files[0].extended_info->options["etag"] = duckdb::Value("changed");
+  auto changed                            = capture_bound_read_view(get, *con.context);
+  CHECK(changed.evidence->etag[0] == "changed");
+  CHECK(previous.evidence->etag[0] == std::string(50, 'x'));
+  CHECK(previous.identity->fingerprint == changed.identity->fingerprint);
+
+  // Duplicate paths remain a multiset, and a later capture cannot reuse an old inventory.
+  files.push_back(files[0]);
+  bind.file_list = duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(files);
+  paths.push_back(paths[0]);
+  auto duplicate = capture_bound_read_view(get, *con.context);
+  CHECK(duplicate.metrics.file_count == 4);
+  CHECK(duplicate.evidence->size == std::vector<int64_t>{100, 100, 0, 102});
+  CHECK(duplicate.identity->fingerprint ==
+        make_bound_read_identity(*duplicate.identity, paths)->fingerprint);
+  CHECK_FALSE(duplicate.identity->fingerprint == previous.identity->fingerprint);
+
+  bind.file_list =
+    duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(duckdb::vector<duckdb::OpenFileInfo>{});
+  auto empty = capture_bound_read_view(get, *con.context);
+  CHECK(empty.metrics.file_count == 0);
+  CHECK(empty.metrics.sort_index_capacity == 0);
+  CHECK(empty.evidence->size.empty());
+  CHECK(empty.identity->fingerprint == make_bound_read_identity(*empty.identity, {})->fingerprint);
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
@@ -442,10 +574,22 @@ TEST_CASE("Scan registry rejects registered replacements before or after first l
   auto const config = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" / "integration" /
                       "s3" / "sirius.yaml";
   REQUIRE(std::filesystem::is_regular_file(config));
-  for (auto const* phase :
-       {"cold", "warm", "cold_same", "warm_same", "preload", "preload_dynamic"}) {
+  for (auto const* phase : {"cold",
+                            "warm",
+                            "cold_same",
+                            "warm_same",
+                            "preload",
+                            "preload_dynamic",
+                            "iceberg_first",
+                            "iceberg_first_same",
+                            "iceberg_last",
+                            "iceberg_first_dynamic",
+                            "iceberg_last_dynamic",
+                            "iceberg_unavailable",
+                            "iceberg_disabled"}) {
     INFO(phase);
-    bool const preload = std::string_view(phase).starts_with("preload");
+    bool const iceberg = std::string_view(phase).starts_with("iceberg_");
+    bool const preload = iceberg || std::string_view(phase).starts_with("preload");
     // The parent test process may leave integration.yaml in the environment after pausing its
     // shared database.  A child must not reserve that config's 50% GPU pool beside the parent;
     // callback verification needs only a small Sirius context.
@@ -454,8 +598,9 @@ TEST_CASE("Scan registry rejects registered replacements before or after first l
        {"SIRIUS_TEST_SHARED_CONFIG_OVERRIDE", config.string()},
        {"SIRIUS_REGISTRY_PRELOAD_CHILD", preload ? "1" : "0"}}};
     std::string executable = "sirius_unittest";
-    std::string filter     = preload ? "Scan registry rejects replacement before Sirius load child"
-                                     : "Scan registry first lookup child";
+    std::string filter     = iceberg ? "Iceberg trust bootstrap load order child"
+                             : preload ? "Scan registry rejects replacement before Sirius load child"
+                                       : "Scan registry first lookup child";
     char* arguments[]      = {executable.data(), filter.data(), nullptr};
     pid_t pid{};
     REQUIRE(
@@ -475,6 +620,141 @@ TEST_CASE("Scan registry rejects registered replacements before or after first l
     REQUIRE(WIFEXITED(status));
     CHECK(WEXITSTATUS(status) == 0);
   }
+}
+
+TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]")
+{
+  REQUIRE(sirius::test::g_shared_env == nullptr);
+  auto const phase          = std::string(std::getenv("SIRIUS_REGISTRY_TRUST_PHASE"));
+  bool const iceberg_first  = phase.find("last") == std::string::npos;
+  bool const dynamic        = phase.ends_with("_dynamic");
+  bool const same_signature = phase.ends_with("_same");
+  bool const unavailable    = phase.ends_with("_unavailable");
+  bool const disabled       = phase.ends_with("_disabled");
+  bool const trace          = std::getenv("SIRIUS_REGISTRY_IO_TRACE") != nullptr;
+  auto marker               = [&](std::string const& value) {
+    if (!trace) return;
+    auto line = "R1_BOOTSTRAP " + value + "\n";
+    REQUIRE(::write(STDERR_FILENO, line.data(), line.size()) == static_cast<ssize_t>(line.size()));
+  };
+
+  duckdb::DBConfig config;
+  config.options.load_extensions = false;
+  config.SetOptionByName("allow_unsigned_extensions", duckdb::Value::BOOLEAN(true));
+  duckdb::DuckDB database(nullptr, &config);
+  duckdb::ExtensionHelper::LoadExtension(database, "parquet");
+  duckdb::ExtensionHelper::LoadExtension(database, "core_functions");
+  duckdb::Connection con(database);
+  duckdb::ExtensionLoader loader(*database.instance, "iceberg_bootstrap_test");
+  auto load_iceberg = [&] {
+    marker("BEGIN iceberg_load");
+    auto result = con.Query("LOAD iceberg");
+    marker("END iceberg_load");
+    INFO((result->HasError() ? result->GetError() : "loaded"));
+    REQUIRE_FALSE(result->HasError());
+  };
+  auto load_sirius = [&] {
+    setenv("SIRIUS_CONFIG_FILE", std::getenv("SIRIUS_TEST_SHARED_CONFIG_OVERRIDE"), 1);
+    if (disabled)
+      setenv("SIRIUS_DISABLE", "1", 1);
+    else
+      unsetenv("SIRIUS_DISABLE");
+    marker("BEGIN sirius_load");
+    if (dynamic) {
+      auto const executable = std::filesystem::canonical("/proc/self/exe");
+      auto const extension =
+        executable.parent_path().parent_path().parent_path() / "sirius.duckdb_extension";
+      auto result = con.Query("LOAD " + sirius::test::sql_literal(extension.string()));
+      INFO((result->HasError() ? result->GetError() : "loaded"));
+      REQUIRE_FALSE(result->HasError());
+    } else {
+      database.LoadStaticExtension<duckdb::SiriusExtension>();
+    }
+    marker("END sirius_load");
+    REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  };
+
+  if (iceberg_first)
+    load_iceberg();
+  else
+    load_sirius();
+
+  duckdb::TableFunction original;
+  if (iceberg_first) original = loader.GetTableFunction("iceberg_scan").functions.functions.front();
+  auto replacement =
+    same_signature ? original
+                   : duckdb::TableFunction(
+                       "iceberg_scan", {duckdb::LogicalType::INTEGER}, fake_scan, replacement_bind);
+  replacement.function = fake_scan;
+  if (same_signature) {
+    duckdb::CreateTableFunctionInfo replace(replacement);
+    replace.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
+    loader.RegisterFunction(std::move(replace));
+  } else {
+    loader.RegisterFunction(replacement);
+  }
+
+  // A missing trusted definition must stay unverified during lookup, even when the
+  // library becomes locatable later; lookup may not retry cold initialization.
+  auto info = duckdb::ExtensionManager::Get(*database.instance).GetExtensionInfo("iceberg");
+  duckdb::ExtensionInstallInfo saved;
+  if (unavailable) {
+    REQUIRE(info);
+    REQUIRE(info->install_info);
+    saved                         = *info->install_info;
+    info->install_info->mode      = duckdb::ExtensionInstallMode::NOT_INSTALLED;
+    info->install_info->full_path = "/nonexistent/sirius-registry-bootstrap-test";
+  }
+  if (iceberg_first)
+    load_sirius();
+  else
+    load_iceberg();
+  if (unavailable) *info->install_info = saved;
+
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  duckdb::MultiFileBindData bind;
+  if (!dynamic) {
+    marker("BEGIN first_lookup");
+    auto const* rejected = sirius::planner::lookup_scan_source(replacement, &bind, *con.context);
+    marker("END first_lookup");
+    CHECK_FALSE(rejected);
+  }
+  // Restore the standard overload when testing replacement of its exact signature.
+  if (same_signature) {
+    duckdb::CreateTableFunctionInfo restore(original);
+    restore.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
+    loader.RegisterFunction(std::move(restore));
+  }
+  if (!dynamic) {
+    for (auto const& function : loader.GetTableFunction("iceberg_scan").functions.functions) {
+      if (function.function == fake_scan) continue;
+      marker("BEGIN genuine_lookup");
+      auto const* trusted = sirius::planner::lookup_scan_source(function, &bind, *con.context);
+      marker("END genuine_lookup");
+      CHECK(static_cast<bool>(trusted) == (!unavailable && !disabled));
+    }
+  }
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+  if (unavailable || disabled) return;
+
+  // Exercise the actual loaded Sirius module too: its private cache differs from the
+  // statically linked test executable's cache when LOAD uses the shared extension.
+  REQUIRE_FALSE(con.Query("SET gpu_execution=true")->HasError());
+  REQUIRE_FALSE(con.Query("SET enable_duckdb_fallback=false")->HasError());
+  if (!same_signature) {
+    auto rejected = con.Query("SELECT * FROM iceberg_scan(42)");
+    INFO((rejected->HasError() ? rejected->GetError() : "unexpected admission"));
+    REQUIRE(rejected->HasError());
+    CHECK(rejected->GetError().find("unverified callbacks") != std::string::npos);
+  }
+  REQUIRE_FALSE(con.Query("SET sirius_test_inject_transparent_gpu_error='t6'")->HasError());
+  auto const path =
+    std::string(SIRIUS_PROJECT_ROOT) + "/test/cpp/integration/data/iceberg_snapshot_deletes";
+  auto genuine = con.Query("SELECT sum(count) FROM iceberg_scan('" + path +
+                           "', snapshot_from_id=9400000000000002)");
+  INFO((genuine->HasError() ? genuine->GetError() : "missing injected error"));
+  REQUIRE(genuine->HasError());
+  CHECK(genuine->GetError().find("injected transparent GPU failure: t6") != std::string::npos);
 }
 
 TEST_CASE("Scan registry rejects replacement before Sirius load child", "[.][registry_trust_child]")

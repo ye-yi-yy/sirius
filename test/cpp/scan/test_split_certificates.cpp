@@ -35,6 +35,7 @@
 #include <duckdb/storage/storage_manager.hpp>
 #include <io/kvikio/kvikio_context.hpp>
 #include <unistd.h>
+#include <utils/gpu_execution_fixture.hpp>
 
 #include <cstdint>
 #include <filesystem>
@@ -64,27 +65,21 @@ void exec_ok(duckdb::Connection& con, std::string const& query)
   REQUIRE_FALSE(result->HasError());
 }
 
-struct native_database {
-  std::filesystem::path path = std::filesystem::temp_directory_path() /
-                               ("sirius_split_certificate_" + std::to_string(::getpid()) + "_" +
-                                std::to_string(reinterpret_cast<std::uintptr_t>(this)) + ".duckdb");
-  std::unique_ptr<duckdb::DuckDB> database;
-  std::unique_ptr<duckdb::Connection> connection;
+struct native_database : sirius::test::GpuExecutionFixture {
+  std::filesystem::path path = temp_db_path;
+  std::unique_ptr<duckdb::SiriusContext::StandaloneQueryScope> window;
+  decltype(con)& connection = con;
 
-  native_database()
+  void lease(duckdb::AttachedDatabase& database)
   {
-    std::filesystem::remove(path);
-    database   = std::make_unique<duckdb::DuckDB>(path.string());
-    connection = std::make_unique<duckdb::Connection>(*database);
-  }
-
-  ~native_database()
-  {
-    connection.reset();
-    database.reset();
-    std::error_code error;
-    std::filesystem::remove(path, error);
-    std::filesystem::remove(path.string() + ".wal", error);
+    auto context = sirius::test::get_registered_sirius_context(*con);
+    if (!window) {
+      window = std::make_unique<duckdb::SiriusContext::StandaloneQueryScope>(
+        *context, *con->context, "native_metadata_test");
+    }
+    if (!context->get_scan_manager().holds_checkpoint_key(database)) {
+      context->get_scan_manager().acquire_checkpoint_key(database);
+    }
   }
 };
 
@@ -114,6 +109,7 @@ std::unique_ptr<duckdb_native_ingestible_table_info> native_info(native_database
   auto entry   = schema.GetEntry(transaction, duckdb::CatalogType::TABLE_ENTRY, "items");
   REQUIRE(entry);
   auto& storage = entry->Cast<duckdb::DuckTableEntry>().GetStorage();
+  fixture.lease(storage.GetAttached());
 
   auto info          = std::make_unique<duckdb_native_ingestible_table_info>();
   info->contract_id  = contract_id;
@@ -400,7 +396,7 @@ TEST_CASE("Parquet certificates include physical-original file evidence after co
 }
 
 TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
-          "[scan][certificate]")
+          "[scan][certificate][integration]")
 {
   constexpr scan_contract_id contract_id = 61;
   native_database fixture;
@@ -441,10 +437,15 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
     REQUIRE(split->contract_id() == contract_id);
     REQUIRE(split->certificates().size() == native_split->row_groups.size());
     REQUIRE(split->dependencies().size() == split->certificates().size());
-    for (auto const& certificate : split->certificates()) {
+    for (std::size_t i = 0; i < split->certificates().size(); ++i) {
+      auto const& certificate = split->certificates()[i];
+      auto const& dependency  = split->dependencies()[i];
       CHECK(certificate.contract_id == contract_id);
       CHECK(certificate.input_identity.find(fixture.path.string()) == 0);
-      CHECK(certificate.input_identity.find("|checkpoint=pending|row_group=") != std::string::npos);
+      REQUIRE(dependency.checkpoint_iteration.has_value());
+      CHECK(certificate.input_identity.find(
+              "|checkpoint=" + std::to_string(*dependency.checkpoint_iteration) + "|row_group=") !=
+            std::string::npos);
     }
     output_slices += split->certificates().size();
   }
@@ -452,7 +453,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
 }
 
 TEST_CASE("An all-pruned native scan keeps its contract on the empty fallback split",
-          "[scan][certificate]")
+          "[scan][certificate][integration]")
 {
   constexpr scan_contract_id contract_id = 62;
   native_database fixture;

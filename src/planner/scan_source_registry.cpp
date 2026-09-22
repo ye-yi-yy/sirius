@@ -17,6 +17,7 @@
 #include "planner/scan_source_registry.hpp"
 
 #include "exec/stream_plan_bindings.hpp"
+#include "log/logging.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
 #include "sirius_registration.hpp"
 
@@ -27,9 +28,11 @@
 #include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/function/table/table_scan.hpp>
+#include <duckdb/main/database.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/main/extension_helper.hpp>
 #include <duckdb/main/extension_manager.hpp>
+#include <duckdb/planner/extension_callback.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <link.h>
 #include <parquet_extension.hpp>
@@ -118,17 +121,21 @@ std::array<scan_source_entry, 6> const entries{{{"seq_scan",
                                                  nullptr,
                                                  std::nullopt}}};
 
-duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::ClientContext& context)
+#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
+void* host_factory(duckdb::DatabaseInstance& db, char const* symbol);
+#endif
+
+duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::DatabaseInstance& db)
 {
-  auto info = duckdb::ExtensionManager::Get(context).GetExtensionInfo("iceberg");
+  auto info = duckdb::ExtensionManager::Get(db).GetExtensionInfo("iceberg");
   if (!info || !info->is_loaded || !info->install_info) return {};
 
-  auto& fs = duckdb::FileSystem::GetFileSystem(context);
+  auto& fs = db.GetFileSystem();
   duckdb::vector<std::string> paths;
   if (info->install_info->mode == duckdb::ExtensionInstallMode::NOT_INSTALLED) {
     paths.push_back(info->install_info->full_path);
   } else {
-    for (auto const& directory : duckdb::ExtensionHelper::GetExtensionDirectoryPath(context))
+    for (auto const& directory : duckdb::ExtensionHelper::GetExtensionDirectoryPath(db, fs))
       paths.push_back(fs.JoinPath(directory, "iceberg.duckdb_extension"));
   }
   for (auto const& path : paths) {
@@ -148,6 +155,22 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Client
     config.options.maximum_threads = 1;
     duckdb::DuckDB reference(nullptr, &config);
     reference.LoadStaticExtension<duckdb::ParquetExtension>();
+#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
+    // Iceberg derives part of its scan callbacks from Parquet. The reference must
+    // use the host factory, not the loadable Sirius module's hidden DuckDB copy.
+    using parquet_factory = duckdb::TableFunctionSet (*)();
+    auto get_parquet      = reinterpret_cast<parquet_factory>(
+      host_factory(db, "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv"));
+    if (!get_parquet) return {};
+    duckdb::ExtensionLoader parquet_loader(*reference.instance, "parquet");
+    auto functions = get_parquet();
+    for (auto const* name : {"read_parquet", "parquet_scan"}) {
+      functions.name = name;
+      duckdb::CreateTableFunctionInfo info(functions);
+      info.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
+      parquet_loader.RegisterFunction(std::move(info));
+    }
+#endif
     duckdb::ExtensionLoader loader(*reference.instance, "iceberg");
     init(loader);
     auto entry = loader.TryGetTableFunction("iceberg_scan");
@@ -157,12 +180,12 @@ duckdb::vector<duckdb::TableFunction> iceberg_reference_functions(duckdb::Client
 }
 
 #ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
-void* host_factory(duckdb::ClientContext& context, char const* symbol)
+void* host_factory(duckdb::DatabaseInstance& db, char const* symbol)
 {
   // The system catalog object is created by the host, independently of mutable function
   // registrations. Its dynamic type locates that DuckDB module even for Python's RTLD_LOCAL
   // import. Do not locate the host through a candidate callback or promote it to RTLD_GLOBAL.
-  auto& catalog = duckdb::Catalog::GetSystemCatalog(context);
+  auto& catalog = duckdb::Catalog::GetSystemCatalog(db);
   Dl_info owner{};
   void* owner_map{};
   if (!::dladdr1(&typeid(catalog), &owner, &owner_map, RTLD_DL_LINKMAP) || !owner_map)
@@ -195,15 +218,17 @@ duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& nam
   // the caller's mutable catalog. Missing host symbols leave the source unverified.
   if (name == "seq_scan") {
     using factory = duckdb::TableFunction (*)();
-    auto get      = reinterpret_cast<factory>(
-      host_factory(context, "_ZN6duckdb17TableScanFunction11GetFunctionEv"));
+    auto get =
+      reinterpret_cast<factory>(host_factory(duckdb::DatabaseInstance::GetDatabase(context),
+                                             "_ZN6duckdb17TableScanFunction11GetFunctionEv"));
     return get ? duckdb::vector<duckdb::TableFunction>{get()}
                : duckdb::vector<duckdb::TableFunction>{};
   }
   if (name == "parquet_scan" || name == "read_parquet") {
     using factory = duckdb::TableFunctionSet (*)();
-    auto get      = reinterpret_cast<factory>(
-      host_factory(context, "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv"));
+    auto get =
+      reinterpret_cast<factory>(host_factory(duckdb::DatabaseInstance::GetDatabase(context),
+                                             "_ZN6duckdb19ParquetScanFunction14GetFunctionSetEv"));
     return get ? get().functions : duckdb::vector<duckdb::TableFunction>{};
   }
 #else
@@ -213,7 +238,8 @@ duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& nam
 #endif
   if (name == "sirius_read_parquet") return {duckdb::GetSiriusReadParquetFunction()};
   if (name == "sirius_stream_source") return {exec::get_stream_source_function()};
-  return iceberg_reference_functions(context);
+  // Iceberg is initialized at extension load, never during a planning lookup.
+  return {};
 }
 
 struct verified_callbacks {
@@ -237,9 +263,56 @@ struct accepted_callbacks {
   std::vector<verified_callbacks> values;
 };
 std::array<accepted_callbacks, entries.size()> accepted;
+
+void initialize_iceberg_callbacks(duckdb::DatabaseInstance& db)
+{
+  if (!duckdb::ExtensionManager::Get(db).ExtensionIsLoaded("iceberg")) return;
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (entries[i].function_name != "iceberg_scan") continue;
+    auto& cache = accepted[i];
+    std::lock_guard lock(cache.mutex);
+    if (!cache.values.empty()) return;
+    try {
+      std::vector<verified_callbacks> verified;
+      for (auto const& value : iceberg_reference_functions(db)) {
+        verified.push_back({value.function,
+                            value.bind,
+                            value.get_multi_file_reader,
+                            value.arguments,
+                            value.varargs,
+                            value.named_parameters});
+      }
+      // Publish the complete independent reference only after registration succeeds.
+      cache.values = std::move(verified);
+    } catch (std::exception const& error) {
+      // Optional GPU admission must not break LOAD or fall back to trusting the caller's
+      // catalog. An empty cache makes lookup decline without retrying initialization there.
+      SIRIUS_LOG_WARN("Iceberg scan source verification failed during extension load: {}",
+                      error.what());
+    }
+    return;
+  }
+}
+
+class scan_source_extension_callback final : public duckdb::ExtensionCallback {
+ public:
+  void OnExtensionLoaded(duckdb::DatabaseInstance& db, std::string const& name) override
+  {
+    if (name == "iceberg") initialize_iceberg_callbacks(db);
+  }
+};
 }  // namespace
 
 std::span<scan_source_entry const> registered_scan_sources() { return entries; }
+
+void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
+{
+  // Register first so a subsequent Iceberg load is observed. The explicit initialization
+  // also covers Iceberg loaded before Sirius, including a catalog already modified by users.
+  duckdb::DBConfig::GetConfig(db).GetCallbackManager().Register(
+    duckdb::make_shared_ptr<scan_source_extension_callback>());
+  initialize_iceberg_callbacks(db);
+}
 
 scan_source_entry const* lookup_scan_source(duckdb::TableFunction const& function,
                                             duckdb::FunctionData const* bind,

@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <numeric>
@@ -319,23 +320,37 @@ struct path_encoding_info {
   std::size_t encoded_bytes = 0;
 };
 
-path_encoding_info analyze_paths(std::span<std::string const> paths, bool known_sorted = false)
+// A capture owns the bulk OpenFileInfo snapshot, while a candidate can borrow its
+// already resolved strings. Encode either representation without a second path vector.
+struct path_sequence {
+  std::span<std::string const> strings;
+  std::span<duckdb::OpenFileInfo const> files;
+
+  std::size_t size() const { return files.empty() ? strings.size() : files.size(); }
+  bool empty() const { return size() == 0; }
+  std::string const& operator[](std::size_t index) const
+  {
+    return files.empty() ? strings[index] : files[index].path;
+  }
+};
+
+void analyze_path(path_encoding_info& result, std::string const& path, std::string const* previous)
+{
+  result.encoded_bytes += path.size() + decimal_digits(path.size()) + 2;
+  if (previous && *previous > path) result.sorted = false;
+}
+
+path_encoding_info analyze_paths(path_sequence paths)
 {
   path_encoding_info result;
-  std::string const* previous = nullptr;
-  for (auto const& path : paths) {
-    result.encoded_bytes += path.size() + decimal_digits(path.size()) + 2;
-    if (!known_sorted && previous && *previous > path) result.sorted = false;
-    previous = &path;
+  for (std::size_t i = 0; i < paths.size(); ++i) {
+    analyze_path(result, paths[i], i ? &paths[i - 1] : nullptr);
   }
   return result;
 }
 
 std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
-  bound_read_identity,
-  std::span<std::string const>,
-  path_encoding_info,
-  read_view_capture_metrics*);
+  bound_read_identity, path_sequence, path_encoding_info, read_view_capture_metrics*);
 
 bound_read_view capture(capture_input input, duckdb::ClientContext& context)
 {
@@ -347,7 +362,9 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
   bound_read_view view;
   view.transaction_id = transaction_id(context);
   std::vector<std::string> owned_paths;
-  std::span<std::string const> paths         = input.resolved_paths;
+  duckdb::vector<duckdb::OpenFileInfo> owned_files;
+  path_sequence paths{input.resolved_paths, {}};
+  auto path_info                             = analyze_paths(paths);
   std::size_t transient_path_string_capacity = 0;
   std::size_t evidence_tag_string_capacity   = 0;
 
@@ -380,7 +397,8 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     if (paths.empty()) {
       owned_paths.push_back(typed->uri);
       transient_path_string_capacity += owned_paths.back().capacity() + 1;
-      paths = owned_paths;
+      paths     = {owned_paths, {}};
+      path_info = analyze_paths(paths);
     }
     identity.bound_types = typed->bound_types;
     identity.bound_names = typed->bound_names;
@@ -396,27 +414,25 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     bool any_tag  = false;
     if (input.collect_evidence) unsorted_evidence = std::make_shared<file_evidence_arrays>();
     if (paths.empty()) {
-      auto const file_count = typed->file_list->GetTotalFileCount();
-      owned_paths.reserve(file_count);
+      // GetAllFiles copies the bound inventory under one lock. Files()/Scan()
+      // would lock and copy OpenFileInfo for every entry before copying its path again.
+      owned_files           = typed->file_list->GetAllFiles();
+      paths                 = {{}, {owned_files.data(), owned_files.size()}};
+      auto const file_count = paths.size();
       if (unsorted_evidence) {
-        unsorted_evidence->size.reserve(file_count);
-        unsorted_evidence->last_modified.reserve(file_count);
-        unsorted_evidence->size_present.reserve(file_count);
-        unsorted_evidence->last_modified_present.reserve(file_count);
-        unsorted_evidence->etag.reserve(file_count);
+        unsorted_evidence->size.resize(file_count);
+        unsorted_evidence->last_modified.resize(file_count);
+        unsorted_evidence->size_present.resize(file_count);
+        unsorted_evidence->last_modified_present.resize(file_count);
+        unsorted_evidence->etag.resize(file_count);
       }
-      for (auto const& file : typed->file_list->Files()) {
-        owned_paths.push_back(file.path);
-        transient_path_string_capacity += owned_paths.back().capacity() + 1;
+      for (std::size_t index = 0; index < file_count; ++index) {
+        auto const& file = owned_files[index];
+        analyze_path(path_info, file.path, index ? &owned_files[index - 1].path : nullptr);
+        transient_path_string_capacity += file.path.capacity() + 1;
         if (!unsorted_evidence) continue;
-        unsorted_evidence->size.push_back(0);
-        unsorted_evidence->last_modified.push_back(0);
-        unsorted_evidence->size_present.push_back(0);
-        unsorted_evidence->last_modified_present.push_back(0);
-        unsorted_evidence->etag.emplace_back();
-        evidence_tag_string_capacity += unsorted_evidence->etag.back().capacity() + 1;
+        evidence_tag_string_capacity += unsorted_evidence->etag[index].capacity() + 1;
         if (!file.extended_info) continue;
-        auto const index    = unsorted_evidence->size.size() - 1;
         auto const& options = file.extended_info->options;
         if (auto found = options.find("file_size");
             found != options.end() && !found->second.IsNull()) {
@@ -438,7 +454,6 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
           any_tag = true;
         }
       }
-      paths = owned_paths;
     }
     identity.bound_types = typed->types;
     identity.bound_names = typed->names;
@@ -448,8 +463,9 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     identity.data_view = file_inventory{static_cast<uint32_t>(paths.size())};
 
     if (input.collect_evidence) {
-      std::vector<std::size_t> order(paths.size());
-      if (!std::is_sorted(paths.begin(), paths.end())) {
+      std::vector<std::size_t> order;
+      if (!path_info.sorted) {
+        order.resize(paths.size());
         std::iota(order.begin(), order.end(), 0);
         std::sort(order.begin(), order.end(), [&](auto left, auto right) {
           return paths[left] < paths[right];
@@ -477,7 +493,7 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
         for (std::size_t current = 0; current < order.size(); ++current) {
           while (order[current] != current) {
             auto const target = order[current];
-            std::swap(owned_paths[current], owned_paths[target]);
+            std::swap(owned_files[current], owned_files[target]);
             std::swap(unsorted_evidence->size[current], unsorted_evidence->size[target]);
             std::swap(unsorted_evidence->last_modified[current],
                       unsorted_evidence->last_modified[target]);
@@ -490,6 +506,7 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
           }
         }
       }
+      path_info.sorted                 = true;
       view.metrics.sort_index_capacity = order.capacity() * sizeof(std::size_t);
       view.evidence                    = std::move(unsorted_evidence);
       view.depth                       = any_tag    ? evidence_depth::path_size_and_tag
@@ -498,10 +515,10 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     }
   }
 
-  auto const path_info    = analyze_paths(paths, input.collect_evidence);
-  view.metrics.file_count = paths.size();
-  view.metrics.transient_path_capacity =
-    owned_paths.capacity() * sizeof(std::string) + transient_path_string_capacity;
+  view.metrics.file_count              = paths.size();
+  view.metrics.transient_path_capacity = owned_paths.capacity() * sizeof(std::string) +
+                                         owned_files.capacity() * sizeof(duckdb::OpenFileInfo) +
+                                         transient_path_string_capacity;
   if (view.evidence) {
     view.metrics.evidence_capacity =
       view.evidence->size.capacity() * sizeof(int64_t) +
@@ -524,7 +541,7 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
 namespace {
 std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
   bound_read_identity identity,
-  std::span<std::string const> paths,
+  path_sequence paths,
   path_encoding_info path_info,
   read_view_capture_metrics* metrics)
 {
@@ -561,9 +578,32 @@ std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
     if (files->count != paths.size()) throw std::invalid_argument("Read-view file count mismatch");
     number(text, files->count);
     text.reserve(text.size() + path_info.encoded_bytes + tail.size());
+    auto const path_begin = text.size();
+    text.resize(path_begin + path_info.encoded_bytes);
+    auto* destination = text.data() + path_begin;
+    char prefix[std::numeric_limits<std::size_t>::digits10 + 3];
+    prefix[0]                   = 'p';
+    std::size_t previous_length = std::numeric_limits<std::size_t>::max();
+    std::size_t prefix_length   = 0;
+    auto encode_path            = [&](std::string const& path) {
+      // Equal-length paths share the same length-delimited prefix. Write into the
+      // pre-sized canonical buffer; the bytes are identical to append(text, 'p', path).
+      if (path.size() != previous_length) {
+        auto const [end, error] =
+          std::to_chars(std::begin(prefix) + 1, std::end(prefix) - 1, path.size());
+        if (error != std::errc{}) throw std::runtime_error("read-view path encoding failed");
+        *end            = ':';
+        prefix_length   = static_cast<std::size_t>(end - prefix) + 1;
+        previous_length = path.size();
+      }
+      std::memcpy(destination, prefix, prefix_length);
+      destination += prefix_length;
+      std::memcpy(destination, path.data(), path.size());
+      destination += path.size();
+    };
     if (path_info.sorted) {
-      for (auto const& path : paths)
-        append(text, 'p', path);
+      for (std::size_t i = 0; i < paths.size(); ++i)
+        encode_path(paths[i]);
     } else {
       std::vector<size_t> order(paths.size());
       if (metrics) {
@@ -574,7 +614,7 @@ std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
       std::sort(
         order.begin(), order.end(), [&](size_t a, size_t b) { return paths[a] < paths[b]; });
       for (auto index : order)
-        append(text, 'p', paths[index]);
+        encode_path(paths[index]);
     }
   } else {
     if (!paths.empty()) throw std::invalid_argument("Stream read view has file inventory");
@@ -592,7 +632,7 @@ std::shared_ptr<bound_read_identity const> make_bound_read_identity(
   read_view_capture_metrics* metrics)
 {
   return make_bound_read_identity_preanalyzed(
-    std::move(identity), paths, analyze_paths(paths), metrics);
+    std::move(identity), {paths, {}}, analyze_paths({paths, {}}), metrics);
 }
 
 std::string canonical_value_text(duckdb::Value const& value)
