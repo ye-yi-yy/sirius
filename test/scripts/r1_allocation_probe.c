@@ -70,7 +70,8 @@ static int r1_frame(void* address)
     char const* symbol = info.dli_sname;
     r1 = strstr(symbol, "capture_bound_read") || strstr(symbol, "make_bound_read_identity") ||
          strstr(symbol, "read_view_registry") || strstr(symbol, "compare_read_views") ||
-         strstr(symbol, "share_equal_read_view") || strstr(symbol, "allocate_scan_contract");
+         strstr(symbol, "share_equal_read_view") || strstr(symbol, "allocate_scan_contract") ||
+         strstr(symbol, "make_read_view_evidence_index");
   }
   if (cached) *cached = (frame_classification){address, r1};
   return r1;

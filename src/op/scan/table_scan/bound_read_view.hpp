@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "transparent/plan_source_policy.hpp"
+
 #include <duckdb/common/types.hpp>
 
 #include <cstdint>
@@ -98,6 +100,8 @@ struct bound_read_identity {
   read_view_fingerprint fingerprint;
 };
 struct bound_read_view {
+  // Diagnostic policy is observation state, never part of stable read identity.
+  transparent::scan_source_policy replay_policy;
   std::shared_ptr<bound_read_identity const> identity;
   std::optional<provider_borrow> provider;
   uint64_t transaction_id = 0;
@@ -119,6 +123,9 @@ struct logical_bound_read_view_capture {
   uint64_t planning_generation = 0;
   std::vector<logical_bound_read_view> views;
 };
+
+// Maps original file order to evidence order without retaining another path inventory.
+std::vector<std::size_t> make_read_view_evidence_index(std::span<std::string const> paths);
 
 // Paths are borrowed only while encoding and are not retained beside the canonical text.
 std::shared_ptr<bound_read_identity const> make_bound_read_identity(

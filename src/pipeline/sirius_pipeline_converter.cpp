@@ -559,8 +559,18 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
           << " kind=" << (identity ? dump_source_kind(identity->source.kind) : "unknown")
           << " hash=" << (identity ? identity->fingerprint.hash : 0)
           << " depth=" << dump_evidence_depth(entry.eligibility.depth)
-          << " profile=" << entry.eligibility.materializer.profile
-          << " policy=" << contract.predicates.pushdown_mode << " correspondence="
+          << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
+          << (contract.predicates.pushdown_mode.empty() ? "none"
+                                                        : contract.predicates.pushdown_mode)
+          << " scan_cpu_replay="
+          << (contract.view && contract.view->replay_policy.cpu_replay_permitted ? "permitted"
+                                                                                 : "forbidden")
+          << " scan_replay_veto="
+          << (contract.view ? (contract.view->replay_policy.reason.empty()
+                                 ? "none"
+                                 : contract.view->replay_policy.reason)
+                            : "incomplete")
+          << " correspondence="
           << (entry.eligibility.correspondence.empty() ? "none" : entry.eligibility.correspondence)
           << " verdict=" << dump_verdict(entry.eligibility.verdict)
           << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
@@ -606,8 +616,17 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
         << " kind=" << (identity ? dump_source_kind(identity->source.kind) : "unknown")
         << " hash=" << (identity ? identity->fingerprint.hash : 0)
         << " depth=" << dump_evidence_depth(entry.eligibility.depth)
-        << " profile=" << entry.eligibility.materializer.profile
-        << " policy=" << contract.predicates.pushdown_mode << " correspondence="
+        << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
+        << (contract.predicates.pushdown_mode.empty() ? "none" : contract.predicates.pushdown_mode)
+        << " scan_cpu_replay="
+        << (contract.view && contract.view->replay_policy.cpu_replay_permitted ? "permitted"
+                                                                               : "forbidden")
+        << " scan_replay_veto="
+        << (contract.view
+              ? (contract.view->replay_policy.reason.empty() ? "none"
+                                                             : contract.view->replay_policy.reason)
+              : "incomplete")
+        << " correspondence="
         << (entry.eligibility.correspondence.empty() ? "none" : entry.eligibility.correspondence)
         << " verdict=" << dump_verdict(entry.eligibility.verdict)
         << " evidence_scope=" << dump_evidence_scope(entry.eligibility.evidence_scope)
@@ -616,6 +635,47 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
         << " projections=" << contract.columns.projection_ids.size()
         << " rowid=" << contract.columns.requires_row_id << "\n";
   }
+}
+
+// Aggregate every GPU-plan scan, independently of whichever pipeline is printed first.
+void dump_plan_replay_policy(std::ostringstream& out, pipeline_conversion_result const& result)
+{
+  bool s3 = false, stream = false, incomplete = false;
+  auto visit = [&](op::sirius_physical_operator const& node) {
+    std::shared_ptr<transparent::read_view_registry> registry;
+    op::scan::scan_contract_id id = 0;
+    if (node.type == op::SiriusPhysicalOperatorType::GPU_SCAN) {
+      auto const& scan = node.Cast<op::scan::sirius_gpu_scan_operator>();
+      registry         = scan.read_views();
+      id               = scan.contract_id();
+    } else if (node.type == op::SiriusPhysicalOperatorType::STREAMING_SOURCE) {
+      auto const& scan = node.Cast<op::sirius_physical_streaming_source>();
+      registry         = scan.read_views();
+      id               = scan.contract_id();
+    } else
+      return;
+    if (!registry || !id || !registry->entry(id).contract.view) {
+      incomplete = true;
+      return;
+    }
+    auto const& policy = registry->entry(id).contract.view->replay_policy;
+    if (policy.cpu_replay_permitted) return;
+    s3 |= policy.source == transparent::byte_source_class::sirius_owned_s3;
+    stream |= policy.source == transparent::byte_source_class::stream;
+    incomplete |= policy.source != transparent::byte_source_class::sirius_owned_s3 &&
+                  policy.source != transparent::byte_source_class::stream;
+  };
+  for (auto const& pipeline : result.scheduled_pipelines) {
+    if (pipeline->get_source()) visit(*pipeline->get_source());
+    for (auto const& node : pipeline->get_operators())
+      visit(node.get());
+  }
+  out << "plan_cpu_replay=" << (s3 || stream || incomplete ? "forbidden" : "permitted") << " veto=";
+  if (!s3 && !stream && !incomplete) out << "none";
+  if (s3) out << "s3";
+  if (stream) out << (s3 ? ",stream" : "stream");
+  if (incomplete) out << (s3 || stream ? ",incomplete" : "incomplete");
+  out << " scope=gpu_plan\n";
 }
 
 //! One `[pipeline N]` block: source/sink/operators with per-scan identity, shared by the
@@ -730,6 +790,7 @@ std::string dump_pipeline_conversion_result(const pipeline_conversion_result& re
   };
 
   std::ostringstream out;
+  dump_plan_replay_policy(out, result);
   out << "=== pipelines (" << ordered.size() << ") ===\n";
   for (std::size_t i = 0; i < ordered.size(); ++i) {
     dump_pipeline_block(out, i, *ordered[i]);
@@ -757,6 +818,7 @@ std::string dump_pipeline_schedule_raw(const pipeline_conversion_result& result)
   };
 
   std::ostringstream out;
+  dump_plan_replay_policy(out, result);
   out << "=== scheduled pipelines (" << scheduled.size() << ") ===\n";
   for (std::size_t i = 0; i < scheduled.size(); ++i) {
     dump_pipeline_block(out, i, *scheduled[i]);

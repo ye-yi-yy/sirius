@@ -414,3 +414,45 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
             << " rss_retained_growth_kib=" << std::max(0L, retained_kib)
             << " rss_process_peak_kib=" << process_peak_kib << std::endl;
 }
+
+#ifndef SIRIUS_T6_BASELINE
+TEST_CASE("T6 evidence index allocations include retained and temporary storage",
+          "[.][t6_measure][allocation_coverage]")
+{
+  struct measurement {
+    uint64_t live, peak, cumulative, allocations;
+    uint64_t all_live, all_peak, all_cumulative;
+    uint64_t overflow;
+  };
+  auto begin = reinterpret_cast<int (*)()>(dlsym(RTLD_DEFAULT, "sirius_t6_allocation_begin"));
+  auto end   = reinterpret_cast<measurement (*)()>(dlsym(RTLD_DEFAULT, "sirius_t6_allocation_end"));
+  REQUIRE(begin);
+  REQUIRE(end);
+  uint64_t previous_live = 0;
+  for (auto count : {100u, 10000u}) {
+    std::vector<std::string> paths;
+    for (unsigned i = 0; i < count; ++i)
+      paths.push_back(std::to_string(count - i));
+    REQUIRE(begin());
+    auto const before = end();
+    REQUIRE(begin());
+    auto index          = sirius::op::scan::make_read_view_evidence_index(paths);
+    auto const measured = end();
+    CAPTURE(count, measured.live, measured.peak, measured.all_peak);
+    std::cout << "T6_INDEX_ALLOCATION files=" << count
+              << " retained=" << measured.live - before.live
+              << " peak=" << measured.peak - before.live << " allocations=" << measured.allocations
+              << "\n";
+    CHECK(measured.overflow == 0);
+    CHECK(measured.allocations >= 2);
+    CHECK(measured.live >= before.live + count * sizeof(std::size_t));
+    CHECK(measured.peak >= before.live + 2 * count * sizeof(std::size_t));
+    CHECK(measured.live - before.live > previous_live);
+    previous_live = measured.live - before.live;
+    // The returned index is the persistent buffer the ingestible owns.
+    // Its destruction outside the window must still clear the live record.
+    std::vector<std::size_t>().swap(index);
+    CHECK(end().live == before.live);
+  }
+}
+#endif

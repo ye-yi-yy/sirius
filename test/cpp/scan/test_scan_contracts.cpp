@@ -20,12 +20,14 @@
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
+#include "pipeline/sirius_pipeline_converter.hpp"
 #include "planner/scan_source_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_extension.hpp"
 #include "transparent/read_view_registry.hpp"
 #include "utils/child_process_environment.hpp"
 #include "utils/parquet_fixture_utils.hpp"
+#include "utils/pipeline_conversion_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
 
 #include <catch.hpp>
@@ -87,6 +89,53 @@ duckdb::LogicalGet& first_get(duckdb::LogicalOperator& node)
 }
 
 void fake_scan(duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&) {}
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> fake_global(duckdb::ClientContext&,
+                                                                 duckdb::TableFunctionInitInput&)
+{
+  throw duckdb::InvalidInputException("replacement global initializer");
+}
+duckdb::unique_ptr<duckdb::LocalTableFunctionState> fake_local(duckdb::ExecutionContext&,
+                                                               duckdb::TableFunctionInitInput&,
+                                                               duckdb::GlobalTableFunctionState*)
+{
+  throw duckdb::InvalidInputException("replacement local initializer");
+}
+void fake_serialize(duckdb::Serializer&,
+                    duckdb::optional_ptr<duckdb::FunctionData>,
+                    duckdb::TableFunction const&)
+{
+  throw duckdb::NotImplementedException("replacement serializer");
+}
+duckdb::unique_ptr<duckdb::FunctionData> fake_deserialize(duckdb::Deserializer&,
+                                                          duckdb::TableFunction&)
+{
+  throw duckdb::NotImplementedException("replacement deserializer");
+}
+
+void replace_callback(duckdb::TableFunction& function, std::string_view phase)
+{
+  if (phase.ends_with("init_global"))
+    function.init_global = fake_global;
+  else if (phase.ends_with("init_local"))
+    function.init_local = fake_local;
+  else if (phase.ends_with("_deserialize"))
+    function.deserialize = fake_deserialize;
+  else if (phase.ends_with("_serialize"))
+    function.serialize = fake_serialize;
+  else
+    function.function = fake_scan;
+}
+
+void require_registered_callbacks(duckdb::TableFunction const& actual,
+                                  duckdb::TableFunction const& expected)
+{
+  REQUIRE(actual.function == expected.function);
+  REQUIRE(actual.init_global == expected.init_global);
+  REQUIRE(actual.init_local == expected.init_local);
+  REQUIRE(actual.serialize == expected.serialize);
+  REQUIRE(actual.deserialize == expected.deserialize);
+}
 
 duckdb::TableCatalogEntry* replacement_table = nullptr;
 
@@ -343,6 +392,14 @@ TEST_CASE("Parquet captures preserve sorted evidence and independent inventories
   CHECK(empty.metrics.sort_index_capacity == 0);
   CHECK(empty.evidence->size.empty());
   CHECK(empty.identity->fingerprint == make_bound_read_identity(*empty.identity, {})->fingerprint);
+  CHECK(empty.replay_policy.cpu_replay_permitted);
+  bind.file_list =
+    duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(duckdb::vector<duckdb::OpenFileInfo>{
+      duckdb::OpenFileInfo("local.parquet"), duckdb::OpenFileInfo("S3://bucket/hidden.parquet")});
+  auto remote = capture_bound_read_view(get, *con.context);
+  CHECK_FALSE(remote.replay_policy.cpu_replay_permitted);
+  CHECK(remote.replay_policy.reason == "s3");
+  CHECK(remote.replay_policy.source == sirius::transparent::byte_source_class::sirius_owned_s3);
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
@@ -529,6 +586,19 @@ TEST_CASE("Physical stream lowering records its window without file checks",
   CHECK(contract_entry.window_id == 42);
   CHECK(contract_entry.finalize_generation == 0);
   CHECK(contract_entry.eligibility.later_checks.empty());
+  CHECK_FALSE(contract_entry.contract.view->replay_policy.cpu_replay_permitted);
+  CHECK(contract_entry.contract.view->replay_policy.reason == "stream");
+  sirius::pipeline::pipeline_build_context build_context(nullptr);
+  auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_context);
+  sirius::pipeline::sirius_pipeline_build_state state;
+  state.set_pipeline_source(*pipeline, *physical);
+  sirius::pipeline::pipeline_conversion_result result{{pipeline}, {}, 1};
+  for (auto const& dump : {sirius::pipeline::dump_pipeline_conversion_result(result),
+                           sirius::pipeline::dump_pipeline_schedule_raw(result)}) {
+    CHECK(dump.find("pushdown_mode=none scan_cpu_replay=forbidden scan_replay_veto=stream") !=
+          std::string::npos);
+    CHECK(dump.find("plan_cpu_replay=forbidden veto=stream") != std::string::npos);
+  }
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
@@ -578,6 +648,23 @@ TEST_CASE("Scan registry rejects registered replacements before or after first l
                             "warm",
                             "cold_same",
                             "warm_same",
+                            "cold_init_global",
+                            "cold_init_local",
+                            "cold_serialize",
+                            "cold_deserialize",
+                            "warm_init_global",
+                            "warm_init_local",
+                            "warm_serialize",
+                            "warm_deserialize",
+                            "preload_init_global",
+                            "preload_init_local",
+                            "preload_serialize",
+                            "preload_deserialize",
+                            "preload_dynamic_init_global",
+                            "preload_dynamic_init_local",
+                            "preload_dynamic_serialize",
+                            "preload_dynamic_deserialize",
+
                             "preload",
                             "preload_dynamic",
                             "iceberg_first",
@@ -774,19 +861,20 @@ TEST_CASE("Scan registry rejects replacement before Sirius load child", "[.][reg
                     ->HasError());
   }
   duckdb::ExtensionLoader loader(*database.instance, "registry_preload_test");
-  auto original        = loader.GetTableFunction("read_parquet").functions.functions.front();
-  auto replacement     = original;
-  replacement.function = fake_scan;
+  auto original    = loader.GetTableFunction("read_parquet").functions.functions.front();
+  auto replacement = original;
+  auto const phase = std::string(std::getenv("SIRIUS_REGISTRY_TRUST_PHASE"));
+  replace_callback(replacement, phase);
   duckdb::CreateTableFunctionInfo info(replacement);
   info.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
   loader.RegisterFunction(std::move(info));
-  REQUIRE(loader.GetTableFunction("read_parquet").functions.functions.front().function ==
-          fake_scan);
+  require_registered_callbacks(loader.GetTableFunction("read_parquet").functions.functions.front(),
+                               replacement);
 
   // Explicitly load Sirius only after the replacement is committed to the catalog.
   setenv("SIRIUS_CONFIG_FILE", std::getenv("SIRIUS_TEST_SHARED_CONFIG_OVERRIDE"), 1);
   unsetenv("SIRIUS_DISABLE");
-  bool const dynamic = std::string(std::getenv("SIRIUS_REGISTRY_TRUST_PHASE")) == "preload_dynamic";
+  bool const dynamic = phase.starts_with("preload_dynamic");
   if (dynamic) {
     auto const executable = std::filesystem::canonical("/proc/self/exe");
     auto const extension =
@@ -800,13 +888,21 @@ TEST_CASE("Scan registry rejects replacement before Sirius load child", "[.][reg
   }
   duckdb::Connection con(database);
   REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  if (phase.ends_with("init_global") || phase.ends_with("init_local")) {
+    auto cpu = con.Query("SELECT * FROM read_parquet(" + files.file_literal("input.parquet") + ")");
+    REQUIRE(cpu);
+    REQUIRE(cpu->HasError());
+    CHECK(cpu->GetError().find(phase.ends_with("init_global")
+                                 ? "replacement global initializer"
+                                 : "replacement local initializer") != std::string::npos);
+  }
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
   duckdb::MultiFileBindData bind;
   CHECK_FALSE(sirius::planner::lookup_scan_source(replacement, &bind, *con.context));
   auto plan =
     con.ExtractPlan("SELECT * FROM read_parquet(" + files.file_literal("input.parquet") + ")");
   auto& get = first_get(*plan);
-  REQUIRE(get.function.function == fake_scan);
+  require_registered_callbacks(get.function, replacement);
   registry_test_generator generator(*con.context);
   CHECK_THROWS_WITH(generator.create_plan(get), Catch::Matchers::Contains("unverified callbacks"));
   REQUIRE_FALSE(con.Query("COMMIT")->HasError());
@@ -857,9 +953,11 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
       bind = duckdb::make_uniq<duckdb::MultiFileBindData>();
     if (std::string_view(phase).starts_with("warm"))
       REQUIRE(sirius::planner::lookup_scan_source(original, bind.get(), *con.context));
-    if (std::string_view(phase).ends_with("_same")) {
-      auto replacement     = original;
-      replacement.function = fake_scan;
+    if (std::string_view(phase).ends_with("_same") ||
+        std::string_view(phase).find("init_") != std::string_view::npos ||
+        std::string_view(phase).ends_with("serialize")) {
+      auto replacement = original;
+      replace_callback(replacement, phase);
       duckdb::CreateTableFunctionInfo info(replacement);
       info.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
       loader.RegisterFunction(std::move(info));
@@ -867,8 +965,9 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
                           .GetEntry<duckdb::TableFunctionCatalogEntry>(
                             *con.context, DEFAULT_SCHEMA, source.function_name)
                           .functions.functions.front();
-      REQUIRE(registered.function == fake_scan);
+      require_registered_callbacks(registered, replacement);
       CHECK_FALSE(sirius::planner::lookup_scan_source(registered, bind.get(), *con.context));
+      CHECK_FALSE(sirius::planner::lookup_scan_source(original, bind.get(), *con.context));
       duckdb::CreateTableFunctionInfo restore(original);
       restore.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
       loader.RegisterFunction(std::move(restore));
@@ -889,4 +988,38 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
   }
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
   replacement_table = nullptr;
+}
+
+TEST_CASE("Scan diagnostics distinguish pushdown from replay permission",
+          "[scan][contracts][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  auto path =
+    std::string(SIRIUS_PROJECT_ROOT) + "/test/cpp/integration/data/parquet/lineitem.parquet";
+  auto dump = sirius::test::convert_query_to_raw_schedule(
+    con, "SELECT sum(l_orderkey) FROM read_parquet('" + path + "')");
+  INFO(dump);
+  CHECK(dump.find(" pushdown_mode=") != std::string::npos);
+  CHECK(dump.find(" scan_cpu_replay=permitted") != std::string::npos);
+  CHECK(dump.find("plan_cpu_replay=permitted veto=none") != std::string::npos);
+  CHECK(dump.find(" policy=") == std::string::npos);
+}
+
+TEST_CASE("Read-view evidence indexes preserve file order and duplicates", "[scan][contracts]")
+{
+  std::vector<std::string> paths{"c", "a", "b", "a"};
+  auto index = make_read_view_evidence_index(paths);
+  REQUIRE(index.size() == paths.size());
+  auto sorted = paths;
+  std::sort(sorted.begin(), sorted.end());
+  std::set<std::size_t> positions;
+  for (std::size_t i = 0; i < paths.size(); ++i) {
+    REQUIRE(index[i] < paths.size());
+    CHECK(sorted[index[i]] == paths[i]);
+    positions.insert(index[i]);
+  }
+  CHECK(positions.size() == paths.size());
+  CHECK(paths == std::vector<std::string>{"c", "a", "b", "a"});
+  CHECK(make_read_view_evidence_index({}).empty());
 }

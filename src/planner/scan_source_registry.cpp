@@ -243,19 +243,48 @@ duckdb::vector<duckdb::TableFunction> reference_functions(std::string const& nam
 }
 
 struct verified_callbacks {
-  duckdb::table_function_t function;
-  duckdb::table_function_bind_t bind;
-  duckdb::table_function_get_multi_file_reader_t get_multi_file_reader;
-  duckdb::vector<duckdb::LogicalType> arguments;
-  duckdb::LogicalType varargs;
-  duckdb::named_parameter_type_map_t named_parameters;
+  explicit verified_callbacks(duckdb::TableFunction const& value) : reference(value) {}
+  duckdb::TableFunction reference;
 
   bool matches(duckdb::TableFunction const& candidate) const
   {
-    return function == candidate.function && bind == candidate.bind &&
-           get_multi_file_reader == candidate.get_multi_file_reader &&
-           arguments == candidate.arguments && varargs == candidate.varargs &&
-           named_parameters == candidate.named_parameters;
+    // Initialization, binding/copy, and optimizer callbacks can change the reader's semantics
+    // even when its scan body is unchanged. Only presentation/profiling callbacks are excluded.
+    return reference.function == candidate.function && reference.bind == candidate.bind &&
+           reference.bind_replace == candidate.bind_replace &&
+           reference.bind_operator == candidate.bind_operator &&
+           reference.init_global == candidate.init_global &&
+           reference.init_local == candidate.init_local &&
+           reference.in_out_function == candidate.in_out_function &&
+           reference.in_out_function_final == candidate.in_out_function_final &&
+           reference.statistics == candidate.statistics &&
+           reference.statistics_extended == candidate.statistics_extended &&
+           reference.dependency == candidate.dependency &&
+           reference.cardinality == candidate.cardinality &&
+           reference.pushdown_complex_filter == candidate.pushdown_complex_filter &&
+           reference.pushdown_expression == candidate.pushdown_expression &&
+           reference.get_partition_data == candidate.get_partition_data &&
+           reference.get_bind_info == candidate.get_bind_info &&
+           reference.type_pushdown == candidate.type_pushdown &&
+           reference.get_multi_file_reader == candidate.get_multi_file_reader &&
+           reference.supports_pushdown_type == candidate.supports_pushdown_type &&
+           reference.supports_pushdown_extract == candidate.supports_pushdown_extract &&
+           reference.get_partition_info == candidate.get_partition_info &&
+           reference.get_partition_stats == candidate.get_partition_stats &&
+           reference.get_virtual_columns == candidate.get_virtual_columns &&
+           reference.get_row_id_columns == candidate.get_row_id_columns &&
+           reference.set_scan_order == candidate.set_scan_order &&
+           reference.serialize == candidate.serialize &&
+           reference.deserialize == candidate.deserialize &&
+           reference.projection_pushdown == candidate.projection_pushdown &&
+           reference.filter_pushdown == candidate.filter_pushdown &&
+           reference.filter_prune == candidate.filter_prune &&
+           reference.sampling_pushdown == candidate.sampling_pushdown &&
+           reference.late_materialization == candidate.late_materialization &&
+           reference.order_preservation_type == candidate.order_preservation_type &&
+           reference.global_initialization == candidate.global_initialization &&
+           reference.arguments == candidate.arguments && reference.varargs == candidate.varargs &&
+           reference.named_parameters == candidate.named_parameters;
   }
 };
 struct accepted_callbacks {
@@ -275,12 +304,7 @@ void initialize_iceberg_callbacks(duckdb::DatabaseInstance& db)
     try {
       std::vector<verified_callbacks> verified;
       for (auto const& value : iceberg_reference_functions(db)) {
-        verified.push_back({value.function,
-                            value.bind,
-                            value.get_multi_file_reader,
-                            value.arguments,
-                            value.varargs,
-                            value.named_parameters});
+        verified.emplace_back(value);
       }
       // Publish the complete independent reference only after registration succeeds.
       cache.values = std::move(verified);
@@ -330,12 +354,7 @@ scan_source_entry const* lookup_scan_source(duckdb::TableFunction const& functio
     if (cache.values.empty()) {
       // A mutable catalog can confirm registration, but must never grant trust.
       for (auto const& value : reference_functions(entry.function_name, context)) {
-        cache.values.push_back({value.function,
-                                value.bind,
-                                value.get_multi_file_reader,
-                                value.arguments,
-                                value.varargs,
-                                value.named_parameters});
+        cache.values.emplace_back(value);
       }
     }
     for (auto const& callbacks : cache.values) {

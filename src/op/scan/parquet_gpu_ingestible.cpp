@@ -76,7 +76,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -737,16 +736,8 @@ parquet_gpu_ingestible::parquet_gpu_ingestible(std::unique_ptr<parquet_ingestibl
     _sirius_dynamic_filters->ignore_columns(partition_cols);
   }
 
-  _file_paths = bind.resolved_file_paths;
-  _evidence_index_by_file.resize(_file_paths.size());
-  std::vector<std::size_t> sorted_indexes(_file_paths.size());
-  std::iota(sorted_indexes.begin(), sorted_indexes.end(), 0);
-  std::sort(sorted_indexes.begin(), sorted_indexes.end(), [&](auto left, auto right) {
-    return _file_paths[left] < _file_paths[right];
-  });
-  for (std::size_t sorted_index = 0; sorted_index < sorted_indexes.size(); ++sorted_index) {
-    _evidence_index_by_file[sorted_indexes[sorted_index]] = sorted_index;
-  }
+  _file_paths             = bind.resolved_file_paths;
+  _evidence_index_by_file = make_read_view_evidence_index(_file_paths);
 }
 
 parquet_gpu_ingestible::~parquet_gpu_ingestible() = default;

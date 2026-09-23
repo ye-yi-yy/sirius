@@ -515,6 +515,21 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     }
   }
 
+  view.replay_policy = {
+    source->function_name, source->byte_source, source->cpu_replay_permitted, {}};
+  for (std::size_t i = 0; i < paths.size(); ++i) {
+    auto const& path = paths[i];
+    if (path.size() > 5 && (path[0] == 's' || path[0] == 'S') && path[1] == '3' && path[2] == ':' &&
+        path[3] == '/' && path[4] == '/') {
+      view.replay_policy.source               = transparent::byte_source_class::sirius_owned_s3;
+      view.replay_policy.cpu_replay_permitted = false;
+      break;
+    }
+  }
+  if (!view.replay_policy.cpu_replay_permitted) {
+    view.replay_policy.reason =
+      view.replay_policy.source == transparent::byte_source_class::stream ? "stream" : "s3";
+  }
   view.metrics.file_count              = paths.size();
   view.metrics.transient_path_capacity = owned_paths.capacity() * sizeof(std::string) +
                                          owned_files.capacity() * sizeof(duckdb::OpenFileInfo) +
@@ -537,6 +552,21 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
   return view;
 }
 }  // namespace
+
+// Keep this allocation boundary visible to T6's stack attribution. It contains only
+// R1 evidence correspondence storage, not baseline Parquet construction allocations.
+__attribute__((noinline)) std::vector<std::size_t> make_read_view_evidence_index(
+  std::span<std::string const> paths)
+{
+  std::vector<std::size_t> result(paths.size());
+  std::vector<std::size_t> order(paths.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(
+    order.begin(), order.end(), [&](auto left, auto right) { return paths[left] < paths[right]; });
+  for (std::size_t sorted = 0; sorted < order.size(); ++sorted)
+    result[order[sorted]] = sorted;
+  return result;
+}
 
 namespace {
 std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
