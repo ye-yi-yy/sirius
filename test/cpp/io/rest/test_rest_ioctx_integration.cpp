@@ -823,14 +823,6 @@ list_watchdog_result run_list_watchdog(range_http_server const& server,
   auto const pid = ::fork();
   REQUIRE(pid >= 0);
   if (pid == 0) {
-    // This watchdog exercises only the standalone REST context.  Loading a second Sirius runtime
-    // can reserve most of the GPU while the full suite's shared runtime is still alive.
-    // The test harness deliberately clears SIRIUS_DISABLE while constructing its shared database,
-    // so give the child a bounded config as well as asking it to disable the runtime.
-    auto const config = std::filesystem::path(SIRIUS_PROJECT_ROOT) / "test" / "cpp" /
-                        "integration" / "s3" / "sirius.yaml";
-    ::setenv("SIRIUS_TEST_SHARED_CONFIG_OVERRIDE", config.c_str(), 1);
-    ::setenv("SIRIUS_DISABLE", "1", 1);
     ::execl("/proc/self/exe",
             "sirius_unittest",
             "rest LIST loop watchdog child runner",

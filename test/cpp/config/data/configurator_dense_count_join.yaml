@@ -3,9 +3,10 @@ sirius:
     num_gpus: 1
   memory:
     gpu:
-      # Keep the dynamic-load child independent of whatever GPU memory the parent suite retains.
-      usage_limit_bytes: 256 MiB
-      reservation_limit_bytes: 128 MiB
+      usage_limit_fraction: 0.05
+      reservation_limit_fraction: 0.04
+      downgrade_trigger_fraction: 0.04
+      downgrade_stop_fraction: 0.02
     host:
       capacity_bytes: 160000000
       reservation_limit_fraction: 0.9
