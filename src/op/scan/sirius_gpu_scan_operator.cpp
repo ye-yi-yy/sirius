@@ -463,7 +463,7 @@ std::unique_ptr<op::operator_data> sirius_gpu_scan_operator::execute(
   }
   if (scan_input->has_scan_metadata() && _contract_id != 0) {
     try {
-      validate_split_contract(_contract_id, scan_input->get_scan_info());
+      validate_split_for_gpu(_contract_id, scan_input->get_scan_info());
     } catch (...) {
       if (_compressed_materialization_observer) {
         _compressed_materialization_observer->record_transparent_certificate_mismatch();

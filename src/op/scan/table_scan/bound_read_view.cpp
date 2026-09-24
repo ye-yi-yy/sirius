@@ -19,7 +19,7 @@
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
 #include "op/sirius_physical_table_scan.hpp"
-#include "planner/scan_source_registry.hpp"
+#include "planner/connector_registry.hpp"
 #include "sirius_registration.hpp"
 
 #include <duckdb/catalog/catalog.hpp>
@@ -354,7 +354,7 @@ std::shared_ptr<bound_read_identity const> make_bound_read_identity_preanalyzed(
 
 bound_read_view capture(capture_input input, duckdb::ClientContext& context)
 {
-  auto const* source = planner::lookup_scan_source(input.function, input.bind_data, context);
+  auto const* source = planner::lookup_connector(input.function, input.bind_data, context);
   if (!source) { throw std::runtime_error("cannot capture an unverified scan source"); }
 
   bound_read_identity identity;
@@ -411,7 +411,7 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
     }
     std::shared_ptr<file_evidence_arrays> unsorted_evidence;
     bool any_size = false;
-    bool any_tag  = false;
+    bool any_etag = false;
     if (input.collect_evidence) unsorted_evidence = std::make_shared<file_evidence_arrays>();
     if (paths.empty()) {
       // GetAllFiles copies the bound inventory under one lock. Files()/Scan()
@@ -445,13 +445,12 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
           unsorted_evidence->last_modified[index] =
             found->second.GetValue<duckdb::timestamp_t>().value;
           unsorted_evidence->last_modified_present[index] = 1;
-          any_tag                                         = true;
         }
         if (auto found = options.find("etag"); found != options.end() && !found->second.IsNull()) {
           evidence_tag_string_capacity -= unsorted_evidence->etag[index].capacity() + 1;
           unsorted_evidence->etag[index] = duckdb::StringValue::Get(found->second);
           evidence_tag_string_capacity += unsorted_evidence->etag[index].capacity() + 1;
-          any_tag = true;
+          any_etag = true;
         }
       }
     }
@@ -509,24 +508,23 @@ bound_read_view capture(capture_input input, duckdb::ClientContext& context)
       path_info.sorted                 = true;
       view.metrics.sort_index_capacity = order.capacity() * sizeof(std::size_t);
       view.evidence                    = std::move(unsorted_evidence);
-      view.depth                       = any_tag    ? evidence_depth::path_size_and_tag
+      view.depth                       = any_etag   ? evidence_depth::path_size_and_tag
                                          : any_size ? evidence_depth::path_and_size
                                                     : evidence_depth::path;
     }
   }
 
-  view.replay_policy = {
-    source->function_name, source->byte_source, source->cpu_replay_permitted, {}};
+  view.replay_policy = {source->function_name, source->byte_source, source->permits_cpu_replay, {}};
   for (std::size_t i = 0; i < paths.size(); ++i) {
     auto const& path = paths[i];
     if (path.size() > 5 && (path[0] == 's' || path[0] == 'S') && path[1] == '3' && path[2] == ':' &&
         path[3] == '/' && path[4] == '/') {
-      view.replay_policy.source               = transparent::byte_source_class::sirius_owned_s3;
-      view.replay_policy.cpu_replay_permitted = false;
+      view.replay_policy.source             = transparent::byte_source_class::sirius_owned_s3;
+      view.replay_policy.permits_cpu_replay = false;
       break;
     }
   }
-  if (!view.replay_policy.cpu_replay_permitted) {
+  if (!view.replay_policy.permits_cpu_replay) {
     view.replay_policy.reason =
       view.replay_policy.source == transparent::byte_source_class::stream ? "stream" : "s3";
   }
@@ -696,7 +694,7 @@ std::vector<logical_bound_read_view> capture_bound_read_views(duckdb::LogicalOpe
   auto visit = [&](auto&& self, duckdb::LogicalOperator const& op) -> void {
     if (op.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
       auto const& get = op.Cast<duckdb::LogicalGet>();
-      if (planner::lookup_scan_source(get, context)) {
+      if (planner::lookup_connector(get, context)) {
         captured.push_back({get.table_index, capture_bound_read_view(get, context)});
       }
     }
@@ -721,7 +719,7 @@ std::vector<bound_read_view> capture_bound_read_views(duckdb::PhysicalOperator c
   auto visit = [&](auto&& self, duckdb::PhysicalOperator const& op) -> void {
     if (op.type == duckdb::PhysicalOperatorType::TABLE_SCAN) {
       auto const& get = op.Cast<duckdb::PhysicalTableScan>();
-      if (planner::lookup_scan_source(get, context)) {
+      if (planner::lookup_connector(get, context)) {
         captured.push_back(capture_bound_read_view(get, context));
       }
     }

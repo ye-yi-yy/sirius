@@ -430,10 +430,6 @@ class SiriusContext : public ClientContextState {
     InternalQueryGuard(const InternalQueryGuard&)            = delete;
     InternalQueryGuard& operator=(const InternalQueryGuard&) = delete;
 
-    /// Fail closed before a Sirius-owned internal connection starts a non-read-only transaction
-    /// while the outer execution window holds a native checkpoint lease.
-    void before_transaction_start(ClientContext& outer, bool read_only) const;
-
    private:
     shared_ptr<SiriusConnectionState> state_;
   };

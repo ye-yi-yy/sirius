@@ -383,21 +383,9 @@ bool SiriusContext::is_internal_query_active(ClientContext& context) noexcept
   return conn_state && conn_state->is_internal_query_active();
 }
 
-void SiriusContext::InternalQueryGuard::before_transaction_start(ClientContext& outer,
-                                                                 bool read_only) const
-{
-  if (read_only) { return; }
-  auto sirius_context = outer.registered_state->Get<SiriusContext>("sirius_state");
-  if (sirius_context && sirius_context->get_scan_manager().holds_any_checkpoint_key()) {
-    throw NotImplementedException(
-      "Sirius refused a non-read-only internal transaction while a checkpoint lease is held");
-  }
-}
-
 struct SiriusContext::internal_connection::implementation {
   explicit implementation(ClientContext& outer) : connection(*outer.db), guard(*connection.context)
   {
-    guard.before_transaction_start(outer, true);
     auto result = connection.Query("BEGIN TRANSACTION READ ONLY");
     if (!result || result->HasError()) {
       throw InvalidInputException(
@@ -406,7 +394,8 @@ struct SiriusContext::internal_connection::implementation {
     }
     if (!connection.context->transaction.HasActiveTransaction() ||
         !MetaTransaction::Get(*connection.context).IsReadOnly()) {
-      throw InternalException("Sirius internal connection did not enter a read-only transaction");
+      throw InvalidInputException(
+        "Sirius internal connection did not enter a read-only transaction");
     }
     transaction_open = true;
   }
@@ -1601,30 +1590,33 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
           sirius::references_sirius_owned_s3_parquet(current_query_sql)) {
         throw;
       }
-      sirius::transparent::require_cpu_replay(
+      sirius::transparent::require_s3_cpu_replay(
         source_policy, current_query_sql, sirius::sanitized_message(e));
       if (!duckdb_fallback_enabled(context)) { throw; }
+      sirius::transparent::require_non_s3_cpu_replay(source_policy, sirius::sanitized_message(e));
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}",
                       sirius::sanitized_message(e));
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (NotImplementedException& e) {
       // The retained physical plan also exposes sources hidden behind views.
-      sirius::transparent::require_cpu_replay(
+      sirius::transparent::require_s3_cpu_replay(
         source_policy, current_query_sql, sirius::sanitized_message(e));
       if (!duckdb_fallback_enabled(context)) {
         rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
       }
+      sirius::transparent::require_non_s3_cpu_replay(source_policy, sirius::sanitized_message(e));
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan unsupported): {}",
                       sirius::sanitized_message(e));
       return RebindQueryInfo::DO_NOT_REBIND;
     } catch (std::exception& e) {
-      sirius::transparent::require_cpu_replay(
+      sirius::transparent::require_s3_cpu_replay(
         source_policy, current_query_sql, sirius::sanitized_message(e));
       if (!duckdb_fallback_enabled(context)) {
         rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
       }
+      sirius::transparent::require_non_s3_cpu_replay(source_policy, sirius::sanitized_message(e));
       record_transparent_fallback();
       SIRIUS_LOG_INFO("Transparent execution fallback (replan failed): {}",
                       sirius::sanitized_message(e));
@@ -1754,30 +1746,33 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // Stable typed unavailable error: S3 keeps it as-is; LOCAL falls back to
     // the retained CPU plan when allowed.
     if (source_policy.reads_sirius_owned_s3()) { throw; }
-    sirius::transparent::require_cpu_replay(
+    sirius::transparent::require_s3_cpu_replay(
       source_policy, current_query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) { throw; }
+    sirius::transparent::require_non_s3_cpu_replay(source_policy, sirius::sanitized_message(e));
     record_transparent_fallback();
     SIRIUS_LOG_INFO("Transparent execution fallback (runtime unavailable): {}",
                     sirius::sanitized_message(e));
     return RebindQueryInfo::DO_NOT_REBIND;
   } catch (NotImplementedException& e) {
-    sirius::transparent::require_cpu_replay(
+    sirius::transparent::require_s3_cpu_replay(
       source_policy, current_query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
+    sirius::transparent::require_non_s3_cpu_replay(source_policy, sirius::sanitized_message(e));
     record_transparent_fallback();
     auto const message = sirius::sanitized_message(e);
     if (!message.starts_with("read-view mismatch:")) {
       SIRIUS_LOG_INFO("Transparent execution fallback (unsupported): {}", message);
     }
   } catch (std::exception& e) {
-    sirius::transparent::require_cpu_replay(
+    sirius::transparent::require_s3_cpu_replay(
       source_policy, current_query_sql, sirius::sanitized_message(e));
     if (!duckdb_fallback_enabled(context)) {
       rethrow_gpu_error_no_fallback(e, "GPU plan generation failed: ");
     }
+    sirius::transparent::require_non_s3_cpu_replay(source_policy, sirius::sanitized_message(e));
     record_transparent_fallback();
     SIRIUS_LOG_INFO("Transparent execution fallback: {}", sirius::sanitized_message(e));
   }

@@ -463,7 +463,7 @@ TEST_CASE_METHOD(ReadViewFixture,
 }
 
 TEST_CASE_METHOD(ReadViewFixture,
-                 "parquet glob metacharacter binding is reproduced by the copy",
+                 "parquet glob metacharacter binding rejects a copy with changed files",
                  "[transparent][read_view][integration]")
 {
   auto& connection = *con;
@@ -474,18 +474,20 @@ TEST_CASE_METHOD(ReadViewFixture,
   query_ok(
     connection,
     "COPY (SELECT 22::INTEGER AS i) TO " + files.file_literal("a1.parquet") + " (FORMAT PARQUET)");
-  auto const scan = "SELECT sum(i) FROM read_parquet(" + files.file_literal("a[1].parquet") + ")";
+  auto const scan = "SELECT sum(i) FROM read_parquet(" + files.file_literal("*.parquet") + ")";
 
   query_ok(connection, "SET gpu_execution = false");
   auto const expected = scalar(connection, scan);
+  REQUIRE(expected == "33");
   query_ok(connection, "SET gpu_execution = true");
   auto const before = sirius::test::get_transparent_execution_stats(connection);
   CHECK(scalar(connection, scan) == expected);
   auto const after = sirius::test::get_transparent_execution_stats(connection);
 
-  CHECK(after.successful_rebinds == before.successful_rebinds + 1);
-  CHECK(after.read_view_mismatches == before.read_view_mismatches);
-  CHECK(after.fallbacks == before.fallbacks);
+  // DuckDB's copy rebind interprets a[1].parquet as a pattern and reads a1.parquet again.
+  // The original glob covers both files, so the changed candidate must be declined.
+  sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
+  CHECK(after.read_view_mismatches == before.read_view_mismatches + 1);
 }
 
 TEST_CASE_METHOD(ReadViewFixture,

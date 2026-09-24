@@ -22,20 +22,25 @@
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "sirius_context.hpp"
+#include "test_utils.hpp"
 #include "transparent/read_view_registry.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
+#include <duckdb/execution/physical_plan_generator.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 #include <duckdb/storage/storage_manager.hpp>
 #include <io/kvikio/kvikio_context.hpp>
+#include <io/sirius_datasource.hpp>
 #include <unistd.h>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/parquet_fixture_utils.hpp>
 
 #include <cstdint>
 #include <filesystem>
@@ -286,39 +291,70 @@ TEST_CASE("Scan contract later checks are materializer-specific", "[scan][certif
 TEST_CASE("Fresh Parquet slices carry physical input certificates", "[scan][certificate]")
 {
   constexpr scan_contract_id contract_id = 51;
-  auto ingestible                        = make_ingestible(parquet_info(contract_id));
-  auto ioctx                             = std::make_shared<sirius::io::kvikio_context>();
-  auto provider                          = ingestible->next_split_provider(
-    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
-  REQUIRE(provider);
-  auto file = provider();
-  REQUIRE(file);
-  REQUIRE(file->contract_id() == contract_id);
-  REQUIRE(file->certificates().size() == 1);
-  REQUIRE(file->dependencies().size() == 1);
-  auto const file_identity = file->certificates().front().input_identity;
-  CHECK(file_identity.find("nation.parquet|footer=") != std::string::npos);
-  CHECK(file_identity.find("size=") == std::string::npos);
-  CHECK(file_identity.find("etag=") == std::string::npos);
-
-  auto coalescer = ingestible->create_batch_coalescer();
-  auto splits    = coalescer->push(std::move(file));
-  auto tail      = coalescer->flush();
-  for (auto& split : tail) {
-    splits.push_back(std::move(split));
+  auto const combine_files               = GENERATE(false, true);
+  CAPTURE(combine_files);
+  temporary_directory files;
+  auto info         = parquet_info(contract_id);
+  auto const source = info->resolved_file_paths.front();
+  std::vector<std::string> paths;
+  for (auto const* name : {"first.parquet", "second.parquet"}) {
+    auto path = (files.path / name).string();
+    std::filesystem::copy_file(source, path);
+    paths.push_back(std::move(path));
   }
-  REQUIRE_FALSE(splits.empty());
+  info->resolved_file_paths    = paths;
+  info->approximate_batch_size = 64 * 1024 * 1024;
+  auto ingestible              = make_ingestible(std::move(info));
+  auto ioctx                   = std::make_shared<sirius::io::kvikio_context>();
+  auto coalescer               = ingestible->create_batch_coalescer();
+  std::vector<std::unique_ptr<scan_info>> splits;
+  std::vector<std::string> identities;
+  auto collect = [&](auto emitted) {
+    for (auto& split : emitted)
+      splits.push_back(std::move(split));
+  };
+  for (auto const& path : paths) {
+    auto provider = ingestible->next_split_provider(
+      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    REQUIRE(provider);
+    auto file = provider();
+    REQUIRE(file);
+    REQUIRE(file->certificates().size() == 1);
+    REQUIRE(file->dependencies().size() == 1);
+    auto const identity = file->certificates().front().input_identity;
+    CHECK(identity.find(path + "|footer=") == 0);
+    CHECK(identity.find("size=") == std::string::npos);
+    CHECK(identity.find("etag=") == std::string::npos);
+    identities.push_back(identity);
+    collect(coalescer->push(std::move(file)));
+    if (!combine_files) collect(coalescer->flush());
+  }
+  collect(coalescer->flush());
+  REQUIRE(splits.size() == (combine_files ? 1 : 2));
+  std::size_t position = 0;
   for (auto const& split : splits) {
     auto const* parquet_split = dynamic_cast<parquet_split_info const*>(split.get());
     REQUIRE(parquet_split);
     REQUIRE(split->contract_id() == contract_id);
     REQUIRE(split->certificates().size() == parquet_split->rg_slices.size());
     REQUIRE(split->dependencies().size() == split->certificates().size());
-    for (auto const& certificate : split->certificates()) {
+    REQUIRE(parquet_split->rg_slices.size() == (combine_files ? 2 : 1));
+    for (std::size_t slice = 0; slice < parquet_split->rg_slices.size(); ++slice) {
+      auto const& certificate = split->certificates()[slice];
       CHECK(certificate.contract_id == contract_id);
-      CHECK(certificate.input_identity == file_identity);
+      REQUIRE(position < identities.size());
+      CHECK(certificate.input_identity == identities[position++]);
+      CHECK(certificate.input_identity.find(parquet_split->rg_slices[slice].file_path +
+                                            "|footer=") == 0);
+      auto const& dependency = split->dependencies()[slice];
+      auto const& group      = parquet_split->rg_slices[slice];
+      REQUIRE(dependency.datasource);
+      REQUIRE(group.datasource);
+      CHECK(dependency.footer == group.file_metadata);
+      CHECK(&dependency.datasource->get_io_object() == &group.datasource->get_io_object());
     }
   }
+  CHECK(position == paths.size());
 }
 
 TEST_CASE("Parquet certificates include physical-original file evidence after comparison",
@@ -395,6 +431,117 @@ TEST_CASE("Parquet certificates include physical-original file evidence after co
   CHECK(entry.physical_evidence == evidence);
 }
 
+TEST_CASE("Local glob evidence reaches Parquet certificates through physical comparison",
+          "[scan][certificate][read_view][integration]")
+{
+  native_database fixture;
+  auto& con = *fixture.connection;
+  exec_ok(con, "SET gpu_execution=false");
+  temporary_directory files;
+  auto const source = project_root() / "test/cpp/integration/data/parquet/nation.parquet";
+  for (auto const* name : {"a.parquet", "z.parquet"})
+    std::filesystem::copy_file(source, files.path / name);
+  exec_ok(con, "BEGIN");
+  auto plan = con.ExtractPlan("SELECT n_nationkey FROM read_parquet(" +
+                              sirius::test::sql_literal((files.path / "*.parquet").string()) + ")");
+  logical_bound_read_view_capture logical;
+  logical.views = capture_bound_read_views(*plan, *con.context);
+  REQUIRE(logical.views.size() == 1);
+  auto candidate = logical.views.front().view;
+  duckdb::PhysicalPlanGenerator generator(*con.context);
+  auto physical_plan = generator.Plan(std::move(plan));
+  auto physical      = capture_bound_read_views(physical_plan->Root(), *con.context);
+  REQUIRE(physical.size() == 1);
+  auto registry   = std::make_shared<sirius::transparent::read_view_registry>();
+  auto const id   = allocate_scan_contract(*registry,
+                                         std::nullopt,
+                                         1,
+                                         logical.views.front().table_index,
+                                         std::make_shared<bound_read_view const>(candidate),
+                                         column_requirements{},
+                                         predicate_contract{},
+                                           {materializer_kind::parquet, "parquet.v1"},
+                                           {},
+                                         logical.views.front().table_index);
+  auto comparison = sirius::transparent::compare_read_views(
+    sirius::transparent::candidate_origin::copy, &logical, physical, *registry);
+  INFO(sirius::transparent::describe_read_view_mismatch(comparison));
+  REQUIRE(comparison.equal);
+  registry->publish_supported(
+    certificate_evidence_scope::binding_correspondence, comparison.correspondence, physical);
+  auto const evidence = registry->entry(id).physical_evidence;
+  REQUIRE(evidence);
+  REQUIRE(evidence->size.size() == 2);
+  auto info = parquet_info(id);
+  // Consume the glob's physical evidence in reverse path order.
+  info->resolved_file_paths = {(files.path / "z.parquet").string(),
+                               (files.path / "a.parquet").string()};
+  info->read_views          = registry;
+  auto ingestible           = make_ingestible(std::move(info));
+  auto ioctx                = std::make_shared<sirius::io::kvikio_context>();
+  for (auto const index : {1, 0}) {
+    auto provider = ingestible->next_split_provider(
+      [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+    REQUIRE(provider);
+    auto file = provider();
+    REQUIRE(file);
+    REQUIRE(file->certificates().size() == 1);
+    auto const& identity = file->certificates().front().input_identity;
+    REQUIRE(evidence->size_present[index]);
+    CHECK(evidence->size[index] == std::filesystem::file_size(source));
+    CHECK(identity.find("|size=" + std::to_string(evidence->size[index])) != std::string::npos);
+    REQUIRE(evidence->last_modified_present[index]);
+    CHECK(identity.find("|last_modified=" + std::to_string(evidence->last_modified[index])) !=
+          std::string::npos);
+  }
+  exec_ok(con, "ROLLBACK");
+}
+
+TEST_CASE("Native decode rejects metadata from an earlier checkpoint",
+          "[scan][certificate][integration]")
+{
+  native_database fixture;
+  auto& con = *fixture.connection;
+  exec_ok(con, "SET gpu_execution=false");
+  exec_ok(con, "CREATE TABLE items AS SELECT range::INTEGER AS id FROM range(100)");
+  exec_ok(con, "CHECKPOINT");
+  auto info       = native_info(fixture, 62);
+  auto* database  = &info->storage->GetAttached();
+  auto ingestible = make_ingestible(std::move(info));
+  auto ioctx      = std::make_shared<sirius::io::kvikio_context>();
+  auto provider   = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  REQUIRE(provider);
+  auto split = provider();
+  REQUIRE(split);
+  REQUIRE_FALSE(split->dependencies().empty());
+  REQUIRE(split->dependencies().front().checkpoint_iteration);
+  // End the original window, advance storage, then deliberately present the stale split.
+  fixture.window->finish();
+  fixture.window.reset();
+  exec_ok(con, "COMMIT");
+  exec_ok(con, "INSERT INTO items VALUES (100)");
+  exec_ok(con, "CHECKPOINT");
+  exec_ok(con, "BEGIN");
+  fixture.lease(*database);
+  auto context = sirius::test::get_registered_sirius_context(con);
+  auto* space =
+    sirius::scan_test_utils::get_space(context->get_memory_manager(), cucascade::memory::Tier::GPU);
+  REQUIRE(space);
+  rmm::cuda_stream stream;
+  scan_operator_input input(std::move(split));
+  input.gpu_memory_space = space;
+  auto const before      = context->get_transparent_execution_stats();
+  REQUIRE_THROWS_WITH(ingestible->materialize_table(input, stream),
+                      "duckdb-native checkpoint iteration changed before metadata materialization");
+  auto const after = context->get_transparent_execution_stats();
+  CHECK(after.checkpoint_revalidation_failures == before.checkpoint_revalidation_failures + 1);
+  CHECK(after.certificate_mismatches == before.certificate_mismatches);
+  fixture.window->finish();
+  fixture.window.reset();
+  exec_ok(con, "ROLLBACK");
+}
+
 TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
           "[scan][certificate][integration]")
 {
@@ -404,10 +551,12 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   exec_ok(*fixture.connection, "INSERT INTO items SELECT range FROM range(300000)");
   exec_ok(*fixture.connection, "CHECKPOINT");
 
-  auto ingestible          = make_ingestible(native_info(fixture, contract_id));
-  auto ioctx               = std::make_shared<sirius::io::kvikio_context>();
-  auto coalescer           = ingestible->create_batch_coalescer();
-  std::size_t input_slices = 0;
+  auto info                    = native_info(fixture, contract_id);
+  info->approximate_batch_size = 1;
+  auto ingestible              = make_ingestible(std::move(info));
+  auto ioctx                   = std::make_shared<sirius::io::kvikio_context>();
+  auto coalescer               = ingestible->create_batch_coalescer();
+  std::size_t input_slices     = 0;
   std::vector<std::unique_ptr<scan_info>> splits;
   while (auto provider = ingestible->next_split_provider(
            [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; })) {
@@ -430,6 +579,7 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
   }
 
   REQUIRE(input_slices > 1);
+  REQUIRE(splits.size() > 1);
   std::size_t output_slices = 0;
   for (auto const& split : splits) {
     auto const* native_split = dynamic_cast<duckdb_native_scan_info const*>(split.get());
@@ -450,6 +600,41 @@ TEST_CASE("Fresh native ranges and coalesced splits preserve every certificate",
     output_slices += split->certificates().size();
   }
   CHECK(output_slices == input_slices);
+}
+
+TEST_CASE("Native coalescing rejects missing or surplus row-group certificates",
+          "[scan][certificate][integration]")
+{
+  auto const certificate_count           = GENERATE(0, 1, 3);
+  constexpr scan_contract_id contract_id = 63;
+  native_database fixture;
+  exec_ok(*fixture.connection, "CREATE TABLE items(id INTEGER)");
+  exec_ok(*fixture.connection, "INSERT INTO items VALUES (1)");
+  exec_ok(*fixture.connection, "CHECKPOINT");
+  auto ingestible = make_ingestible(native_info(fixture, contract_id));
+  auto coalescer  = ingestible->create_batch_coalescer();
+  auto malformed  = std::make_unique<duckdb_native_scan_info>();
+  malformed->row_groups.resize(2);
+  std::vector<split_materializer_certificate> certificates(certificate_count);
+  for (auto& certificate : certificates) {
+    certificate.contract_id = contract_id;
+  }
+  malformed->set_contract_payload(
+    contract_id, std::move(certificates), std::vector<split_dependencies>(certificate_count));
+  REQUIRE_THROWS_WITH(coalescer->push(std::move(malformed)),
+                      "native split requires one certificate and dependency per row group");
+
+  // Rejection must leave the coalescer ready for a valid provider.
+  auto ioctx    = std::make_shared<sirius::io::kvikio_context>();
+  auto provider = ingestible->next_split_provider(
+    [ioctx](std::string_view) -> std::shared_ptr<sirius::io::ioctx> { return ioctx; });
+  REQUIRE(provider);
+  REQUIRE(coalescer->push(provider()).empty());
+  auto splits = coalescer->flush();
+  REQUIRE(splits.size() == 1);
+  REQUIRE(splits.front()->certificates().size() == 1);
+  REQUIRE(splits.front()->dependencies().size() == 1);
+  CHECK(splits.front()->contract_id() == contract_id);
 }
 
 TEST_CASE("An all-pruned native scan keeps its contract on the empty fallback split",

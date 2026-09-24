@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "planner/scan_source_registry.hpp"
+#include "planner/connector_registry.hpp"
 
 #include "exec/stream_plan_bindings.hpp"
 #include "log/logging.hpp"
@@ -54,72 +54,72 @@ bool matches_bind(duckdb::FunctionData const* bind)
   return dynamic_cast<T const*>(bind) != nullptr;
 }
 
-std::array<scan_source_entry, 6> const entries{{{"seq_scan",
-                                                 kind::duckdb_native,
-                                                 "duckdb.seq_scan.v1",
-                                                 matches_bind<duckdb::TableScanBindData>,
-                                                 lower_native_scan,
-                                                 mode::include_ast_row_masks,
-                                                 bytes::duckdb_native,
-                                                 true,
-                                                 false,
-                                                 nullptr,
-                                                 std::nullopt},
-                                                {"parquet_scan",
-                                                 kind::parquet_local,
-                                                 "duckdb.parquet_scan.v1",
-                                                 matches_bind<duckdb::MultiFileBindData>,
-                                                 lower_parquet_scan,
-                                                 mode::membership_masks_only,
-                                                 bytes::local_file,
-                                                 true,
-                                                 false,
-                                                 nullptr,
-                                                 std::nullopt},
-                                                {"read_parquet",
-                                                 kind::parquet_local,
-                                                 "duckdb.read_parquet.v1",
-                                                 matches_bind<duckdb::MultiFileBindData>,
-                                                 lower_parquet_scan,
-                                                 mode::membership_masks_only,
-                                                 bytes::local_file,
-                                                 true,
-                                                 false,
-                                                 nullptr,
-                                                 std::nullopt},
-                                                {"sirius_read_parquet",
-                                                 kind::parquet_s3,
-                                                 "sirius.read_parquet.v1",
-                                                 matches_bind<duckdb::SiriusReadParquetBindData>,
-                                                 lower_parquet_scan,
-                                                 mode::membership_masks_only,
-                                                 bytes::sirius_owned_s3,
-                                                 false,
-                                                 false,
-                                                 nullptr,
-                                                 std::nullopt},
-                                                {"iceberg_scan",
-                                                 kind::parquet_local,
-                                                 "duckdb.iceberg_scan.v1",
-                                                 matches_bind<duckdb::MultiFileBindData>,
-                                                 lower_iceberg_scan,
-                                                 mode::membership_masks_only,
-                                                 bytes::local_file,
-                                                 true,
-                                                 true,
-                                                 registered_iceberg_decline_reason,
-                                                 std::nullopt},
-                                                {"sirius_stream_source",
-                                                 kind::stream_source,
-                                                 "sirius.stream_source.v1",
-                                                 matches_bind<exec::stream_source_bind_data>,
-                                                 nullptr,
-                                                 mode::membership_masks_only,
-                                                 bytes::stream,
-                                                 false,
-                                                 false,
-                                                 nullptr,
-                                                 std::nullopt}}};
+std::array<connector, 6> const entries{{{"seq_scan",
+                                         kind::duckdb_native,
+                                         "duckdb.seq_scan.v1",
+                                         matches_bind<duckdb::TableScanBindData>,
+                                         lower_native_scan,
+                                         mode::include_ast_row_masks,
+                                         bytes::duckdb_native,
+                                         true,
+                                         false,
+                                         nullptr,
+                                         std::nullopt},
+                                        {"parquet_scan",
+                                         kind::parquet_local,
+                                         "duckdb.parquet_scan.v1",
+                                         matches_bind<duckdb::MultiFileBindData>,
+                                         lower_parquet_scan,
+                                         mode::membership_masks_only,
+                                         bytes::local_file,
+                                         true,
+                                         false,
+                                         nullptr,
+                                         std::nullopt},
+                                        {"read_parquet",
+                                         kind::parquet_local,
+                                         "duckdb.read_parquet.v1",
+                                         matches_bind<duckdb::MultiFileBindData>,
+                                         lower_parquet_scan,
+                                         mode::membership_masks_only,
+                                         bytes::local_file,
+                                         true,
+                                         false,
+                                         nullptr,
+                                         std::nullopt},
+                                        {"sirius_read_parquet",
+                                         kind::parquet_s3,
+                                         "sirius.read_parquet.v1",
+                                         matches_bind<duckdb::SiriusReadParquetBindData>,
+                                         lower_parquet_scan,
+                                         mode::membership_masks_only,
+                                         bytes::sirius_owned_s3,
+                                         false,
+                                         false,
+                                         nullptr,
+                                         std::nullopt},
+                                        {"iceberg_scan",
+                                         kind::parquet_local,
+                                         "duckdb.iceberg_scan.v1",
+                                         matches_bind<duckdb::MultiFileBindData>,
+                                         lower_iceberg_scan,
+                                         mode::membership_masks_only,
+                                         bytes::local_file,
+                                         true,
+                                         true,
+                                         registered_iceberg_decline_reason,
+                                         std::nullopt},
+                                        {"sirius_stream_source",
+                                         kind::stream_source,
+                                         "sirius.stream_source.v1",
+                                         matches_bind<exec::stream_source_bind_data>,
+                                         nullptr,
+                                         mode::membership_masks_only,
+                                         bytes::stream,
+                                         false,
+                                         false,
+                                         nullptr,
+                                         std::nullopt}}};
 
 #ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
 void* host_factory(duckdb::DatabaseInstance& db, char const* symbol);
@@ -290,6 +290,7 @@ struct verified_callbacks {
 struct accepted_callbacks {
   std::mutex mutex;
   std::vector<verified_callbacks> values;
+  bool missing_reference_reported = false;
 };
 std::array<accepted_callbacks, entries.size()> accepted;
 
@@ -327,7 +328,7 @@ class scan_source_extension_callback final : public duckdb::ExtensionCallback {
 };
 }  // namespace
 
-std::span<scan_source_entry const> registered_scan_sources() { return entries; }
+std::span<connector const> registered_connectors() { return entries; }
 
 void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
 {
@@ -338,9 +339,9 @@ void register_scan_source_callbacks(duckdb::DatabaseInstance& db)
   initialize_iceberg_callbacks(db);
 }
 
-scan_source_entry const* lookup_scan_source(duckdb::TableFunction const& function,
-                                            duckdb::FunctionData const* bind,
-                                            duckdb::ClientContext& context)
+connector const* lookup_connector(duckdb::TableFunction const& function,
+                                  duckdb::FunctionData const* bind,
+                                  duckdb::ClientContext& context)
 {
   for (size_t i = 0; i < entries.size(); ++i) {
     auto const& entry = entries[i];
@@ -357,6 +358,27 @@ scan_source_entry const* lookup_scan_source(duckdb::TableFunction const& functio
         cache.values.emplace_back(value);
       }
     }
+    if (cache.values.empty()) {
+      if (!cache.missing_reference_reported) {
+        auto const* requirement =
+          "The source extension must provide a verifiable function definition.";
+#ifdef DUCKDB_BUILD_LOADABLE_EXTENSION
+        if (entry.function_name == "seq_scan" || entry.function_name == "parquet_scan" ||
+            entry.function_name == "read_parquet") {
+          requirement =
+            "Loadable Sirius requires the matching host DuckDB build to export "
+            "TableScanFunction::GetFunction and ParquetScanFunction::GetFunctionSet.";
+        }
+#endif
+        SIRIUS_LOG_WARN(
+          "GPU scan source '{}' has no trusted reference definition; GPU lowering "
+          "is disabled for this source. {}",
+          entry.function_name,
+          requirement);
+        cache.missing_reference_reported = true;
+      }
+      return nullptr;
+    }
     for (auto const& callbacks : cache.values) {
       if (!callbacks.matches(function)) continue;
       for (auto const& registered : catalog_entry->functions.functions) {
@@ -368,15 +390,14 @@ scan_source_entry const* lookup_scan_source(duckdb::TableFunction const& functio
   return nullptr;
 }
 
-scan_source_entry const* lookup_scan_source(duckdb::LogicalGet const& get,
-                                            duckdb::ClientContext& context)
+connector const* lookup_connector(duckdb::LogicalGet const& get, duckdb::ClientContext& context)
 {
-  return lookup_scan_source(get.function, get.bind_data.get(), context);
+  return lookup_connector(get.function, get.bind_data.get(), context);
 }
 
-scan_source_entry const* lookup_scan_source(duckdb::PhysicalTableScan const& get,
-                                            duckdb::ClientContext& context)
+connector const* lookup_connector(duckdb::PhysicalTableScan const& get,
+                                  duckdb::ClientContext& context)
 {
-  return lookup_scan_source(get.function, get.bind_data.get(), context);
+  return lookup_connector(get.function, get.bind_data.get(), context);
 }
 }  // namespace sirius::planner

@@ -74,7 +74,8 @@ class iceberg_metadata_connection {
       if (!context.TryGetCurrentSetting(setting, value) || value.IsNull()) { continue; }
       bool const outer_effective =
         value.DefaultCastAs(duckdb::LogicalType::BOOLEAN).GetValue<bool>();
-      _conn.Query(std::string("SET ") + setting + " = " + (outer_effective ? "true" : "false"));
+      _conn.Query(std::string("SET SESSION ") + setting + " = " +
+                  (outer_effective ? "true" : "false"));
     }
   }
 

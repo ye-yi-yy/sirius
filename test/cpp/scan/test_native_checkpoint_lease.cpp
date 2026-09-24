@@ -11,6 +11,7 @@
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/catalog/catalog_entry/schema_catalog_entry.hpp>
 #include <fcntl.h>
+#include <op/scan/iceberg_metadata_connection.hpp>
 #include <op/scan/iceberg_metadata_reader.hpp>
 #include <signal.h>
 #include <sirius_context.hpp>
@@ -93,9 +94,7 @@ void prepare_native_table(NativeLeaseFixture& fixture, bool sync_observer = true
   query_ok(*fixture.con, "SET sirius_test_inject_pin_registry_change = false");
   query_ok(*fixture.con, "SET sirius_test_mark_runtime_unavailable_before_window = false");
   query_ok(*fixture.con, "SET sirius_test_pause_native_after_prepare_ms = 0");
-  query_ok(*fixture.con, "SET sirius_test_pause_after_native_leaf_ms = 0");
   query_ok(*fixture.con, "SET sirius_test_pause_native_decode_ms = 0");
-  query_ok(*fixture.con, "SET sirius_test_pause_pin_after_prepare_ms = 0");
   if (sync_observer) { query_ok(*fixture.con, "SET sirius_test_sync_native_checkpoint = true"); }
   query_ok(*fixture.con, "SET sirius_test_sync_cpu_replay = false");
   query_ok(*fixture.con, "SET sirius_test_inject_checkpoint_cleanup_failure = false");
@@ -562,10 +561,6 @@ TEST_CASE("framework internal connections remain read-only while a native lease 
   REQUIRE_FALSE(selected->HasError());
   CHECK(selected->GetValue(0, 0).ToString() == "300000");
 
-  duckdb::SiriusContext::InternalQueryGuard attempted_write(*internal_outer->context);
-  CHECK_THROWS_AS(attempted_write.before_transaction_start(*con->context, false),
-                  duckdb::NotImplementedException);
-
   CHECK_THROWS_AS(internal.Query("UPDATE " + qualified + " SET i = i WHERE false"),
                   duckdb::InvalidInputException);
 
@@ -939,6 +934,37 @@ TEST_CASE("unwinding an unfinished window releases its native checkpoint lease",
   REQUIRE(checkpoint.wait_for(5s) == std::future_status::ready);
   CHECK(checkpoint.get().empty());
   query_ok(*con, "ROLLBACK");
+}
+
+TEST_CASE("Iceberg metadata settings do not change the database default",
+          "[scan][iceberg][integration]")
+{
+  if (sirius::test::run_isolated()) { return; }
+  NativeLeaseFixture fixture;
+  auto& con = fixture.con;
+  query_ok(*con, "LOAD iceberg");
+  auto setting_value = [](auto& connection) {
+    auto result = connection.Query("SELECT current_setting('unsafe_enable_version_guessing')");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+    return result->GetValue(0, 0).template GetValue<bool>();
+  };
+  for (bool global_value : {false, true}) {
+    CAPTURE(global_value);
+    query_ok(*con,
+             std::string("SET GLOBAL unsafe_enable_version_guessing = ") +
+               (global_value ? "true" : "false"));
+    query_ok(*con,
+             std::string("SET SESSION unsafe_enable_version_guessing = ") +
+               (global_value ? "false" : "true"));
+    duckdb::Connection sibling(*con->context->db);
+    sirius::op::scan::iceberg_metadata_connection internal(*con->context);
+    CHECK(setting_value(internal) == !global_value);
+    CHECK(setting_value(*con) == !global_value);
+    CHECK(setting_value(sibling) == global_value);
+    duckdb::Connection fresh(*con->context->db);
+    CHECK(setting_value(fresh) == global_value);
+  }
 }
 
 TEST_CASE("internal metadata queries cannot escape their read-only transaction",

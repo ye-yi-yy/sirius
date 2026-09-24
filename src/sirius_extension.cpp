@@ -71,8 +71,9 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
-#include "planner/scan_source_registry.hpp"
+#include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "transparent/plan_source_policy.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 
 #include <cudf/types.hpp>
@@ -86,7 +87,6 @@ extern "C" int cudaProfilerStop();
 #include <chrono>
 #include <filesystem>
 #include <fstream>
-#include <thread>
 // #include "from_substrait.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
 #include "gpu_buffer_manager.hpp"
@@ -329,9 +329,9 @@ TableFunction GetSiriusReadParquetFunction()
 
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
-  // Bind data carries ONLY re-executable input (the SQL template, schema and
-  // label). The physical plan, interface, connection and result are
-  // per-execution state (SiriusExecutionGlobalState): a plan built at bind time
+  // Bind data carries only re-executable input: the SQL template, schema,
+  // query label and bound source policy. The physical plan, interface, connection
+  // and result are per-execution state (SiriusExecutionGlobalState): a plan built at bind time
   // would cache pin-registry pointers that a later unpin invalidates, and a
   // bind-held result cannot serve a prepared statement's second execution.
   string query;
@@ -343,6 +343,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
   // queries there is no CPU fallback: run_internal_cpu_fallback_query detects the
   // s3:// read and raises a clear "S3 CPU fallback is not supported" error.
   string cpu_fallback_query;
+  // Bind-time discovery survives failures before execution can rebuild a plan.
+  // A missing plan must never grant permission to replay.
+  sirius::transparent::plan_source_policy source_policy{{}, false};
   bool enable_optimizer;
   // Schema captured at bind time; each execution rebuilds its
   // PreparedStatementData from these (parameterized execution is not
@@ -693,6 +696,9 @@ unique_ptr<FunctionData> SiriusRegistration::GPUExecutionBind(ClientContext& con
   Planner planner(context);
   planner.CreatePlan(std::move(parser.statements[0]));
   D_ASSERT(planner.plan);
+  if (planner.plan) {
+    result->source_policy = sirius::transparent::derive_plan_source_policy(*planner.plan, context);
+  }
 
   result->bind_names = planner.names;
   result->bind_types = planner.types;
@@ -821,6 +827,9 @@ void SiriusRegistration::GPUExecutionFunction(ClientContext& context,
       if (!duckdb_fallback_enabled(context)) {
         throw std::runtime_error("SiriusExecuteQuery error: " + gpu_error.RawMessage());
       }
+      // Check the bound sources before entering CPU replay. The helper below
+      // retains its existing SQL-text check as an additional S3 signal.
+      sirius::transparent::require_cpu_replay(data.source_policy, "", gpu_error.RawMessage());
       if (sirius_ctx) { sirius_ctx->before_cpu_replay_for_testing(context); }
       if (lease_release.state !=
             duckdb::SiriusContext::StandaloneQueryScope::lease_release_state::released &&
@@ -1413,11 +1422,6 @@ void SiriusRegistration::PinTableFunction(ClientContext& context,
       "pin_prepared",
       std::static_pointer_cast<sirius::op::scan::duckdb_native_gpu_ingestible>(ingestible)
         ->checkpoint_iteration());
-    Value pin_pause_ms;
-    if (context.TryGetCurrentSetting("sirius_test_pause_pin_after_prepare_ms", pin_pause_ms) &&
-        !pin_pause_ms.IsNull() && pin_pause_ms.GetValue<uint64_t>() > 0) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(pin_pause_ms.GetValue<uint64_t>()));
-    }
     duckdb_pin_checkpoint_iteration =
       std::static_pointer_cast<sirius::op::scan::duckdb_native_gpu_ingestible>(ingestible)
         ->checkpoint_iteration();
@@ -3318,12 +3322,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                     Value::UBIGINT(0));
   add_sirius_option(config,
                     option_visibility::internal,
-                    "sirius_test_pause_after_native_leaf_ms",
-                    "pause after lowering a native leaf while no checkpoint key is held",
-                    LogicalType::UBIGINT,
-                    Value::UBIGINT(0));
-  add_sirius_option(config,
-                    option_visibility::internal,
                     "sirius_test_pause_native_decode_ms",
                     "pause after native metadata preparation while its checkpoint key is held",
                     LogicalType::UBIGINT,
@@ -3358,12 +3356,6 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
                     "fail cleanup before scan-manager reset while checkpoint keys remain held",
                     LogicalType::BOOLEAN,
                     Value::BOOLEAN(false));
-  add_sirius_option(config,
-                    option_visibility::internal,
-                    "sirius_test_pause_pin_after_prepare_ms",
-                    "pause pin_table after its native walk while its checkpoint key is held",
-                    LogicalType::UBIGINT,
-                    Value::UBIGINT(0));
   add_sirius_option(config,
                     option_visibility::internal,
                     "sirius_test_mark_runtime_unavailable_before_window",

@@ -36,6 +36,8 @@
 #include "sirius/exception.hpp"
 #include "transparent/read_view_registry.hpp"
 
+#include <duckdb/common/types/blob.hpp>
+
 #include <algorithm>
 #include <functional>
 #include <sstream>
@@ -563,8 +565,8 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
           << (contract.predicates.pushdown_mode.empty() ? "none"
                                                         : contract.predicates.pushdown_mode)
           << " scan_cpu_replay="
-          << (contract.view && contract.view->replay_policy.cpu_replay_permitted ? "permitted"
-                                                                                 : "forbidden")
+          << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
+                                                                               : "forbidden")
           << " scan_replay_veto="
           << (contract.view ? (contract.view->replay_policy.reason.empty()
                                  ? "none"
@@ -619,8 +621,8 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
         << " profile=" << entry.eligibility.materializer.profile << " pushdown_mode="
         << (contract.predicates.pushdown_mode.empty() ? "none" : contract.predicates.pushdown_mode)
         << " scan_cpu_replay="
-        << (contract.view && contract.view->replay_policy.cpu_replay_permitted ? "permitted"
-                                                                               : "forbidden")
+        << (contract.view && contract.view->replay_policy.permits_cpu_replay ? "permitted"
+                                                                             : "forbidden")
         << " scan_replay_veto="
         << (contract.view
               ? (contract.view->replay_policy.reason.empty() ? "none"
@@ -633,7 +635,13 @@ void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_opera
         << " outputs=" << contract.output_types.size()
         << " columns=" << contract.columns.column_ids.size()
         << " projections=" << contract.columns.projection_ids.size()
-        << " rowid=" << contract.columns.requires_row_id << "\n";
+        << " rowid=" << contract.columns.requires_row_id;
+    if (contract.view && contract.view->selector_evidence_required) {
+      auto const& evidence = contract.view->logical_selector_evidence;
+      out << " selector_evidence=\""
+          << (evidence ? duckdb::Blob::ToString(duckdb::string_t(*evidence)) : "missing") << "\"";
+    }
+    out << "\n";
   }
 }
 
@@ -659,7 +667,7 @@ void dump_plan_replay_policy(std::ostringstream& out, pipeline_conversion_result
       return;
     }
     auto const& policy = registry->entry(id).contract.view->replay_policy;
-    if (policy.cpu_replay_permitted) return;
+    if (policy.permits_cpu_replay) return;
     s3 |= policy.source == transparent::byte_source_class::sirius_owned_s3;
     stream |= policy.source == transparent::byte_source_class::stream;
     incomplete |= policy.source != transparent::byte_source_class::sirius_owned_s3 &&

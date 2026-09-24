@@ -399,7 +399,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       }
 
       try {
-        require_cpu_replay(source_policy_, query_sql_, gpu_msg);
+        require_s3_cpu_replay(source_policy_, query_sql_, gpu_msg);
       } catch (std::runtime_error const& error) {
         throw duckdb::ExecutorException(error.what());
       }
@@ -413,6 +413,12 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           throw duckdb::ExecutorException("Sirius GPU execution failed: " + gpu_msg);
         }
         gpu_error.Throw("Sirius GPU execution failed: ");
+      }
+
+      try {
+        require_non_s3_cpu_replay(source_policy_, gpu_msg);
+      } catch (std::runtime_error const& error) {
+        throw duckdb::ExecutorException(error.what());
       }
 
       if (state.sirius_context) {

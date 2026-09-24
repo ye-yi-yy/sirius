@@ -411,6 +411,8 @@ class parquet_batch_coalescer : public batch_coalescer {
     split->partition_values        = _partition_values;
     split->set_contract_payload(_contract_id, std::move(_certificates), std::move(_dependencies));
     _slices.clear();
+    _certificates.clear();
+    _dependencies.clear();
     _acc_working_bytes = 0;
     _acc_run_count     = 0;
     _acc_rows          = 0;

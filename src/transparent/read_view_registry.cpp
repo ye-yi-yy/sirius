@@ -533,7 +533,7 @@ bound_table_scan const& contract_of(transparent::read_view_registry const& regis
   return registry.entry(contract_id).contract;
 }
 
-void validate_split_contract(scan_contract_id expected, scan_info const& split)
+void validate_split_for_gpu(scan_contract_id expected, scan_info const& split)
 {
   if (split.contract_id() != expected) {
     throw std::runtime_error("scan split contract mismatch: expected " + std::to_string(expected) +

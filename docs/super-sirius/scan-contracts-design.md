@@ -49,9 +49,21 @@ serialization callbacks, optimizer callbacks, and scan behavior flags.
 Presentation and profiling callbacks do not determine admission. A matching
 function name or bind-data type alone is insufficient.
 
-Native and Parquet definitions come from DuckDB's factories. In a loadable
-extension, Sirius resolves those factories from the host DuckDB module.
-Sirius-owned functions use the same factories as their registration.
+Native and Parquet definitions come from DuckDB's factories. Statically linked
+Sirius calls those factories directly. A loadable extension requires the matching
+DuckDB C++ ABI and host exports for `TableScanFunction::GetFunction` and
+`ParquetScanFunction::GetFunctionSet`. Sirius locates the host module through the
+system catalog's dynamic type and accepts factory symbols only from that module.
+Python's default `RTLD_LOCAL` import and `RTLD_GLOBAL` loading are both supported;
+global symbol visibility is not required. Sirius-owned functions use the same
+factories as their registration.
+
+A host that hides the required factory exports cannot supply trusted native or
+Parquet definitions. Sirius refuses GPU lowering for affected scans and logs a
+warning once per source for the lifetime of the loaded Sirius module. Local
+queries may use the original CPU plan when fallback and source policy permit it;
+disabling fallback reports the GPU planning error. Catalog contents never
+substitute for missing trusted factories.
 
 Iceberg's trusted definitions come from the already-loaded extension's registration
 entry point, run in a private CPU reference catalog. This initialization occurs
@@ -93,7 +105,8 @@ binding.
 Original captures retain available file sizes, modification times and tags from
 the bound inventory. Capture does not issue stat, HEAD or footer requests to fill
 missing evidence. These observations describe what was available at capture
-time; they do not participate in identity equality.
+time; they do not participate in identity equality. The tag evidence depth
+requires an ETag; a modification time alone does not establish it.
 
 GPU candidate capture uses the resolved paths already needed for lowering and
 does not allocate another file-evidence array. After a successful comparison,
@@ -164,7 +177,13 @@ key. During execution preparation, `sirius_scan_manager` acquires a shared
 checkpoint key for each database read by a native scan, then calls
 `ensure_metadata_prepared()`. Under that key, the ingestible records the checkpoint
 iteration, captures the row-group layout and publishes metadata readiness.
-Decode rechecks the iteration before staging bytes.
+The split-provider backstop can finish pending preparation only while that key
+is already held; it does not acquire a key itself.
+
+Native range splits carry the recorded iteration in `split_dependencies`, and
+decode rechecks it before staging bytes. Insert-delta splits carry no checkpoint
+iteration and skip that per-split recheck. They are protected by the pinned scan's
+shared checkpoint key and its prepare-time iteration check.
 
 The scan manager owns the keys alongside those used for pinned scans. They remain
 held for the execution window and are released by scan-manager reset after scan
@@ -174,9 +193,9 @@ between prepared executions hold no execution lease.
 Success, cancellation and execution errors all require window cleanup before CPU
 replay. Replay uses the completed window's captured release result: a released
 lease permits the remaining replay checks; a window that never started preserves
-the entry point's normal policy. Failure to begin or clean up an entered window
-prevents replay. Failed cleanup can retain keys until later cleanup or scan-manager
-destruction.
+the entry point's normal policy. Window initialization and cleanup failures
+propagate exceptions before replay can consult a release result. Failed cleanup
+can retain keys until later cleanup or scan-manager destruction.
 
 A non-forced `CHECKPOINT` on the same database fails while a shared key is held.
 `FORCE CHECKPOINT` waits for release and, while waiting, can also delay new
@@ -195,17 +214,17 @@ execution error. Prepared executions retry preparation independently.
 ### Internal metadata queries
 
 Iceberg metadata queries use `SiriusContext::open_internal_connection`. The wrapper
-installs `InternalQueryGuard` before starting a read-only transaction and accepts
-one SELECT or SET statement at a time. It prevents transaction-control escapes
-and recursive GPU admission.
+executes `BEGIN TRANSACTION READ ONLY` and verifies that the transaction remains
+active and read-only before each query. It accepts one SELECT or SET statement
+at a time, excluding writes, transaction control and multi-statement escapes.
 
-The internal transaction-start guard rejects a non-read-only start while the
-current execution window holds checkpoint keys. Planning metadata queries
-complete before native execution leases are acquired.
+`InternalQueryGuard` suppresses lifecycle callbacks and recursive GPU admission
+on that internal connection for its lifetime. Planning metadata queries complete
+before native execution leases are acquired.
 
 ## CPU replay policy
 
-Transparent execution derives replay permission across the whole original plan:
+CPU replay permission is derived from the bound scan sources across the whole plan:
 
 | Source or discovery result | Source permission |
 |---|---|
@@ -216,13 +235,33 @@ Transparent execution derives replay permission across the whole original plan:
 
 The policy inspects bound MultiFile paths even when a function is not registered
 for GPU lowering, so an S3 source hidden behind a view still vetoes replay.
-Unclassified sources retain the entry point's existing policy. SQL text provides
-an additional S3 signal when a complete bound plan is unavailable.
+Unclassified sources retain the entry point's default replay permission. SQL text
+provides an additional S3 signal.
 
-Source permission is only one condition for replay. The fallback setting, runtime
-health and completed-window cleanup must also permit it. The explicit
-`gpu_execution()` entry uses its SQL-text source policy and the same lease-release
-requirement; it does not use the transparent path's full bound-plan discovery.
+CPU replay requires source permission, enabled fallback and successful cleanup
+of any entered execution window. Cancellation, begin-window failure and cleanup
+failure prevent replay. A failure before a window is entered does not by itself
+prevent a source-permitted query from falling back.
+
+Transparent execution uses the policy captured from the original physical plan
+and replays the retained CPU plan. S3 vetoes are checked before the fallback
+setting. For other sources, disabled fallback or a missing CPU plan surfaces the
+GPU error before the source policy is checked. Planning and execution errors
+retain their respective prefixes and exception types, with INTERNAL/FATAL errors
+converted to ordinary query errors.
+
+The explicit `gpu_execution()` entry captures its policy from the bound logical
+plan and retains it with the SQL template. After a GPU failure, it checks the
+fallback setting, then the bound policy, before rerunning the SQL on its CPU
+connection. This also applies when execution-window entry fails. Missing or
+incomplete source discovery forbids replay. The fallback helper additionally
+checks the SQL text for S3 references.
+
+Both entry paths propagate interrupts before replay decisions. At execution,
+a typed runtime-unavailable error for a query containing a literal S3 reference
+is propagated without a source-policy wrapper; transparent execution also
+recognizes S3 through its bound policy. The CPU replay filesystem guard rejects
+indirect S3 access on the replay connection.
 
 ## Diagnostics
 
@@ -263,7 +302,7 @@ layout failures and rebuild activity.
 | Area | Entry points |
 |---|---|
 | Identity and evidence capture | [bound_read_view.hpp](../../src/op/scan/table_scan/bound_read_view.hpp), [bound_read_view.cpp](../../src/op/scan/table_scan/bound_read_view.cpp) |
-| Source verification and lowering | [scan_source_registry.cpp](../../src/planner/scan_source_registry.cpp), [sirius_plan_get.cpp](../../src/planner/sirius_plan_get.cpp) |
+| Source verification and lowering | [connector_registry.cpp](../../src/planner/connector_registry.cpp), [sirius_plan_get.cpp](../../src/planner/sirius_plan_get.cpp) |
 | Scan and split contracts | [scan_contract.hpp](../../src/op/scan/table_scan/scan_contract.hpp) |
 | Plan comparison and registry | [read_view_registry.cpp](../../src/transparent/read_view_registry.cpp) |
 | Replay policy and execution | [plan_source_policy.cpp](../../src/transparent/plan_source_policy.cpp), [physical_sirius_execution.cpp](../../src/transparent/physical_sirius_execution.cpp) |

@@ -16,7 +16,7 @@
 
 #include "transparent/plan_source_policy.hpp"
 
-#include "planner/scan_source_registry.hpp"
+#include "planner/connector_registry.hpp"
 #include "sirius_sql_rewrite.hpp"
 
 #include <duckdb/common/exception.hpp>
@@ -32,7 +32,7 @@ namespace sirius::transparent {
 bool plan_source_policy::cpu_replay_permitted() const noexcept
 {
   return discovery_complete && std::all_of(scans.begin(), scans.end(), [](auto const& scan) {
-           return scan.cpu_replay_permitted;
+           return scan.permits_cpu_replay;
          });
 }
 bool plan_source_policy::reads_sirius_owned_s3() const noexcept
@@ -44,7 +44,7 @@ bool plan_source_policy::reads_sirius_owned_s3() const noexcept
 std::string plan_source_policy::reason() const
 {
   for (auto const& scan : scans) {
-    if (!scan.cpu_replay_permitted) return scan.function_name + ": " + scan.reason;
+    if (!scan.permits_cpu_replay) return scan.function_name + ": " + scan.reason;
   }
   return discovery_complete ? "" : "source discovery incomplete";
 }
@@ -55,25 +55,25 @@ scan_source_policy classify(duckdb::TableFunction const& function,
                             duckdb::ClientContext& context)
 {
   scan_source_policy result{function.name, byte_source_class::unclassified, true, ""};
-  auto const* entry = planner::lookup_scan_source(function, bind, context);
+  auto const* entry = planner::lookup_connector(function, bind, context);
   if (entry) {
-    result.source               = entry->byte_source;
-    result.cpu_replay_permitted = entry->cpu_replay_permitted;
+    result.source             = entry->byte_source;
+    result.permits_cpu_replay = entry->permits_cpu_replay;
     if (result.source == byte_source_class::stream) result.reason = "stream source has no CPU body";
     if (result.source == byte_source_class::sirius_owned_s3)
       result.reason = "S3 CPU fallback is not supported";
   }
   if (auto const* files = dynamic_cast<duckdb::MultiFileBindData const*>(bind)) {
     if (!files->file_list) throw std::runtime_error("Missing bound file list");
-    result.source               = byte_source_class::local_file;
-    result.cpu_replay_permitted = true;
+    result.source             = byte_source_class::local_file;
+    result.permits_cpu_replay = true;
     for (auto const& file : files->file_list->Files()) {
       auto const& path = file.path;
       if (path.size() > 5 && (path[0] == 's' || path[0] == 'S') && path[1] == '3' &&
           path[2] == ':' && path[3] == '/' && path[4] == '/') {
-        result.source               = byte_source_class::sirius_owned_s3;
-        result.cpu_replay_permitted = false;
-        result.reason               = "S3 CPU fallback is not supported";
+        result.source             = byte_source_class::sirius_owned_s3;
+        result.permits_cpu_replay = false;
+        result.reason             = "S3 CPU fallback is not supported";
         break;
       }
     }
@@ -151,9 +151,9 @@ plan_source_policy derive_plan_source_policy(duckdb::LogicalOperator const& plan
   return derive(plan, context);
 }
 
-void require_cpu_replay(plan_source_policy const& policy,
-                        std::string const& sql,
-                        std::string const& gpu_error)
+void require_s3_cpu_replay(plan_source_policy const& policy,
+                           std::string const& sql,
+                           std::string const& gpu_error)
 {
   if (policy.reads_sirius_owned_s3() || sirius::references_sirius_owned_s3_parquet(sql)) {
     throw std::runtime_error(
@@ -161,6 +161,18 @@ void require_cpu_replay(plan_source_policy const& policy,
       "Sirius has no CPU fallback for S3 data sources. Underlying GPU error: " +
       gpu_error);
   }
+}
+
+void require_cpu_replay(plan_source_policy const& policy,
+                        std::string const& sql,
+                        std::string const& gpu_error)
+{
+  require_s3_cpu_replay(policy, sql, gpu_error);
+  require_non_s3_cpu_replay(policy, gpu_error);
+}
+
+void require_non_s3_cpu_replay(plan_source_policy const& policy, std::string const& gpu_error)
+{
   if (!policy.cpu_replay_permitted()) {
     throw std::runtime_error("CPU fallback is not supported: " + policy.reason() +
                              ". Underlying GPU error: " + gpu_error);

@@ -21,11 +21,12 @@
 #include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
 #include "pipeline/sirius_pipeline_converter.hpp"
-#include "planner/scan_source_registry.hpp"
+#include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_extension.hpp"
 #include "transparent/read_view_registry.hpp"
 #include "utils/child_process_environment.hpp"
+#include "utils/log_test_utils.hpp"
 #include "utils/parquet_fixture_utils.hpp"
 #include "utils/pipeline_conversion_test_utils.hpp"
 #include "utils/sirius_test_env.hpp"
@@ -254,7 +255,7 @@ TEST_CASE("Read-view path encoding preserves the length-delimited bytes", "[scan
   }
 }
 
-TEST_CASE("Read-view identity changes with bound schema and options", "[scan][contracts]")
+TEST_CASE("Read-view identity changes with bound schema", "[scan][contracts]")
 {
   auto base = file_view({"a"});
   REQUIRE(canonical_read_view_text(base) !=
@@ -262,9 +263,6 @@ TEST_CASE("Read-view identity changes with bound schema and options", "[scan][co
   REQUIRE(
     canonical_read_view_text(base) !=
     canonical_read_view_text(file_view({"a"}, "", {duckdb::LogicalType::INTEGER}, {"renamed"})));
-  for (auto const* option : {"hive_partitioning", "union_by_name", "filename"}) {
-    REQUIRE(canonical_read_view_text(base) != canonical_read_view_text(file_view({"a"}, option)));
-  }
 }
 
 TEST_CASE("Parquet identity includes bound explicit cardinality but not optimizer estimates",
@@ -385,6 +383,29 @@ TEST_CASE("Parquet captures preserve sorted evidence and independent inventories
         make_bound_read_identity(*duplicate.identity, paths)->fingerprint);
   CHECK_FALSE(duplicate.identity->fingerprint == previous.identity->fingerprint);
 
+  // Modification times are retained evidence, but do not establish tag availability.
+  for (bool has_size : {false, true}) {
+    CAPTURE(has_size);
+    duckdb::OpenFileInfo file("timestamp.parquet");
+    file.extended_info = duckdb::make_shared_ptr<duckdb::ExtendedOpenFileInfo>();
+    auto& options      = file.extended_info->options;
+    if (has_size) { options["file_size"] = duckdb::Value::BIGINT(100); }
+    bind.file_list = duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(
+      duckdb::vector<duckdb::OpenFileInfo>{file});
+    auto const without_timestamp = capture_bound_read_view(get, *con.context);
+
+    options["last_modified"]  = duckdb::Value::TIMESTAMP(duckdb::timestamp_t(200));
+    auto const with_timestamp = capture_bound_read_view(get, *con.context);
+    REQUIRE(with_timestamp.evidence);
+    CHECK(with_timestamp.evidence->last_modified == std::vector<int64_t>{200});
+    CHECK(with_timestamp.evidence->last_modified_present == std::vector<uint8_t>{1});
+    CHECK(with_timestamp.evidence->etag == std::vector<std::string>{""});
+    CHECK(with_timestamp.depth ==
+          (has_size ? evidence_depth::path_and_size : evidence_depth::path));
+    CHECK(with_timestamp.depth == without_timestamp.depth);
+    CHECK(with_timestamp.identity->fingerprint == without_timestamp.identity->fingerprint);
+  }
+
   bind.file_list =
     duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(duckdb::vector<duckdb::OpenFileInfo>{});
   auto empty = capture_bound_read_view(get, *con.context);
@@ -392,12 +413,12 @@ TEST_CASE("Parquet captures preserve sorted evidence and independent inventories
   CHECK(empty.metrics.sort_index_capacity == 0);
   CHECK(empty.evidence->size.empty());
   CHECK(empty.identity->fingerprint == make_bound_read_identity(*empty.identity, {})->fingerprint);
-  CHECK(empty.replay_policy.cpu_replay_permitted);
+  CHECK(empty.replay_policy.permits_cpu_replay);
   bind.file_list =
     duckdb::make_shared_ptr<duckdb::SimpleMultiFileList>(duckdb::vector<duckdb::OpenFileInfo>{
       duckdb::OpenFileInfo("local.parquet"), duckdb::OpenFileInfo("S3://bucket/hidden.parquet")});
   auto remote = capture_bound_read_view(get, *con.context);
-  CHECK_FALSE(remote.replay_policy.cpu_replay_permitted);
+  CHECK_FALSE(remote.replay_policy.permits_cpu_replay);
   CHECK(remote.replay_policy.reason == "s3");
   CHECK(remote.replay_policy.source == sirius::transparent::byte_source_class::sirius_owned_s3);
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
@@ -432,10 +453,10 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
   auto native      = con.ExtractPlan("SELECT * FROM r1_registry_native");
   auto& native_get = first_get(*native);
-  REQUIRE(sirius::planner::lookup_scan_source(native_get, *con.context));
+  REQUIRE(sirius::planner::lookup_connector(native_get, *con.context));
 
   std::set<std::string> names;
-  for (auto const& entry : sirius::planner::registered_scan_sources())
+  for (auto const& entry : sirius::planner::registered_connectors())
     names.insert(entry.function_name);
   REQUIRE(names == std::set<std::string>{"seq_scan",
                                          "parquet_scan",
@@ -459,25 +480,25 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
         bind = duckdb::make_uniq<duckdb::MultiFileBindData>();
       }
       duckdb::LogicalGet get(1, function, std::move(bind), {}, {});
-      REQUIRE(sirius::planner::lookup_scan_source(get, *con.context));
+      REQUIRE(sirius::planner::lookup_connector(get, *con.context));
       get.function.function = fake_scan;
-      REQUIRE_FALSE(sirius::planner::lookup_scan_source(get, *con.context));
+      REQUIRE_FALSE(sirius::planner::lookup_connector(get, *con.context));
       get.function      = function;
       get.function.bind = fake_bind;
-      REQUIRE_FALSE(sirius::planner::lookup_scan_source(get, *con.context));
+      REQUIRE_FALSE(sirius::planner::lookup_connector(get, *con.context));
       get.function                       = function;
       get.function.get_multi_file_reader = fake_reader;
-      REQUIRE_FALSE(sirius::planner::lookup_scan_source(get, *con.context));
+      REQUIRE_FALSE(sirius::planner::lookup_connector(get, *con.context));
       get.function           = function;
       get.function.arguments = {duckdb::LogicalType::BLOB, duckdb::LogicalType::BLOB};
-      REQUIRE_FALSE(sirius::planner::lookup_scan_source(get, *con.context));
+      REQUIRE_FALSE(sirius::planner::lookup_connector(get, *con.context));
       get.function = function;
       get.bind_data.reset();
-      REQUIRE_FALSE(sirius::planner::lookup_scan_source(get, *con.context));
+      REQUIRE_FALSE(sirius::planner::lookup_connector(get, *con.context));
     }
   }
   native_get.function.name = "r1_unknown_scan";
-  REQUIRE_FALSE(sirius::planner::lookup_scan_source(native_get, *con.context));
+  REQUIRE_FALSE(sirius::planner::lookup_connector(native_get, *con.context));
   registry_test_generator generator(*con.context);
   REQUIRE_THROWS_WITH(
     generator.create_plan(native_get),
@@ -486,23 +507,58 @@ TEST_CASE("Scan registry verifies all six catalog functions", "[scan][contracts]
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
-TEST_CASE("Scan consumption fields do not alter read identity", "[scan][contracts]")
+TEST_CASE("Scan consumption fields do not alter read identity", "[scan][contracts][shared_context]")
 {
-  bound_table_scan a;
-  a.view                   = std::make_shared<bound_read_view>(file_view({"one.parquet"}));
-  auto b                   = a;
-  a.scan_node_id           = 10;
-  b.scan_node_id           = 11;
-  a.output_types           = {duckdb::LogicalType::INTEGER};
-  b.output_types           = {duckdb::LogicalType::BIGINT};
-  a.columns.column_ids     = {duckdb::ColumnIndex(0)};
-  b.columns.column_ids     = {duckdb::ColumnIndex(1)};
-  a.columns.projection_ids = {0};
-  b.columns.projection_ids = {1};
-  a.predicates.static_filter_fingerprint = "id > 5";
-  b.predicates.static_filter_fingerprint = "id < 10";
-  REQUIRE(canonical_read_view_text(*a.view) == canonical_read_view_text(*b.view));
-  REQUIRE(a.view->identity->fingerprint.hash == b.view->identity->fingerprint.hash);
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  auto const parquet =
+    std::string(SIRIUS_PROJECT_ROOT) + "/test/cpp/integration/data/parquet/nation.parquet";
+  auto first =
+    con.ExtractPlan("SELECT n_name FROM read_parquet('" + parquet + "') WHERE n_nationkey > 5");
+  auto second = con.ExtractPlan("SELECT n_regionkey FROM read_parquet('" + parquet +
+                                "') WHERE n_nationkey < 10");
+  auto& a     = first_get(*first);
+  auto& b     = first_get(*second);
+  REQUIRE(a.GetColumnIds() != b.GetColumnIds());
+  REQUIRE(a.types != b.types);
+  REQUIRE_FALSE(a.table_filters.filters.empty());
+  REQUIRE_FALSE(b.table_filters.filters.empty());
+  REQUIRE(a.table_filters.filters.begin()->second->DebugToString() !=
+          b.table_filters.filters.begin()->second->DebugToString());
+  auto const first_view  = capture_bound_read_view(a, *con.context);
+  auto const second_view = capture_bound_read_view(b, *con.context);
+  REQUIRE(first_view.identity != second_view.identity);
+  CHECK(canonical_read_view_text(first_view) == canonical_read_view_text(second_view));
+  CHECK(first_view.identity->fingerprint == second_view.identity->fingerprint);
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+}
+
+TEST_CASE("Parquet identity captures bound file options", "[scan][contracts][shared_context]")
+{
+  REQUIRE(sirius::test::g_shared_env);
+  auto con = sirius::test::g_shared_env->make_connection();
+  REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
+  sirius::test::scratch_dir files("bound_options");
+  auto const directory = files.path() / "part=one";
+  std::filesystem::create_directories(directory);
+  auto const path = sirius::test::sql_literal((directory / "data.parquet").string());
+  REQUIRE_FALSE(con.Query("COPY (SELECT 1 AS id) TO " + path + " (FORMAT PARQUET)")->HasError());
+  REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+  for (auto const* option : {"hive_partitioning", "union_by_name", "filename"}) {
+    CAPTURE(option);
+    auto capture = [&](bool enabled) {
+      auto plan = con.ExtractPlan("SELECT * FROM read_parquet(" + path + ", " + option + "=" +
+                                  (enabled ? "true" : "false") + ")");
+      return capture_bound_read_view(first_get(*plan), *con.context);
+    };
+    auto const disabled = capture(false);
+    auto const enabled  = capture(true);
+    REQUIRE(disabled.identity != enabled.identity);
+    CHECK(canonical_read_view_text(disabled) != canonical_read_view_text(enabled));
+  }
+  REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
 TEST_CASE("Logical scan copy retains table index and verified source",
@@ -520,7 +576,7 @@ TEST_CASE("Logical scan copy retains table index and verified source",
   auto copy        = get.Copy(*con.context);
   auto& copied_get = copy->Cast<duckdb::LogicalGet>();
   REQUIRE(copied_get.table_index == get.table_index);
-  REQUIRE(sirius::planner::lookup_scan_source(copied_get, *con.context));
+  REQUIRE(sirius::planner::lookup_connector(copied_get, *con.context));
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
@@ -586,7 +642,7 @@ TEST_CASE("Physical stream lowering records its window without file checks",
   CHECK(contract_entry.window_id == 42);
   CHECK(contract_entry.finalize_generation == 0);
   CHECK(contract_entry.eligibility.later_checks.empty());
-  CHECK_FALSE(contract_entry.contract.view->replay_policy.cpu_replay_permitted);
+  CHECK_FALSE(contract_entry.contract.view->replay_policy.permits_cpu_replay);
   CHECK(contract_entry.contract.view->replay_policy.reason == "stream");
   sirius::pipeline::pipeline_build_context build_context(nullptr);
   auto pipeline = std::make_shared<sirius::pipeline::sirius_pipeline>(build_context);
@@ -621,21 +677,20 @@ TEST_CASE("Dropping and recreating a native table changes read identity",
   auto con = sirius::test::g_shared_env->make_connection();
   REQUIRE_FALSE(con.Query("SET gpu_execution=false")->HasError());
   auto identity = [&] {
-    auto plan  = con.ExtractPlan("SELECT * FROM r1_recreated_native");
-    auto& bind = first_get(*plan).bind_data->Cast<duckdb::TableScanBindData>();
-    bound_read_identity value;
-    value.source = {"seq_scan", source_kind::duckdb_native, "duckdb.seq_scan.v1"};
-    value.data_view =
-      native_table_identity{"memory", 1, "main", "r1_recreated_native", bind.table.oid, ""};
-    value.bound_types = {duckdb::LogicalType::INTEGER};
-    value.bound_names = {"id"};
-    return make_bound_read_identity(std::move(value), {})->fingerprint;
+    REQUIRE_FALSE(con.Query("BEGIN")->HasError());
+    auto plan = con.ExtractPlan("SELECT * FROM r1_recreated_native");
+    auto view = capture_bound_read_view(first_get(*plan), *con.context);
+    REQUIRE_FALSE(con.Query("COMMIT")->HasError());
+    return view;
   };
   REQUIRE_FALSE(con.Query("CREATE TEMP TABLE r1_recreated_native(id INTEGER)")->HasError());
   auto before = identity();
   REQUIRE_FALSE(con.Query("DROP TABLE r1_recreated_native")->HasError());
   REQUIRE_FALSE(con.Query("CREATE TEMP TABLE r1_recreated_native(id INTEGER)")->HasError());
-  REQUIRE_FALSE(before == identity());
+  auto after = identity();
+  CHECK(std::get<native_table_identity>(before.identity->data_view).table_oid !=
+        std::get<native_table_identity>(after.identity->data_view).table_oid);
+  CHECK_FALSE(before.identity->fingerprint == after.identity->fingerprint);
 }
 
 TEST_CASE("Scan registry rejects registered replacements before or after first lookup",
@@ -798,11 +853,12 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
     load_iceberg();
   if (unavailable) *info->install_info = saved;
 
+  sirius::test::scoped_recording_log_sink logs;
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
   duckdb::MultiFileBindData bind;
   if (!dynamic) {
     marker("BEGIN first_lookup");
-    auto const* rejected = sirius::planner::lookup_scan_source(replacement, &bind, *con.context);
+    auto const* rejected = sirius::planner::lookup_connector(replacement, &bind, *con.context);
     marker("END first_lookup");
     CHECK_FALSE(rejected);
   }
@@ -816,12 +872,22 @@ TEST_CASE("Iceberg trust bootstrap load order child", "[.][registry_trust_child]
     for (auto const& function : loader.GetTableFunction("iceberg_scan").functions.functions) {
       if (function.function == fake_scan) continue;
       marker("BEGIN genuine_lookup");
-      auto const* trusted = sirius::planner::lookup_scan_source(function, &bind, *con.context);
+      auto const* trusted = sirius::planner::lookup_connector(function, &bind, *con.context);
       marker("END genuine_lookup");
       CHECK(static_cast<bool>(trusted) == (!unavailable && !disabled));
     }
   }
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
+  if (!dynamic) {
+    auto const records  = logs.records();
+    auto const warnings = std::count_if(records.begin(), records.end(), [](auto const& record) {
+      return record.level == sirius::log::level::warn &&
+             record.message.find(
+               "GPU scan source 'iceberg_scan' has no trusted reference definition") !=
+               std::string::npos;
+    });
+    CHECK(warnings == (unavailable || disabled ? 1 : 0));
+  }
   if (unavailable || disabled) return;
 
   // Exercise the actual loaded Sirius module too: its private cache differs from the
@@ -898,7 +964,7 @@ TEST_CASE("Scan registry rejects replacement before Sirius load child", "[.][reg
   }
   REQUIRE_FALSE(con.Query("BEGIN")->HasError());
   duckdb::MultiFileBindData bind;
-  CHECK_FALSE(sirius::planner::lookup_scan_source(replacement, &bind, *con.context));
+  CHECK_FALSE(sirius::planner::lookup_connector(replacement, &bind, *con.context));
   auto plan =
     con.ExtractPlan("SELECT * FROM read_parquet(" + files.file_literal("input.parquet") + ")");
   auto& get = first_get(*plan);
@@ -917,7 +983,7 @@ TEST_CASE("Scan registry rejects replacement before Sirius load child", "[.][reg
   duckdb::CreateTableFunctionInfo restore(original);
   restore.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
   loader.RegisterFunction(std::move(restore));
-  CHECK(sirius::planner::lookup_scan_source(original, &bind, *con.context));
+  CHECK(sirius::planner::lookup_connector(original, &bind, *con.context));
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
 }
 
@@ -935,7 +1001,7 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
   auto native       = con.ExtractPlan("SELECT * FROM r1_replacement_native");
   replacement_table = &first_get(*native).bind_data->Cast<duckdb::TableScanBindData>().table;
   duckdb::ExtensionLoader loader(*con.context->db, "registry_replacement_test");
-  for (auto const& source : sirius::planner::registered_scan_sources()) {
+  for (auto const& source : sirius::planner::registered_connectors()) {
     INFO(source.function_name);
     auto& catalog = duckdb::Catalog::GetSystemCatalog(*con.context);
     auto original = catalog
@@ -952,7 +1018,7 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
     else
       bind = duckdb::make_uniq<duckdb::MultiFileBindData>();
     if (std::string_view(phase).starts_with("warm"))
-      REQUIRE(sirius::planner::lookup_scan_source(original, bind.get(), *con.context));
+      REQUIRE(sirius::planner::lookup_connector(original, bind.get(), *con.context));
     if (std::string_view(phase).ends_with("_same") ||
         std::string_view(phase).find("init_") != std::string_view::npos ||
         std::string_view(phase).ends_with("serialize")) {
@@ -966,8 +1032,8 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
                             *con.context, DEFAULT_SCHEMA, source.function_name)
                           .functions.functions.front();
       require_registered_callbacks(registered, replacement);
-      CHECK_FALSE(sirius::planner::lookup_scan_source(registered, bind.get(), *con.context));
-      CHECK_FALSE(sirius::planner::lookup_scan_source(original, bind.get(), *con.context));
+      CHECK_FALSE(sirius::planner::lookup_connector(registered, bind.get(), *con.context));
+      CHECK_FALSE(sirius::planner::lookup_connector(original, bind.get(), *con.context));
       duckdb::CreateTableFunctionInfo restore(original);
       restore.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
       loader.RegisterFunction(std::move(restore));
@@ -979,12 +1045,12 @@ TEST_CASE("Scan registry first lookup child", "[.][registry_trust_child][shared_
       auto& get = first_get(*plan);
       REQUIRE(get.function.function == fake_scan);
       REQUIRE(source.bind_data_matches(get.bind_data.get()));
-      CHECK_FALSE(sirius::planner::lookup_scan_source(get, *con.context));
+      CHECK_FALSE(sirius::planner::lookup_connector(get, *con.context));
       registry_test_generator generator(*con.context);
       CHECK_THROWS_WITH(generator.create_plan(get),
                         Catch::Matchers::Contains("unverified callbacks"));
     }
-    CHECK(sirius::planner::lookup_scan_source(original, bind.get(), *con.context));
+    CHECK(sirius::planner::lookup_connector(original, bind.get(), *con.context));
   }
   REQUIRE_FALSE(con.Query("ROLLBACK")->HasError());
   replacement_table = nullptr;

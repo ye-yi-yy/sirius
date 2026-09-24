@@ -45,7 +45,7 @@
 #include "op/scan/iceberg_metadata_connection.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
-#include "planner/scan_source_registry.hpp"
+#include "planner/connector_registry.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -643,7 +643,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   auto column_ids = op.GetColumnIds();
 
-  auto const* source = lookup_scan_source(op, context);
+  auto const* source = lookup_connector(op, context);
   if (!source) {
     throw duckdb::NotImplementedException(
       "Table function '%s' is not supported in Sirius (unverified callbacks, overload or bind "

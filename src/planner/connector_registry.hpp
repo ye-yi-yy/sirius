@@ -52,7 +52,7 @@ struct provider_profile {
   std::string isolation_rule_id;
 };
 
-struct scan_source_entry {
+struct connector {
   std::string function_name;
   op::scan::source_kind kind;
   std::string registry_profile;
@@ -60,19 +60,18 @@ struct scan_source_entry {
   scan_lowering lower;
   op::scan::dynamic_filter_apply_mode filter_mode;
   transparent::byte_source_class byte_source;
-  bool cpu_replay_permitted;
+  bool permits_cpu_replay;
   bool selector_outside_bind_data;
   std::optional<std::string> (*decline_reason)(duckdb::LogicalGet&, duckdb::ClientContext&);
   std::optional<provider_profile> provider;
 };
 
-scan_source_entry const* lookup_scan_source(duckdb::LogicalGet const&, duckdb::ClientContext&);
-scan_source_entry const* lookup_scan_source(duckdb::PhysicalTableScan const&,
-                                            duckdb::ClientContext&);
-scan_source_entry const* lookup_scan_source(duckdb::TableFunction const&,
-                                            duckdb::FunctionData const*,
-                                            duckdb::ClientContext&);
-std::span<scan_source_entry const> registered_scan_sources();
+connector const* lookup_connector(duckdb::LogicalGet const&, duckdb::ClientContext&);
+connector const* lookup_connector(duckdb::PhysicalTableScan const&, duckdb::ClientContext&);
+connector const* lookup_connector(duckdb::TableFunction const&,
+                                  duckdb::FunctionData const*,
+                                  duckdb::ClientContext&);
+std::span<connector const> registered_connectors();
 
 // Register at Sirius load; bootstrap Iceberg trust during extension loading, never in lookup.
 void register_scan_source_callbacks(duckdb::DatabaseInstance&);

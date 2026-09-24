@@ -66,7 +66,7 @@
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_union.hpp"
-#include "planner/scan_source_registry.hpp"
+#include "planner/connector_registry.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
@@ -79,9 +79,7 @@
 #include <duckdb/common/serializer/memory_stream.hpp>
 
 #include <atomic>
-#include <chrono>
 #include <numeric>
-#include <thread>
 #include <utility>
 
 namespace sirius::planner {
@@ -468,7 +466,7 @@ void wrap_table_scan_source(
   // GPU_SCAN normalization requires one target per output column. Reject an incomplete schema
   // while transparent execution can still fall back to DuckDB.
   require_complete_native_scan_schema(scan);
-  auto const* entry = lookup_scan_source(scan.function, scan.bind_data.get(), context);
+  auto const* entry = lookup_connector(scan.function, scan.bind_data.get(), context);
   if (!entry || !entry->lower) {
     throw duckdb::NotImplementedException(
       "Table function '%s' is not supported in Sirius (unverified scan source)", fn);
@@ -1031,14 +1029,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> lower_native_scan(
                                  mode,
                                  sirius_ctx.get());
   if (sirius_ctx) { sirius_ctx->observe_native_checkpoint_for_testing(context, "native_leaf"); }
-  // TEST-ONLY c7 seam: the native leaf exists, but execution preparation has not started and
-  // therefore no checkpoint key may exist. A later Iceberg leaf can still open its internal
-  // read-only metadata connection without forming a FORCE CHECKPOINT wait cycle.
-  duckdb::Value pause_ms;
-  if (context.TryGetCurrentSetting("sirius_test_pause_after_native_leaf_ms", pause_ms) &&
-      !pause_ms.IsNull() && pause_ms.GetValue<uint64_t>() > 0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms.GetValue<uint64_t>()));
-  }
   return leaf;
 }
 

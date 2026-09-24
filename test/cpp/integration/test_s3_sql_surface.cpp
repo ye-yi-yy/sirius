@@ -4576,3 +4576,42 @@ TEST_CASE("never-entered native and S3 windows preserve the runtime-unavailable 
     fs::remove(path);
   }
 }
+
+TEST_CASE("Explicit replay rejects S3 behind a view before CPU replay starts",
+          "[s3][integration][sql][gpu_execution][fallback][explicit_replay]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  if (sirius::test::run_isolated()) return;
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con,
+                   "CREATE VIEW explicit_remote_view AS SELECT n_nationkey FROM " +
+                     s3_parquet_scan(*env, "nation"));
+  require_query_ok(fixture.con, "SET enable_duckdb_fallback = true");
+  require_query_ok(fixture.con, "SET sirius_test_sync_cpu_replay = true");
+  auto context                         = sirius::test::get_registered_sirius_context(fixture.con);
+  unsigned replays                     = 0;
+  context->cpu_replay_hook_for_testing = [&] { ++replays; };
+  struct reset_hook {
+    duckdb::SiriusContext& context;
+    ~reset_hook() { context.cpu_replay_hook_for_testing = {}; }
+  } reset{*context};
+
+  auto const query =
+    "SELECT n_nationkey, row_number() OVER (ORDER BY n_nationkey) "
+    "FROM explicit_remote_view";
+  SECTION("plan generation fails") {}
+  SECTION("window entry fails")
+  {
+    require_query_ok(fixture.con, "SET sirius_test_mark_runtime_unavailable_before_window = true");
+  }
+  auto result = fixture.con.Query(gpu_execution_sql(query));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+  INFO(result->GetError());
+  CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+  CHECK(result->GetError().find("Underlying GPU error:") != std::string::npos);
+  CHECK(replays == 0);
+  CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
+}

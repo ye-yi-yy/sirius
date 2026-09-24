@@ -958,6 +958,14 @@ if source == "native":
 con.execute(f"LOAD {sql_literal(extension)}")
 con.execute("SET gpu_execution = true")
 con.execute("SET enable_duckdb_fallback = false")
+# Check fresh scans before pinning, so cached inputs cannot hide host scan verification failures.
+for query, expected in [
+    ("SELECT sum(c_custkey) FROM customer WHERE c_custkey >= 3", [(33,)]),
+    ("SELECT sum(o_orderkey) FROM orders WHERE o_custkey < 3", [(696,)]),
+]:
+    actual = con.execute(query).fetchall()
+    if actual != expected:
+        raise AssertionError((query, actual, expected))
 for name, path, cols in [("customer", customer_path, "['c_custkey']"),
                          ("orders", orders_path, "['o_custkey','o_orderkey','o_comment']")]:
     source_arg = sql_literal(path) if source == "parquet" else "format='duckdb'"
@@ -1061,6 +1069,7 @@ con.close()
   }
 
   INFO("dynamic-load Sirius logs:\n" << log_text);
+  CHECK(log_text.find("has no trusted reference definition") == std::string::npos);
   REQUIRE(fusion_lines.size() >= 2);
   bool saw_count_column = false;
   bool saw_count_star   = false;

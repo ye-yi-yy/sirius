@@ -79,6 +79,8 @@ struct read_view_registry_entry {
   uint64_t finalize_generation = 0;
 };
 
+// Planning and finalize, including execution rebuilds, complete mutations before dispatch.
+// Dispatcher threads only read published entries; mutation must not overlap those reads.
 class read_view_registry {
  public:
   [[nodiscard]] read_view_registry_entry const& entry(op::scan::scan_contract_id id) const;

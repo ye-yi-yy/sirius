@@ -77,6 +77,12 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     auto* scan_info = dynamic_cast<duckdb_native_scan_info*>(info.get());
     if (scan_info == nullptr) { return emitted; }
 
+    if (scan_info->certificates().size() != scan_info->row_groups.size() ||
+        scan_info->dependencies().size() != scan_info->row_groups.size()) {
+      throw std::invalid_argument(
+        "native split requires one certificate and dependency per row group");
+    }
+
     if (!_have_template) {
       _datasource    = scan_info->datasource;
       _block_manager = scan_info->block_manager;
@@ -112,10 +118,8 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
         }
       }
       _acc.push_back(std::move(rg));
-      if (certificate_position < scan_info->certificates().size()) {
-        _certificates.push_back(scan_info->certificates()[certificate_position]);
-        _dependencies.push_back(scan_info->dependencies()[certificate_position]);
-      }
+      _certificates.push_back(scan_info->certificates()[certificate_position]);
+      _dependencies.push_back(scan_info->dependencies()[certificate_position]);
     }
     return emitted;
   }
@@ -148,6 +152,8 @@ class duckdb_native_batch_coalescer : public batch_coalescer {
     split->block_manager = _block_manager;
     split->set_contract_payload(_contract_id, std::move(_certificates), std::move(_dependencies));
     _acc.clear();
+    _certificates.clear();
+    _dependencies.clear();
     _acc_bytes = 0;
     std::fill(_col_bytes.begin(), _col_bytes.end(), 0);
     _produced_any = true;

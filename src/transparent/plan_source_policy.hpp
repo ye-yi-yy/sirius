@@ -35,8 +35,8 @@ enum class byte_source_class : uint8_t {
 };
 struct scan_source_policy {
   std::string function_name;
-  byte_source_class source  = byte_source_class::unclassified;
-  bool cpu_replay_permitted = true;
+  byte_source_class source = byte_source_class::unclassified;
+  bool permits_cpu_replay  = true;
   std::string reason;
 };
 struct plan_source_policy {
@@ -50,6 +50,12 @@ plan_source_policy derive_plan_source_policy(duckdb::PhysicalOperator const&,
                                              duckdb::ClientContext&);
 plan_source_policy derive_plan_source_policy(duckdb::LogicalOperator const&,
                                              duckdb::ClientContext&);
+// The existing S3 veto precedes the fallback setting; other source vetoes do not.
+void require_s3_cpu_replay(plan_source_policy const&,
+                           std::string const& sql,
+                           std::string const& gpu_error);
+// Check remaining source vetoes after require_s3_cpu_replay has succeeded.
+void require_non_s3_cpu_replay(plan_source_policy const&, std::string const& gpu_error);
 void require_cpu_replay(plan_source_policy const&,
                         std::string const& sql,
                         std::string const& gpu_error);

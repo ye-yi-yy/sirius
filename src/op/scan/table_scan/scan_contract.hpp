@@ -94,5 +94,5 @@ scan_contract_id allocate_scan_contract(
   duckdb::vector<duckdb::LogicalType> output_types = {},
   duckdb::idx_t table_index                        = duckdb::DConstants::INVALID_INDEX);
 bound_table_scan const& contract_of(transparent::read_view_registry const&, scan_contract_id);
-void validate_split_contract(scan_contract_id expected, scan_info const& split);
+void validate_split_for_gpu(scan_contract_id expected, scan_info const& split);
 }  // namespace sirius::op::scan
