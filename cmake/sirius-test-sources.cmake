@@ -1,5 +1,7 @@
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/scan/test_native_physical_matrix.cpp
+    test/cpp/scan/test_parquet_physical_profile.cpp
     test/cpp/scan/test_scan_planning_measurements.cpp
     test/cpp/scan/test_native_checkpoint_lease.cpp
     test/cpp/transparent/test_read_view_comparison.cpp

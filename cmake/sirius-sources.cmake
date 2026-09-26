@@ -103,6 +103,7 @@ set(EXTENSION_SOURCES
     src/op/scan/owning_table_view.cpp
     src/op/scan/parquet_batch_layout.cpp
     src/op/scan/parquet_schema_mapping.cpp
+    src/op/scan/table_scan/parquet_physical_profile.cpp
     src/op/scan/scan_plan.cpp
     src/op/scan/scan_filter_analysis.cpp
     src/op/scan/scan_utils.cpp

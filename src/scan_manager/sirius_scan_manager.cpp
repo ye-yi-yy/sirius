@@ -1394,7 +1394,9 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
     }
   }
   if (!file_metadata) {
-    auto footer_buffer         = cudf::io::parquet::fetch_footer_to_host(*datasource);
+    auto footer_buffer = op::scan::fetch_plaintext_parquet_footer(*datasource, 0, uri);
+    auto encryption =
+      op::scan::inspect_parquet_encryption({footer_buffer->data(), footer_buffer->size()});
     auto const footer_byte_len = footer_buffer->size();
     auto reader_options        = cudf::io::parquet_reader_options::builder().build();
     cudf::io::parquet::experimental::hybrid_scan_reader reader{
@@ -1403,7 +1405,7 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
     file_metadata =
       std::make_shared<cudf::io::parquet::FileMetaData const>(reader.parquet_metadata());
     [[maybe_unused]] auto const stored = datasource->store_metadata(
-      std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len));
+      std::make_shared<op::scan::parquet_metadata>(file_metadata, footer_byte_len, encryption));
   }
 
   auto schema = sirius::io::parquet_helpers::extract_schema(*file_metadata);
@@ -1422,6 +1424,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
 {
   _pruning_enabled = enable_pinned_zone_map_pruning;
   reset();
+  _query_token = sirius::value_of(query.query_id());
 
   if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
@@ -1516,6 +1519,19 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   _checkpoint_locks.reserve(_checkpoint_locks.size() + _pending_mvcc_mask_jobs.size());
   for (auto const& request : _pending_mvcc_mask_jobs) {
     acquire_checkpoint_key(request.storage->GetAttached());
+  }
+
+  for (auto& request : _pending_insert_delta_jobs) {
+    auto const* database = &request.storage->GetAttached();
+    auto held            = std::ranges::find_if(_checkpoint_locks, [&](auto const& entry) {
+      return entry.database == database && entry.key;
+    });
+    if (held == _checkpoint_locks.end())
+      throw std::logic_error("insert-delta capture requires the query checkpoint key");
+    request.checkpoint_witness =
+      op::scan::key_held_witness{held->database,
+                                 request.storage->GetAttached().GetStorageManager().GetDBPath(),
+                                 held->query_token};
   }
 
   // A manual CHECKPOINT can replace DuckDB's on-disk base while the pinned
@@ -1734,7 +1750,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     } else if (late_mat.port != nullptr) {
       installed_rides.push_back(installed_ride{late_mat.port, assignment.op});
     }
-    auto provider = make_provider_for_pinned_entry(*assignment.entry,
+    auto provider                 = make_provider_for_pinned_entry(*assignment.entry,
                                                    assignment.columns,
                                                    std::move(assignment.plan),
                                                    assignment.op->batch_telemetry(),
@@ -1744,6 +1760,19 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
                                                    assignment.op->has_physical_overrides(),
                                                    std::move(pushdown_req),
                                                    std::move(dynamic_filters));
+    provider->contract_id         = assignment.op->contract_id();
+    provider->validation.identity = assignment.entry->identity_evidence;
+    provider->validation.layout   = assignment.entry->layout_evidence;
+    bool const native_pin = dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(
+                              &assignment.op->get_ingestible().table_info()) != nullptr;
+    bool const native_validated = native_pin && assignment.entry->mvcc != nullptr;
+    // Reached only after the applicable checkpoint/MVCC jobs and the provider's
+    // structure check. An absent native MVCC witness is unpassed, not inapplicable.
+    // Never write these query-dependent checks onto the shared pin.
+    provider->validation.iteration   = {native_pin, native_validated};
+    provider->validation.visibility  = {native_pin, native_validated};
+    provider->validation.structure   = {true, true};
+    provider->validation.query_token = _query_token;
     _metadata_processor->use_cached_entries_for_pipeline(assignment.op, std::move(provider));
   }
   install_rider_deferrals(rider_candidates, installed_rides);
@@ -1922,7 +1951,7 @@ void sirius_scan_manager::reset()
 void sirius_scan_manager::acquire_checkpoint_key(duckdb::AttachedDatabase& database)
 {
   _checkpoint_locks.push_back(checkpoint_lock_entry{
-    &database, duckdb::DuckTransactionManager::Get(database).SharedCheckpointLock()});
+    &database, duckdb::DuckTransactionManager::Get(database).SharedCheckpointLock(), _query_token});
   _checkpoint_lock_count.store(_checkpoint_locks.size(), std::memory_order_release);
 }
 
@@ -2326,6 +2355,14 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
           stored.push_back(column_names[i]);
         }
       }
+      std::vector<std::size_t> evidence_columns(entry.cache_info.column_ids.size());
+      std::iota(evidence_columns.begin(), evidence_columns.end(), 0);
+      try {
+        validate_pinned_entry_for_serving(entry, evidence_columns);
+        entry.layout_evidence = {true, true};
+      } catch (std::exception const&) {
+        entry.layout_evidence = {true, false};
+      }
       return stored;
     }
     // Row count or completeness contract differs → drop the stale entry and rebuild below.
@@ -2359,6 +2396,15 @@ std::vector<std::string> sirius_scan_manager::insert_pinned_entry(
   // handle would still resolve, and its pointer would address the map node now
   // holding different data.
   retire_late_mat_handle(name);
+  entry.identity_evidence = {true, true};
+  std::vector<std::size_t> evidence_columns(entry.cache_info.column_ids.size());
+  std::iota(evidence_columns.begin(), evidence_columns.end(), 0);
+  try {
+    validate_pinned_entry_for_serving(entry, evidence_columns);
+    entry.layout_evidence = {true, true};
+  } catch (std::exception const&) {
+    entry.layout_evidence = {true, false};
+  }
   _pinned_entries[name] = std::move(entry);
   publish_late_mat_handle(name);
   // The replace path stored every column.
@@ -2465,6 +2511,15 @@ void sirius_scan_manager::insert_pinned_entry_host(
   // handle would still resolve, and its pointer would address the map node now
   // holding different data.
   retire_late_mat_handle(name);
+  entry.identity_evidence = {true, true};
+  std::vector<std::size_t> evidence_columns(entry.cache_info.column_ids.size());
+  std::iota(evidence_columns.begin(), evidence_columns.end(), 0);
+  try {
+    validate_pinned_entry_for_serving(entry, evidence_columns);
+    entry.layout_evidence = {true, true};
+  } catch (std::exception const&) {
+    entry.layout_evidence = {true, false};
+  }
   _pinned_entries[name] = std::move(entry);
   publish_late_mat_handle(name);
 }
@@ -2523,6 +2578,15 @@ void sirius_scan_manager::insert_pinned_entry_device(
   // handle would still resolve, and its pointer would address the map node now
   // holding different data.
   retire_late_mat_handle(name);
+  entry.identity_evidence = {true, true};
+  std::vector<std::size_t> evidence_columns(entry.cache_info.column_ids.size());
+  std::iota(evidence_columns.begin(), evidence_columns.end(), 0);
+  try {
+    validate_pinned_entry_for_serving(entry, evidence_columns);
+    entry.layout_evidence = {true, true};
+  } catch (std::exception const&) {
+    entry.layout_evidence = {true, false};
+  }
   _pinned_entries[name] = std::move(entry);
   publish_late_mat_handle(name);
 }
@@ -3095,11 +3159,15 @@ std::optional<sirius_scan_manager::cached_assignment> sirius_scan_manager::try_m
           [&](insert_delta_job_request const& r) { return r.entry_name == pinned_name; });
         if (delta_request == _pending_insert_delta_jobs.end()) {
           insert_delta_job_request request;
-          request.storage                = duckdb_info->storage;
-          request.context                = duckdb_info->context;
-          request.n_cache                = entry.mvcc->n_cache();
-          request.approximate_batch_size = duckdb_info->approximate_batch_size;
-          request.entry_name             = pinned_name;
+          request.storage                  = duckdb_info->storage;
+          request.context                  = duckdb_info->context;
+          request.n_cache                  = entry.mvcc->n_cache();
+          request.approximate_batch_size   = duckdb_info->approximate_batch_size;
+          request.entry_name               = pinned_name;
+          request.first_consuming_contract = op->contract_id();
+          request.profiles                 = duckdb_info->profiles;
+          request.storage_version =
+            duckdb_info->storage->GetAttached().GetStorageManager().GetStorageVersion();
           _pending_insert_delta_jobs.push_back(std::move(request));
           delta_request = std::prev(_pending_insert_delta_jobs.end());
         }
