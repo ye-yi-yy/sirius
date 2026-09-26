@@ -47,6 +47,7 @@
 #include "planner/late_mat_plan_pass.hpp"
 #include "planner/query.hpp"
 #include "scan_manager/round_robin_strategy.hpp"
+#include "sirius_context.hpp"
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/io/datasource.hpp>
@@ -86,6 +87,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -1440,7 +1442,39 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     }
     // This scan reads disk, so it needs any walk the ingestible deferred. Must run here on the
     // query thread: GetPartitionStats touches ClientContext/LocalStorage.
-    op->get_ingestible().ensure_metadata_prepared();
+    auto* native = dynamic_cast<op::scan::duckdb_native_gpu_ingestible*>(&op->get_ingestible());
+    if (native) { acquire_checkpoint_key(native->attached_database()); }
+    auto pause_native_with_key_for_testing = [&] {
+      if (!native) { return; }
+      auto const& native_info =
+        static_cast<op::scan::duckdb_native_ingestible_table_info const&>(native->table_info());
+      auto state =
+        native_info.context->registered_state
+          ? native_info.context->registered_state->Get<duckdb::SiriusContext>("sirius_state")
+          : nullptr;
+      if (state && state->native_checkpoint_hook_for_testing) {
+        bool const pending = native->metadata_walk_pending();
+        state->observe_native_checkpoint_for_testing(
+          *native_info.context,
+          pending ? "native_walk_failed" : "native_prepared",
+          pending ? 0 : native->checkpoint_iteration());
+      }
+      duckdb::Value pause_ms;
+      if (native_info.context->TryGetCurrentSetting("sirius_test_pause_native_decode_ms",
+                                                    pause_ms) &&
+          !pause_ms.IsNull() && pause_ms.GetValue<uint64_t>() > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms.GetValue<uint64_t>()));
+      }
+    };
+    try {
+      op->get_ingestible().ensure_metadata_prepared();
+    } catch (...) {
+      // The c10 viability-error route must expose the same bounded held-key window as a
+      // successful prepare, so FORCE CHECKPOINT can be proven waiting before cleanup/replay.
+      pause_native_with_key_for_testing();
+      throw;
+    }
+    if (native) { pause_native_with_key_for_testing(); }
     auto provider = std::make_unique<split_provider>(
       op->get_ingestible(), [this](std::string_view file_path) -> std::shared_ptr<io::ioctx> {
         auto io_ctx = ioctx_for_path(file_path);
@@ -1460,10 +1494,9 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
     return;
   }
 
-  _checkpoint_locks.reserve(_pending_mvcc_mask_jobs.size());
+  _checkpoint_locks.reserve(_checkpoint_locks.size() + _pending_mvcc_mask_jobs.size());
   for (auto const& request : _pending_mvcc_mask_jobs) {
-    _checkpoint_locks.push_back(
-      duckdb::DuckTransactionManager::Get(request.storage->GetAttached()).SharedCheckpointLock());
+    acquire_checkpoint_key(request.storage->GetAttached());
   }
 
   // A manual CHECKPOINT can replace DuckDB's on-disk base while the pinned
@@ -1604,7 +1637,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
         delta_splits = cut_delta_splits_for_op(*delta_request,
                                                duckdb_info->projected_cols,
                                                io_ctx->open_datasource(duckdb_info->db_path),
-                                               sf_bm);
+                                               sf_bm,
+                                               assignment.op->contract_id());
         SIRIUS_LOG_INFO(
           "[sirius_scan_manager] operator '{}' serves {} insert-delta split(s) of pinned entry "
           "'{}' ({} delta row(s))",
@@ -1862,7 +1896,28 @@ void sirius_scan_manager::reset()
   _pending_insert_delta_jobs.clear();
   _metadata_processor.reset();
   _checkpoint_locks.clear();
+  _checkpoint_lock_count.store(0, std::memory_order_release);
   _dispatcher = std::make_unique<exec::scoped_dispatcher>(_thread_pool, _thread_pool.num_threads());
+}
+
+void sirius_scan_manager::acquire_checkpoint_key(duckdb::AttachedDatabase& database)
+{
+  _checkpoint_locks.push_back(checkpoint_lock_entry{
+    &database, duckdb::DuckTransactionManager::Get(database).SharedCheckpointLock()});
+  _checkpoint_lock_count.store(_checkpoint_locks.size(), std::memory_order_release);
+}
+
+bool sirius_scan_manager::holds_checkpoint_key(
+  duckdb::AttachedDatabase const& database) const noexcept
+{
+  return std::any_of(_checkpoint_locks.begin(), _checkpoint_locks.end(), [&](auto const& entry) {
+    return entry.database == &database;
+  });
+}
+
+bool sirius_scan_manager::holds_any_checkpoint_key() const noexcept
+{
+  return _checkpoint_lock_count.load(std::memory_order_acquire) != 0;
 }
 
 void sirius_scan_manager::start() {}

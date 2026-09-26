@@ -1,5 +1,9 @@
 # cmake-format: off
 set(EXTENSION_SOURCES
+    src/transparent/read_view_registry.cpp
+    src/transparent/plan_source_policy.cpp
+    src/planner/connector_registry.cpp
+    src/op/scan/table_scan/bound_read_view.cpp
     src/compression/compressed_representation.cpp
     src/compression/compressed_scan.cpp
     src/compression/compression_converters.cpp

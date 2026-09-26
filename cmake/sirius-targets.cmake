@@ -68,6 +68,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
     ${_target}
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/core_functions/include
             ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/parquet/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/parquet
+            ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/thrift
             ${SIRIUS_SUBSTRAIT_DIR}/src/include
             ${SIRIUS_SUBSTRAIT_DIR}/third_party
             ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
