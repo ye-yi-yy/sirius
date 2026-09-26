@@ -47,6 +47,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iomanip>
 #include <memory>
 #include <mutex>
@@ -4635,4 +4636,70 @@ TEST_CASE("R2a S3 semantic verdict keeps the source replay veto",
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
   CHECK(after.scan_lowerings == before.scan_lowerings);
   CHECK(after.window_tasks_started == before.window_tasks_started);
+}
+
+TEST_CASE("S3 late physical refusal follows a published GPU batch and never replays",
+          "[s3][integration][transparent][late_failure]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+  s3_sql_fixture fixture(*env);
+  sirius::test::scratch_dir directory("s3_late_physical");
+  set_gpu_execution(fixture.con, false);
+  require_query_ok(fixture.con,
+                   "COPY (SELECT i::INTEGER x FROM range(4096) t(i)) TO " +
+                     directory.file_literal("a.parquet") +
+                     " (FORMAT PARQUET, ROW_GROUP_SIZE 2048)");
+  require_query_ok(fixture.con,
+                   "COPY (SELECT x::DOUBLE x FROM (VALUES (1.2),(2.0)) t(x)) TO " +
+                     directory.file_literal("b.parquet") + " (FORMAT PARQUET)");
+  for (auto file : {"a.parquet", "b.parquet"}) {
+    if (!sirius::test::put_s3_container_object(std::string("r2a-late/") + file,
+                                               read_binary_file(directory.path() / file))) {
+      SUCCEED("managed MinIO is required to upload the late-failure fixture");
+      return;
+    }
+  }
+  set_gpu_execution(fixture.con, true);
+  require_query_ok(fixture.con, "SET scan_task_batch_size=1");
+  require_query_ok(fixture.con, "SET sirius_test_hold_footer_index=2");
+  auto& context = require_sirius_context(fixture);
+  auto sql      = "SELECT sum(x) FROM " + s3_parquet_glob_scan(*env, "r2a-late/*.parquet");
+  // The explicit SQL rewriter accepts a single S3 URI, not a glob. The view
+  // preserves this same two-file bound scan without rewriting the glob as an object key.
+  require_query_ok(fixture.con,
+                   "CREATE VIEW late_s3_input AS SELECT * FROM " +
+                     s3_parquet_glob_scan(*env, "r2a-late/*.parquet"));
+  for (bool explicit_entry : {false, true}) {
+    auto before = context.get_transparent_execution_stats();
+    std::promise<void> footer_started;
+    auto started = footer_started.get_future();
+    std::atomic<bool> notified{false};
+    auto counters                       = context.physical_counters();
+    counters->parquet_phase_for_testing = [&](std::string const&, bool footer) {
+      if (footer && !notified.exchange(true)) footer_started.set_value();
+    };
+    auto pending   = std::async(std::launch::async, [&] {
+      return fixture.con.Query(
+        explicit_entry ? "CALL gpu_execution('SELECT sum(x) FROM late_s3_input')" : sql);
+    });
+    auto ready     = started.wait_for(std::chrono::seconds(20)) == std::future_status::ready;
+    auto published = ready && context.get_scan_manager().wait_for_publication_for_testing(
+                                std::chrono::seconds(20));
+    context.get_scan_manager().release_footer_hold_for_testing(2);
+    auto result                         = pending.get();
+    counters->parquet_phase_for_testing = {};
+    INFO("explicit=" << explicit_entry);
+    if (result->HasError()) UNSCOPED_INFO(result->GetError());
+    REQUIRE(ready);
+    REQUIRE(published);
+    REQUIRE(result->HasError());
+    CHECK(result->GetError().find("S3 CPU fallback is not supported") != std::string::npos);
+    auto after = context.get_transparent_execution_stats();
+    auto cause = static_cast<size_t>(sirius::transparent::late_failure_cause::physical_input);
+    CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+    CHECK(after.late_replays == before.late_replays);
+    CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
+    CHECK(after.lease_held_at_replay == before.lease_held_at_replay);
+  }
 }

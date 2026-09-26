@@ -25,6 +25,7 @@
 #include "late_mat/column_origin.hpp"
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "pin_table.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "scan_manager/config.hpp"
 #include "scan_manager/duckdb_mvcc_metadata.hpp"
 #include "scan_manager/insert_delta_job.hpp"
@@ -484,7 +485,18 @@ class sirius_scan_manager {
   ///        distributed round-robin across this subset instead of all GPUs.
   void prepare_for_query(const sirius::planner::query& query,
                          bool enable_pinned_zone_map_pruning,
-                         const std::vector<int>& allocated_gpu_ids);
+                         const std::vector<int>& allocated_gpu_ids,
+                         std::shared_ptr<pipeline::completion_handler> completion = nullptr);
+  void release_footer_hold_for_testing(uint64_t file_number)
+  {
+    if (auto completion = _execution_completion.load())
+      completion->release_footer_for_testing(file_number);
+  }
+  bool wait_for_publication_for_testing(std::chrono::milliseconds timeout)
+  {
+    auto completion = _execution_completion.load();
+    return completion && completion->wait_for_publication_for_testing(timeout);
+  }
 
   /// \brief Clear the providers map and join the driver thread if it is
   ///        still running.
@@ -854,6 +866,7 @@ class sirius_scan_manager {
     duckdb::unique_ptr<duckdb::StorageLockKey> key;
     uint64_t query_token = 0;
   };
+  std::atomic<std::shared_ptr<pipeline::completion_handler>> _execution_completion;
   uint64_t _query_token = 0;
   std::vector<checkpoint_lock_entry> _checkpoint_locks;
   std::atomic<std::size_t> _checkpoint_lock_count{0};

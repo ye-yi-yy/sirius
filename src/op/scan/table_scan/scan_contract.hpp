@@ -379,12 +379,12 @@ struct test_injections {
   bool fail_on_host_staging_refusal  = false;
   uint64_t gpu_task_oom              = 0;
   uint64_t gpu_task_launch_error     = 0;
-  uint64_t gpu_task_retry_limit      = 0;
-  uint64_t gpu_task_retry_backoff_ms = 0;
-  bool override_read_only            = false;
-  bool transaction_mismatch          = false;
-  bool interrupt_before_replay       = false;
-  bool non_rollbackable_state        = false;
+  uint64_t gpu_task_retry_limit      = 100;
+  uint64_t gpu_task_retry_backoff_ms = 50;
+  std::optional<bool> override_read_only;
+  bool transaction_mismatch    = false;
+  bool interrupt_before_replay = false;
+  bool non_rollbackable_state  = false;
 };
 
 struct column_requirements {

@@ -228,6 +228,9 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   auto after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks + 1);
   CHECK(after.certificate_incompletes == before.certificate_incompletes + 1);
+  auto const cause = static_cast<size_t>(sirius::transparent::late_failure_cause::certificate);
+  CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+  CHECK(after.late_replays[cause] == before.late_replays[cause] + 1);
   CHECK(after.certificate_mismatches == before.certificate_mismatches);
   run_ok("SET enable_duckdb_fallback=false");
   before = sirius::test::get_transparent_execution_stats(*con);
@@ -238,6 +241,8 @@ TEST_CASE_METHOD(sirius::test::GpuExecutionFixture,
   after = sirius::test::get_transparent_execution_stats(*con);
   CHECK(after.runtime_fallbacks == before.runtime_fallbacks);
   CHECK(after.certificate_incompletes == before.certificate_incompletes + 1);
+  CHECK(after.late_failures[cause] == before.late_failures[cause] + 1);
+  CHECK(after.late_replays[cause] == before.late_replays[cause]);
   run_ok("SET enable_duckdb_fallback=true");
   run_ok("SET sirius_test_invalidate_pin_witness=false");
   compare_gpu_vs_cpu("SELECT x FROM admission_pin");

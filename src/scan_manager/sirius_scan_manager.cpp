@@ -1418,13 +1418,16 @@ parquet_bind_result sirius_scan_manager::describe_parquet(std::string const& uri
   return result;
 }
 
-void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
-                                            bool enable_pinned_zone_map_pruning,
-                                            const std::vector<int>& allocated_gpu_ids)
+void sirius_scan_manager::prepare_for_query(
+  const sirius::planner::query& query,
+  bool enable_pinned_zone_map_pruning,
+  const std::vector<int>& allocated_gpu_ids,
+  std::shared_ptr<pipeline::completion_handler> completion)
 {
   _pruning_enabled = enable_pinned_zone_map_pruning;
   reset();
   _query_token = sirius::value_of(query.query_id());
+  _execution_completion.store(completion);
 
   if (_io_ctx && _io_ctx->cache()) {
     SIRIUS_LOG_INFO("[sirius_scan_manager] cache summary: {}", _io_ctx->cache()->summary());
@@ -1543,11 +1546,12 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       &request.storage->GetAttached().GetStorageManager().GetBlockManager());
     if (block_manager == nullptr ||
         block_manager->GetCheckpointIteration() != request.metadata.checkpoint_iteration) {
-      throw std::runtime_error(
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::checkpoint_revalidation,
         "Sirius cannot safely scan pinned DuckDB table '" + request.entry_name +
-        "': its database was checkpointed after pin_table, so the pinned cache may be stale. "
-        "Run CALL unpin_table('" +
-        request.entry_name + "'), then pin_table again");
+          "': its database was checkpointed after pin_table, so the pinned cache may be stale. "
+          "Run CALL unpin_table('" +
+          request.entry_name + "'), then pin_table again");
     }
   }
 
@@ -1793,6 +1797,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
       }
     }
     op->set_query_validation(_query_token, std::move(expected_key));
+    op->get_ingestible().set_execution_completion(completion);
   }
   start_metadata_processing();
 }
@@ -1948,6 +1953,9 @@ std::shared_ptr<sirius::io::ioctx> sirius_scan_manager::ioctx_for_path(std::stri
 
 void sirius_scan_manager::reset()
 {
+  if (auto completion = _execution_completion.exchange(nullptr);
+      completion && completion->injections)
+    completion->release_footer_for_testing(completion->injections->hold_footer_index);
   // Stop the prefetcher first: it holds shared_ptrs to the operators'
   // connectors and must not convert batches while per-query state is torn down.
   _prefetcher.reset();

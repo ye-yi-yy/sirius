@@ -22,6 +22,7 @@
 #include "op/scan/parquet_gpu_ingestible.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "planner/connector_registry.hpp"
+#include "transparent/replay_admission.hpp"
 
 #include <duckdb/storage/single_file_block_manager.hpp>
 
@@ -630,14 +631,17 @@ void validate_split_for_gpu(scan_contract_id expected,
 {
   // Preserve R1's handle mismatch and its precedence.
   if (split.contract_id() != expected) {
-    throw std::runtime_error("scan split contract mismatch: expected " + std::to_string(expected) +
-                             ", got " + std::to_string(split.contract_id()));
+    throw transparent::classified_execution_error(transparent::late_failure_cause::certificate,
+                                                  "scan split contract mismatch: expected " +
+                                                    std::to_string(expected) + ", got " +
+                                                    std::to_string(split.contract_id()));
   }
   for (auto const& certificate : split.certificates()) {
     if (certificate.contract_id != expected) {
-      throw std::runtime_error("scan split certificate contract mismatch: expected " +
-                               std::to_string(expected) + ", got " +
-                               std::to_string(certificate.contract_id));
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::certificate,
+        "scan split certificate contract mismatch: expected " + std::to_string(expected) +
+          ", got " + std::to_string(certificate.contract_id));
     }
   }
   auto fail = [&](std::string text, later_check_set missing = {}) {

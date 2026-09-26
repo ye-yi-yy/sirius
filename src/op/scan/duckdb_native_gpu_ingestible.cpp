@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "transparent/replay_admission.hpp"
+
 // sirius
 #include "op/scan/owning_table_view.hpp"
 
@@ -296,7 +298,8 @@ void duckdb_native_gpu_ingestible::run_metadata_walk()
       }
     } catch (...) {
     }
-    throw std::runtime_error(
+    throw transparent::classified_execution_error(
+      transparent::late_failure_cause::checkpoint_revalidation,
       "duckdb-native checkpoint iteration changed during metadata preparation");
   }
   if (!bind.injections.synthetic_native_segment.empty()) {
@@ -464,7 +467,8 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
         }
       } catch (...) {
       }
-      throw std::runtime_error(
+      throw transparent::classified_execution_error(
+        transparent::late_failure_cause::checkpoint_revalidation,
         "duckdb-native checkpoint iteration changed before metadata materialization");
     }
   }

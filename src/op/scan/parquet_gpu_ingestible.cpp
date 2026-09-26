@@ -781,7 +781,16 @@ std::function<std::unique_ptr<op::scan::scan_info>()> parquet_gpu_ingestible::ne
   auto io_ctx = resolve(file_path);
   return [this, file_path, idx, evidence_index, io_ctx = std::move(io_ctx)]()
            -> std::unique_ptr<scan_info> {
-    return build_file_scan_info(file_path, idx, evidence_index, io_ctx);
+    try {
+      return build_file_scan_info(file_path, idx, evidence_index, io_ctx);
+    } catch (unsupported_physical_input const&) {
+      throw;
+    } catch (transparent::classified_execution_error const&) {
+      throw;
+    } catch (std::exception const& error) {
+      throw transparent::classified_execution_error(transparent::late_failure_cause::reader_io,
+                                                    error.what());
+    }
   };
 }
 
@@ -794,6 +803,10 @@ std::unique_ptr<scan_info> parquet_gpu_ingestible::build_file_scan_info(
   std::size_t evidence_index,
   std::shared_ptr<io::ioctx> const& io_ctx)
 {
+  if (_execution_completion && _execution_completion->injections &&
+      _execution_completion->injections->hold_footer_index == file_index + 1) {
+    _execution_completion->hold_footer_for_testing(file_index + 1);
+  }
   auto stream = cudf::get_default_stream();
   if (_info->profiles->counters) _info->profiles->counters->parquet_phase(file_path, true);
 
