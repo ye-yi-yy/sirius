@@ -129,6 +129,7 @@ class duckdb_native_scan_info : public op::scan::scan_info {
   /// stats-backed only): the split stages no file reads and may carry a null
   /// datasource.
   bool host_backed_only = false;
+  bool is_insert_delta  = false;
 
   /// On-disk byte ranges this unit reads, derived from @ref row_groups so they always match the row
   /// groups currently held. The scan sequencer fadvises these to prefetch.

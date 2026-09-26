@@ -18,7 +18,10 @@
 
 #include "exec/try.hpp"
 #include "log/logging.hpp"
+#include "op/scan/duckdb_native_gpu_ingestible.hpp"
 #include "op/scan/sirius_gpu_scan_operator_data.hpp"
+#include "sirius_context.hpp"
+#include "transparent/read_view_registry.hpp"
 
 #include <stop_token>
 #include <utility>
@@ -56,6 +59,7 @@ void load_balancing_scan_batch_coalescer::use_cached_entries_for_pipeline(
   // op's row filter (when present) runs against every drained split — record
   // that so each split's working-set estimate covers the filter-by-copy peak.
   state.row_filter_pending = scan_op->get_ingestible().has_row_filter();
+  state.scan_op            = scan_op;
   state.attach_batch_provider(std::move(provider));
 }
 
@@ -165,19 +169,54 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
                                                                  std::stop_token const& stop)
 {
-  drain_cached_provider(*state.batch_provider, *state.connector, stop, state.row_filter_pending);
+  auto* op = state.scan_op;
+  drain_cached_provider(*state.batch_provider,
+                        *state.connector,
+                        stop,
+                        state.row_filter_pending,
+                        op->contract_id(),
+                        op->query_token(),
+                        op->certificate_observer(),
+                        op->read_views() && op->read_views()->injections.invalidate_pin_witness,
+                        dynamic_cast<op::scan::duckdb_native_ingestible_table_info const*>(
+                          &op->get_ingestible().table_info()) != nullptr);
 }
 
 void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provider& provider,
                                                                 split_connector& connector,
                                                                 std::stop_token const& stop,
-                                                                bool row_filter_pending)
+                                                                bool row_filter_pending,
+                                                                op::scan::scan_contract_id expected,
+                                                                uint64_t query_token,
+                                                                duckdb::SiriusContext* observer,
+                                                                bool invalidate_witness,
+                                                                bool native_pin)
 {
   try {
     while (!stop.stop_requested()) {
       auto next = provider.get_next_batch();
       if (next.data) {
+        // Nothing has published this batch yet: even the memory prefetcher
+        // must only see batches that passed admission for this operator/query.
+        auto validation = provider.validation;
+        if (invalidate_witness) validation.query_token ^= 1;
+        try {
+          if (provider.contract_id != expected)
+            throw std::runtime_error("resident scan contract mismatch");
+          if (native_pin && (!validation.iteration.applies || !validation.visibility.applies))
+            throw op::scan::certificate_incomplete(
+              expected, {}, "resident native applicability missing");
+          op::scan::admit_resident_batch(expected, validation, query_token);
+        } catch (op::scan::certificate_incomplete const&) {
+          if (observer) observer->record_transparent_certificate_incomplete();
+          throw;
+        } catch (...) {
+          if (observer) observer->record_transparent_certificate_mismatch();
+          throw;
+        }
         auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.data));
+        split->resident_contract_id         = expected;
+        split->resident_validation          = validation;
         split->mvcc_keep_mask               = std::move(next.mvcc_keep_mask);
         split->needs_carrier_conversion     = next.needs_carrier_conversion;
         split->conversion_destination_bytes = next.conversion_destination_bytes;

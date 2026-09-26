@@ -133,6 +133,7 @@ class load_balancing_scan_batch_coalescer {
     /// batches; stamped onto each drained split so its working-set estimate
     /// covers the filter-by-copy peak.
     bool row_filter_pending{false};
+    op::scan::sirius_gpu_scan_operator* scan_op = nullptr;
   };
 
   load_balancing_scan_batch_coalescer()                                           = default;
@@ -165,7 +166,12 @@ class load_balancing_scan_batch_coalescer {
   static void drain_cached_provider(databatch_provider& provider,
                                     split_connector& connector,
                                     std::stop_token const& stop,
-                                    bool row_filter_pending);
+                                    bool row_filter_pending,
+                                    op::scan::scan_contract_id expected = 0,
+                                    uint64_t query_token                = 0,
+                                    duckdb::SiriusContext* observer     = nullptr,
+                                    bool invalidate_witness             = false,
+                                    bool native_pin                     = false);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when

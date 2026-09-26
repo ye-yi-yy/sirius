@@ -1779,6 +1779,21 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query,
   _pending_mvcc_mask_jobs.clear();
   _pending_insert_delta_jobs.clear();
 
+  for (auto* op : _scan_op_order) {
+    std::optional<op::scan::key_held_witness> expected_key;
+    if (auto* native =
+          dynamic_cast<op::scan::duckdb_native_gpu_ingestible*>(&op->get_ingestible())) {
+      auto* database = &native->attached_database();
+      auto held      = std::ranges::find_if(_checkpoint_locks, [&](auto const& entry) {
+        return entry.database == database && entry.key && entry.query_token == _query_token;
+      });
+      if (held != _checkpoint_locks.end()) {
+        expected_key = op::scan::key_held_witness{
+          database, database->GetStorageManager().GetDBPath(), _query_token};
+      }
+    }
+    op->set_query_validation(_query_token, std::move(expected_key));
+  }
   start_metadata_processing();
 }
 

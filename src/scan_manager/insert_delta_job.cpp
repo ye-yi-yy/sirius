@@ -370,6 +370,7 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
       d.max_string_length = s.max_string_length;
       d.bytes_size        = s.bytes_size;
       d.all_null          = s.all_null;
+      d.is_transient      = s.is_transient;
       d.segment_stats     = s.segment_stats;
       if (s.is_transient) {
         d.block_id     = -1;
@@ -433,6 +434,7 @@ std::vector<insert_delta_split> cut_delta_splits_for_op(
       info->row_groups.push_back(std::move(md));
     }
     info->host_backed_only = !any_file_read;
+    info->is_insert_delta  = true;
     // The prefetch handle inside a datasource is per-scan mutable state, so
     // every file-backed split owns a fresh duplicate (matching the native-scan
     // coalescer); splits that read no file carry none.
