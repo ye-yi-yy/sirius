@@ -15,6 +15,7 @@
  */
 
 // sirius
+#include "common/planning_measurement.hpp"
 #include "op/scan/owning_table_view.hpp"
 
 #include <expression/ast/from_duckdb.hpp>
@@ -252,6 +253,7 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
 //! serial; the deferred path runs it from prepare_for_query on the query thread.
 void duckdb_native_gpu_ingestible::run_metadata_walk()
 {
+  sirius::measurement::phase_scope walk(sirius::measurement::phase::native_walk);
   auto const& bind = *_info;
   duckdb::Value injected_failure;
   if (bind.context->TryGetCurrentSetting("sirius_test_inject_native_walk_failure",

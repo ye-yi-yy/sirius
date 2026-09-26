@@ -31,6 +31,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+#include <duckdb/main/config.hpp>
 #include <unistd.h>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
@@ -86,7 +87,7 @@ struct sirius_config_env_guard {
  */
 class GpuExecutionFixture {
  public:
-  GpuExecutionFixture()
+  explicit GpuExecutionFixture(duckdb::unique_ptr<duckdb::FileSystem> file_system = nullptr)
   {
     namespace fs = std::filesystem;
 
@@ -99,7 +100,8 @@ class GpuExecutionFixture {
                      .string();
     attach_alias = "gpu_db_" + std::to_string(getpid()) + "_" + std::to_string(id);
 
-    if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
+    if (!file_system && sirius::test::g_integration_env &&
+        sirius::test::g_integration_env->is_active()) {
       con =
         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
     } else {
@@ -109,8 +111,14 @@ class GpuExecutionFixture {
         fs::path(__FILE__).parent_path().parent_path() / "integration" / "integration.yaml";
       REQUIRE(fs::exists(cfg_path));
       config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
-      db           = std::make_unique<duckdb::DuckDB>(nullptr);  // in-memory host DB
-      con          = std::make_unique<duckdb::Connection>(*db);
+      if (file_system) {
+        duckdb::DBConfig config;
+        config.file_system = std::move(file_system);
+        db                 = std::make_unique<duckdb::DuckDB>(nullptr, &config);
+      } else {
+        db = std::make_unique<duckdb::DuckDB>(nullptr);  // in-memory host DB
+      }
+      con = std::make_unique<duckdb::Connection>(*db);
     }
 
     // Route all subsequent DDL/DML/queries into the on-disk database so the

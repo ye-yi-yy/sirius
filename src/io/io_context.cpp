@@ -16,6 +16,7 @@
 
 #include "io/io_context.hpp"
 
+#include "common/planning_measurement.hpp"
 #include "io/cache/config.hpp"
 #include "io/cache/prefetching_cache.hpp"
 #include "io/sirius_datasource.hpp"
@@ -65,6 +66,7 @@ void ioctx::shutdown_cache() noexcept { _cache.reset(); }
 
 std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path)
 {
+  sirius::measurement::record_datasource_io(sirius::measurement::io_request::open);
   // Create the backend-appropriate io_object (local fds / object-store HEAD /
   // ...) and wrap it in a sirius_datasource bound to this ioctx.  Datasource
   // construction is uniform across backends, so it lives here rather than in a
@@ -83,6 +85,7 @@ std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path)
 
 std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path, open_hint hint)
 {
+  sirius::measurement::record_datasource_io(sirius::measurement::io_request::open);
   return std::make_unique<sirius_datasource>(shared_from_this(),
                                              create_io_object(strip_file_scheme(path), hint));
 }
@@ -90,6 +93,7 @@ std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path, open
 std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path,
                                                           std::uint64_t known_size)
 {
+  sirius::measurement::record_datasource_io(sirius::measurement::io_request::open);
   return std::make_unique<sirius_datasource>(shared_from_this(),
                                              create_io_object(strip_file_scheme(path), known_size));
 }

@@ -16,6 +16,7 @@
 
 #include "transparent/physical_sirius_execution.hpp"
 
+#include "common/planning_measurement.hpp"
 #include "log/logging.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
@@ -228,6 +229,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           !read_view_injection.IsNull()) {
         read_view_injection_stage = read_view_injection.ToString();
       }
+      std::optional<sirius::measurement::phase_scope> rebuild_measurement;
       if (validated_sirius_plan_) {
         duckdb::Value inject_registry_change;
         if (state.sirius_context &&
@@ -244,6 +246,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
             read_view_injection_stage != "execute_copy_fails") {
           sirius_plan = std::move(validated_sirius_plan_);
         } else {
+          rebuild_measurement.emplace(sirius::measurement::phase::execute_rebuild);
           validated_sirius_plan_.reset();
           SIRIUS_LOG_INFO(
             "Transparent execution: discarding finalize-validated Sirius plan (pinned registry "
@@ -259,6 +262,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
                         logical_plan_ ? "from logical plan template" : "from SQL replan");
       }
       if (!sirius_plan) {
+        if (!rebuild_measurement)
+          rebuild_measurement.emplace(sirius::measurement::phase::execute_rebuild);
         if (state.sirius_context) { state.sirius_context->record_transparent_execution_rebuild(); }
         // Rebuild a fresh Sirius physical plan for this execution. DuckDB may reuse
         // the same prepared physical operator across multiple EXECUTE calls.
@@ -297,12 +302,17 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           duckdb::Optimizer optimizer(*duckdb_planner.binder, context.client);
           fresh_plan = optimizer.Optimize(std::move(duckdb_planner.plan));
         }
+        sirius::measurement::phase_scope candidate_measurement(
+          sirius::measurement::phase::candidate_build);
         sirius::planner::sirius_physical_plan_generator planner(
           context.client, {{sirius::value_of(window->query_id())}, 0});
         sirius_plan = planner.create_plan(std::move(fresh_plan));
+        candidate_measurement.finish();
         if (read_view_injection_stage == "execute") {
           planner.read_views->inject_mismatch_for_testing(false);
         }
+        sirius::measurement::phase_scope comparison_measurement(
+          sirius::measurement::phase::comparison);
         auto comparison =
           compare_read_views(rebuild_origin,
                              logical_original_views_ ? &*logical_original_views_ : nullptr,
@@ -318,6 +328,8 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
                           message);
           throw duckdb::ExecutorException(message);
         }
+        comparison_measurement.finish();
+        sirius::measurement::phase_scope publish_measurement(sirius::measurement::phase::publish);
         share_equal_read_view_identities(
           logical_original_views_ ? &*logical_original_views_ : nullptr,
           physical_original_views_,
@@ -328,6 +340,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           physical_original_views_);
       }
 
+      if (rebuild_measurement) rebuild_measurement->finish();
       auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
         std::move(prepared), std::move(sirius_plan));
 

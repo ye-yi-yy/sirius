@@ -1,0 +1,1510 @@
+diff --git a/cmake/sirius-sources.cmake b/cmake/sirius-sources.cmake
+index ed990805..77c2c487 100644
+--- a/cmake/sirius-sources.cmake
++++ b/cmake/sirius-sources.cmake
+@@ -1,5 +1,6 @@
+ # cmake-format: off
+ set(EXTENSION_SOURCES
++    src/common/planning_measurement.cpp
+     src/compression/compressed_representation.cpp
+     src/compression/compressed_scan.cpp
+     src/compression/compression_converters.cpp
+@@ -278,3 +279,20 @@ set(SIRIUS_SUBSTRAIT_SOURCES
+ set_source_files_properties(${SIRIUS_SUBSTRAIT_SOURCES}
+                             PROPERTIES COMPILE_OPTIONS "-w")
+ list(APPEND EXTENSION_SOURCES ${SIRIUS_SUBSTRAIT_SOURCES})
++
++option(SIRIUS_ENABLE_PLANNING_MEASUREMENTS
++       "Enable benchmark-only planning observations" OFF)
++if(SIRIUS_ENABLE_PLANNING_MEASUREMENTS)
++  set_property(
++    SOURCE src/common/planning_measurement.cpp
++           src/io/io_context.cpp
++           src/io/sirius_datasource.cpp
++           src/sirius_context.cpp
++           src/transparent/sirius_optimizer_extension.cpp
++           src/transparent/physical_sirius_execution.cpp
++           src/op/scan/duckdb_native_gpu_ingestible.cpp
++           test/cpp/scan/test_scan_planning_measurements.cpp
++           test/cpp/scan/test_planning_measurement_observers.cpp
++    APPEND
++    PROPERTY COMPILE_DEFINITIONS SIRIUS_ENABLE_PLANNING_MEASUREMENTS=1)
++endif()
+diff --git a/cmake/sirius-test-sources.cmake b/cmake/sirius-test-sources.cmake
+index 9e1c6010..e59458ff 100644
+--- a/cmake/sirius-test-sources.cmake
++++ b/cmake/sirius-test-sources.cmake
+@@ -1,5 +1,7 @@
+ # cmake-format: off
+ set(TEST_SOURCES
++    test/cpp/scan/test_scan_planning_measurements.cpp
++    test/cpp/scan/test_planning_measurement_observers.cpp
+     test/cpp/compression/test_compression.cpp
+     test/cpp/config/test_config.cpp
+     test/cpp/config/test_context.cpp
+diff --git a/src/io/io_context.cpp b/src/io/io_context.cpp
+index 4e9513e5..9a563b5d 100644
+--- a/src/io/io_context.cpp
++++ b/src/io/io_context.cpp
+@@ -16,6 +16,7 @@
+
+ #include "io/io_context.hpp"
+
++#include "common/planning_measurement.hpp"
+ #include "io/cache/config.hpp"
+ #include "io/cache/prefetching_cache.hpp"
+ #include "io/sirius_datasource.hpp"
+@@ -65,6 +66,7 @@ void ioctx::shutdown_cache() noexcept { _cache.reset(); }
+
+ std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path)
+ {
++  sirius::measurement::record_datasource_io(sirius::measurement::io_request::open);
+   // Create the backend-appropriate io_object (local fds / object-store HEAD /
+   // ...) and wrap it in a sirius_datasource bound to this ioctx.  Datasource
+   // construction is uniform across backends, so it lives here rather than in a
+@@ -83,6 +85,7 @@ std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path)
+
+ std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path, open_hint hint)
+ {
++  sirius::measurement::record_datasource_io(sirius::measurement::io_request::open);
+   return std::make_unique<sirius_datasource>(shared_from_this(),
+                                              create_io_object(strip_file_scheme(path), hint));
+ }
+@@ -90,6 +93,7 @@ std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path, open
+ std::unique_ptr<sirius_datasource> ioctx::open_datasource(std::string path,
+                                                           std::uint64_t known_size)
+ {
++  sirius::measurement::record_datasource_io(sirius::measurement::io_request::open);
+   return std::make_unique<sirius_datasource>(shared_from_this(),
+                                              create_io_object(strip_file_scheme(path), known_size));
+ }
+diff --git a/src/io/sirius_datasource.cpp b/src/io/sirius_datasource.cpp
+index a0f57be7..046c67a8 100644
+--- a/src/io/sirius_datasource.cpp
++++ b/src/io/sirius_datasource.cpp
+@@ -16,6 +16,7 @@
+
+ #include "io/sirius_datasource.hpp"
+
++#include "common/planning_measurement.hpp"
+ #include "exec/semi_future.hpp"
+ #include "exec/try.hpp"
+ #include "io/cache/prefetching_cache.hpp"
+@@ -83,7 +84,11 @@ std::shared_ptr<io_object_metadata> sirius_datasource::metadata() const
+   return true;
+ }
+
+-size_t sirius_datasource::size() const { return _io_object->size(); }
++size_t sirius_datasource::size() const
++{
++  sirius::measurement::record_datasource_io(sirius::measurement::io_request::metadata);
++  return _io_object->size();
++}
+
+ bool sirius_datasource::supports_device_read() const { return _io_ctx->supports_device_read(); }
+
+@@ -99,6 +104,7 @@ bool sirius_datasource::is_device_read_preferred(size_t) const
+
+ size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
+ {
++  sirius::measurement::record_datasource_io(sirius::measurement::io_request::read, size);
+   if (uses_prefetching_cache()) {
+     auto* cache = _io_ctx->cache();
+     return cache->host_read(*_io_object, offset, size, dst, &_cache_handle);
+@@ -117,6 +123,7 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_
+
+ std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
+ {
++  sirius::measurement::record_datasource_io(sirius::measurement::io_request::read, size);
+   exec::semi_future<size_t> semi;
+   if (uses_prefetching_cache()) {
+     auto* cache = _io_ctx->cache();
+@@ -169,6 +176,7 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
+                                                          uint8_t* dst,
+                                                          cudf_datasource_stream_t stream_arg)
+ {
++  sirius::measurement::record_datasource_io(sirius::measurement::io_request::read, size);
+   ::cuda::stream_ref stream{stream_arg};
+   exec::semi_future<size_t> semi;
+   if (uses_prefetching_cache()) {
+diff --git a/src/op/scan/duckdb_native_gpu_ingestible.cpp b/src/op/scan/duckdb_native_gpu_ingestible.cpp
+index eb65e6c1..7e4c1e71 100644
+--- a/src/op/scan/duckdb_native_gpu_ingestible.cpp
++++ b/src/op/scan/duckdb_native_gpu_ingestible.cpp
+@@ -15,6 +15,7 @@
+  */
+
+ // sirius
++#include "common/planning_measurement.hpp"
+ #include "op/scan/owning_table_view.hpp"
+
+ #include <expression/ast/from_duckdb.hpp>
+@@ -240,6 +241,7 @@ duckdb_native_gpu_ingestible::duckdb_native_gpu_ingestible(
+ //! serial; the deferred path runs it from prepare_for_query on the query thread.
+ void duckdb_native_gpu_ingestible::run_metadata_walk()
+ {
++  sirius::measurement::phase_scope walk(sirius::measurement::phase::native_walk);
+   auto const& bind = *_info;
+   _plan            = prepare_duckdb_native_walk(*bind.storage,
+                                      *bind.context,
+diff --git a/src/sirius_context.cpp b/src/sirius_context.cpp
+index 26750af8..f4a1950a 100644
+--- a/src/sirius_context.cpp
++++ b/src/sirius_context.cpp
+@@ -14,6 +14,7 @@
+  * limitations under the License.
+  */
+
++#include "common/planning_measurement.hpp"
+ #include "sirius_context.hpp"
+
+ #include "config.hpp"
+@@ -1391,6 +1392,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
+     reject_update_to_pinned_table(*this, context, prepared);
+   }
+   if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
++  sirius::measurement::phase_scope finalize_measurement(sirius::measurement::phase::finalize);
+   auto conn_state = get_sirius_connection_state(context);
+
+   // If the optimizer hook captured a plan FOR THIS planning attempt, use it.
+@@ -1509,6 +1511,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
+     // directly and consumes it; we then re-plan from `unbound_statement` for
+     // the actual execution path. PhysicalSiriusExecution falls back to
+     // re-planning per execute when its `logical_plan_` is null.
++    sirius::measurement::phase_scope candidate_measurement(sirius::measurement::phase::candidate_build);
+     sirius::planner::sirius_physical_plan_generator planner(context);
+     duckdb::unique_ptr<duckdb::LogicalOperator> validation_plan;
+     bool plan_is_copyable = true;
+@@ -1532,6 +1535,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
+       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
+     }
+
++    candidate_measurement.finish();
++    sirius::measurement::phase_scope publish_measurement(sirius::measurement::phase::publish);
+     SIRIUS_LOG_INFO("Transparent execution: Sirius physical plan generated successfully");
+
+     // Stash DuckDB's CPU plan before overwriting it, wrapped in a minimal
+@@ -1642,7 +1647,10 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
+   if (runtime_unavailable_.load(std::memory_order_acquire)) { throw_runtime_unavailable(); }
+   if (context && context->IsInterrupted()) { throw InterruptException(); }
+
+-  query_lifecycle_mutex_.lock();
++  {
++    sirius::measurement::phase_scope wait(sirius::measurement::phase::lifecycle_lock_wait);
++    query_lifecycle_mutex_.lock();
++  }
+   holder_thread_hash_.store(my_hash, std::memory_order_relaxed);
+   query_lifecycle_held_.store(true, std::memory_order_release);
+
+diff --git a/src/transparent/physical_sirius_execution.cpp b/src/transparent/physical_sirius_execution.cpp
+index 45428467..8ad58a36 100644
+--- a/src/transparent/physical_sirius_execution.cpp
++++ b/src/transparent/physical_sirius_execution.cpp
+@@ -14,6 +14,7 @@
+  * limitations under the License.
+  */
+
++#include "common/planning_measurement.hpp"
+ #include "transparent/physical_sirius_execution.hpp"
+
+ #include "log/logging.hpp"
+@@ -196,6 +197,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
+       // with a window, but they can land between two — so reuse the plan only while the pinned
+       // registry is unchanged, and otherwise rebuild against what this window actually sees.
+       duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_plan;
++      std::optional<sirius::measurement::phase_scope> rebuild_measurement;
+       if (validated_sirius_plan_) {
+         duckdb::Value inject_registry_change;
+         if (state.sirius_context &&
+@@ -211,6 +213,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
+         if (current_epoch == planned_epoch) {
+           sirius_plan = std::move(validated_sirius_plan_);
+         } else {
++          rebuild_measurement.emplace(sirius::measurement::phase::execute_rebuild);
+           validated_sirius_plan_.reset();
+           SIRIUS_LOG_INFO(
+             "Transparent execution: discarding finalize-validated Sirius plan (pinned registry "
+@@ -226,6 +229,7 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
+                         logical_plan_ ? "from logical plan template" : "from SQL replan");
+       }
+       if (!sirius_plan) {
++        if (!rebuild_measurement) rebuild_measurement.emplace(sirius::measurement::phase::execute_rebuild);
+         // Rebuild a fresh Sirius physical plan for this execution. DuckDB may reuse
+         // the same prepared physical operator across multiple EXECUTE calls.
+         //
+@@ -258,10 +262,12 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
+           duckdb::Optimizer optimizer(*duckdb_planner.binder, context.client);
+           fresh_plan = optimizer.Optimize(std::move(duckdb_planner.plan));
+         }
++        sirius::measurement::phase_scope candidate_measurement(sirius::measurement::phase::candidate_build);
+         sirius::planner::sirius_physical_plan_generator planner(context.client);
+         sirius_plan = planner.create_plan(std::move(fresh_plan));
+       }
+
++      if (rebuild_measurement) rebuild_measurement->finish();
+       auto gpu_prepared = duckdb::make_shared_ptr<sirius::sirius_prepared_statement_data>(
+         std::move(prepared), std::move(sirius_plan));
+
+diff --git a/src/transparent/sirius_optimizer_extension.cpp b/src/transparent/sirius_optimizer_extension.cpp
+index bccb938e..0d9e8758 100644
+--- a/src/transparent/sirius_optimizer_extension.cpp
++++ b/src/transparent/sirius_optimizer_extension.cpp
+@@ -14,6 +14,7 @@
+  * limitations under the License.
+  */
+
++#include "common/planning_measurement.hpp"
+ #include "transparent/sirius_optimizer_extension.hpp"
+
+ #include "sirius_context.hpp"
+@@ -260,6 +261,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
+   if (!ctx) { return; }
+   auto conn_state = duckdb::get_sirius_connection_state(context);
+   if (!conn_state || conn_state->is_internal_query_active()) { return; }
++  sirius::measurement::phase_scope hook_measurement(sirius::measurement::phase::optimizer_hook);
+   // Preserve the pre-hook's decline; optimized plans may no longer contain the scans.
+   if (should_use_duckdb(context, nullptr, nullptr) != decline_reason::none) { return; }
+   if (!gpu_execution_enabled(context) || !ctx->is_initialized()) { return; }
+diff --git a/test/cpp/utils/gpu_execution_fixture.hpp b/test/cpp/utils/gpu_execution_fixture.hpp
+index b6f51a66..216dadaf 100644
+--- a/test/cpp/utils/gpu_execution_fixture.hpp
++++ b/test/cpp/utils/gpu_execution_fixture.hpp
+@@ -31,6 +31,7 @@
+
+ #include <catch.hpp>
+ #include <duckdb.hpp>
++#include <duckdb/main/config.hpp>
+ #include <unistd.h>
+ #include <utils/sirius_test_env.hpp>
+ #include <utils/transparent_execution_test_utils.hpp>
+@@ -86,7 +87,7 @@ struct sirius_config_env_guard {
+  */
+ class GpuExecutionFixture {
+  public:
+-  GpuExecutionFixture()
++  explicit GpuExecutionFixture(duckdb::unique_ptr<duckdb::FileSystem> file_system = nullptr)
+   {
+     namespace fs = std::filesystem;
+
+@@ -99,7 +100,8 @@ class GpuExecutionFixture {
+                      .string();
+     attach_alias = "gpu_db_" + std::to_string(getpid()) + "_" + std::to_string(id);
+
+-    if (sirius::test::g_integration_env && sirius::test::g_integration_env->is_active()) {
++    if (!file_system && sirius::test::g_integration_env &&
++        sirius::test::g_integration_env->is_active()) {
+       con =
+         std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
+     } else {
+@@ -109,8 +111,14 @@ class GpuExecutionFixture {
+         fs::path(__FILE__).parent_path().parent_path() / "integration" / "integration.yaml";
+       REQUIRE(fs::exists(cfg_path));
+       config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
+-      db           = std::make_unique<duckdb::DuckDB>(nullptr);  // in-memory host DB
+-      con          = std::make_unique<duckdb::Connection>(*db);
++      if (file_system) {
++        duckdb::DBConfig config;
++        config.file_system = std::move(file_system);
++        db                 = std::make_unique<duckdb::DuckDB>(nullptr, &config);
++      } else {
++        db = std::make_unique<duckdb::DuckDB>(nullptr);  // in-memory host DB
++      }
++      con = std::make_unique<duckdb::Connection>(*db);
+     }
+
+     // Route all subsequent DDL/DML/queries into the on-disk database so the
+diff --git a/src/common/planning_measurement.hpp b/src/common/planning_measurement.hpp
+new file mode 100644
+index 00000000..3b230f66
+--- /dev/null
++++ b/src/common/planning_measurement.hpp
+@@ -0,0 +1,83 @@
++#pragma once
++
++#include <array>
++#include <chrono>
++#include <cstdint>
++
++namespace sirius::measurement {
++// Enabled only in a dedicated benchmark build. No timers or counters run in normal builds.
++enum class phase : unsigned {
++  optimizer_hook,
++  capture_logical,
++  finalize,
++  capture_physical,
++  candidate_build,
++  comparison,
++  publish,
++  execute_rebuild,
++  lifecycle_lock_wait,
++  native_walk,
++  count
++};
++constexpr auto phase_count = static_cast<unsigned>(phase::count);
++char const* phase_name(phase value) noexcept;
++struct phase_result {
++  uint64_t nanoseconds = 0;
++  uint64_t calls       = 0;
++};
++struct observation {
++  std::array<phase_result, phase_count> phases{};
++  // Used by memory and I/O fixtures. No allocation, logging or sampling in latency runs.
++  void (*boundary)(void*, phase, bool) noexcept = nullptr;
++  void* payload                                 = nullptr;
++};
++enum class io_request { open, read, metadata };
++struct datasource_io_result {
++  uint64_t opens = 0, read_calls = 0, requested_bytes = 0, metadata_requests = 0;
++};
++#ifdef SIRIUS_ENABLE_PLANNING_MEASUREMENTS
++// Process-wide request counters include reads issued by worker threads. One window at a time.
++void begin_datasource_io() noexcept;
++datasource_io_result end_datasource_io() noexcept;
++void record_datasource_io(io_request request, uint64_t bytes = 0) noexcept;
++#else
++inline void begin_datasource_io() noexcept {}
++inline datasource_io_result end_datasource_io() noexcept { return {}; }
++inline void record_datasource_io(io_request, uint64_t = 0) noexcept {}
++#endif
++
++#ifdef SIRIUS_ENABLE_PLANNING_MEASUREMENTS
++extern thread_local observation* active_observation;
++class observation_scope {
++ public:
++  explicit observation_scope(observation& value) noexcept;
++  ~observation_scope();
++  observation_scope(observation_scope const&) = delete;
++
++ private:
++  observation* previous_;
++};
++class phase_scope {
++ public:
++  explicit phase_scope(phase value) noexcept;
++  ~phase_scope() { finish(); }
++  void finish() noexcept;
++  phase_scope(phase_scope const&) = delete;
++
++ private:
++  observation* observer_;
++  phase value_;
++  std::chrono::steady_clock::time_point begin_;
++};
++#else
++class observation_scope {
++ public:
++  explicit observation_scope(observation&) noexcept {}
++};
++class phase_scope {
++ public:
++  explicit phase_scope(phase) noexcept {}
++  void finish() noexcept {}
++};
++#endif
++}  // namespace sirius::measurement
+diff --git a/src/common/planning_measurement.cpp b/src/common/planning_measurement.cpp
+new file mode 100644
+index 00000000..c79f6a43
+--- /dev/null
++++ b/src/common/planning_measurement.cpp
+@@ -0,0 +1,70 @@
++#include "common/planning_measurement.hpp"
++
++#include <atomic>
++
++namespace sirius::measurement {
++char const* phase_name(phase value) noexcept
++{
++  constexpr char const* names[] = {"optimizer_hook",
++                                   "capture_logical",
++                                   "finalize",
++                                   "capture_physical",
++                                   "candidate_build",
++                                   "comparison",
++                                   "publish",
++                                   "execute_rebuild",
++                                   "lifecycle_lock_wait",
++                                   "native_walk"};
++  return names[static_cast<unsigned>(value)];
++}
++#ifdef SIRIUS_ENABLE_PLANNING_MEASUREMENTS
++namespace {
++std::atomic<bool> io_enabled{false};
++std::atomic<uint64_t> io_opens{0}, io_reads{0}, io_bytes{0}, io_metadata{0};
++}  // namespace
++void begin_datasource_io() noexcept
++{
++  io_opens = io_reads = io_bytes = io_metadata = 0;
++  io_enabled.store(true);
++}
++datasource_io_result end_datasource_io() noexcept
++{
++  io_enabled.store(false);
++  return {io_opens.load(), io_reads.load(), io_bytes.load(), io_metadata.load()};
++}
++void record_datasource_io(io_request request, uint64_t bytes) noexcept
++{
++  if (!io_enabled.load()) return;
++  switch (request) {
++    case io_request::open: ++io_opens; break;
++    case io_request::read:
++      ++io_reads;
++      io_bytes += bytes;
++      break;
++    case io_request::metadata: ++io_metadata; break;
++  }
++}
++thread_local observation* active_observation = nullptr;
++observation_scope::observation_scope(observation& value) noexcept : previous_(active_observation)
++{
++  active_observation = &value;
++}
++observation_scope::~observation_scope() { active_observation = previous_; }
++phase_scope::phase_scope(phase value) noexcept : observer_(active_observation), value_(value)
++{
++  if (!observer_) return;
++  if (observer_->boundary) observer_->boundary(observer_->payload, value_, true);
++  begin_ = std::chrono::steady_clock::now();
++}
++void phase_scope::finish() noexcept
++{
++  if (!observer_) return;
++  auto const end = std::chrono::steady_clock::now();
++  auto& result   = observer_->phases[static_cast<unsigned>(value_)];
++  result.nanoseconds += std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin_).count();
++  ++result.calls;
++  if (observer_->boundary) observer_->boundary(observer_->payload, value_, false);
++  observer_ = nullptr;
++}
++#endif
++}  // namespace sirius::measurement
+diff --git a/test/cpp/utils/planning_memory_sampler.hpp b/test/cpp/utils/planning_memory_sampler.hpp
+new file mode 100644
+index 00000000..c13849fa
+--- /dev/null
++++ b/test/cpp/utils/planning_memory_sampler.hpp
+@@ -0,0 +1,250 @@
++#pragma once
++
++#include <dlfcn.h>
++
++#include <algorithm>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++#if defined(__GLIBC__)
++#include <malloc.h>
++#endif
++
++namespace sirius::test {
++struct allocator_reading {
++  uint64_t system_bytes        = 0;
++  uint64_t duckdb_bytes        = 0;
++  uint64_t system_active_bytes = 0;
++  uint64_t duckdb_active_bytes = 0;
++  bool valid                   = false;
++  uint64_t total() const noexcept { return system_bytes + duckdb_bytes; }
++};
++
++// Statistics describe allocator-observed bytes. Neither allocator gives a historical
++// process peak; tcaches, allocator metadata and sampling gaps limit the interpretation.
++class allocator_reader {
++ public:
++  virtual ~allocator_reader()               = default;
++  virtual allocator_reading read() noexcept = 0;
++};
++class process_allocator_reader final : public allocator_reader {
++ public:
++  using mallctl_fn = int (*)(char const*, void*, size_t*, void*, size_t);
++  explicit process_allocator_reader(std::string const& system_allocator) : xml_(1024 * 1024, '\0')
++  {
++    duckdb_ = reinterpret_cast<mallctl_fn>(dlsym(RTLD_DEFAULT, "duckdb_je_mallctl"));
++    if (system_allocator == "jemalloc") {
++      system_ = reinterpret_cast<mallctl_fn>(dlsym(RTLD_DEFAULT, "mallctl"));
++      if (!system_) throw std::runtime_error("process jemalloc mallctl is unavailable");
++      Dl_info malloc_owner{}, control_owner{};
++      if (!dladdr(dlsym(RTLD_DEFAULT, "malloc"), &malloc_owner) ||
++          !dladdr(reinterpret_cast<void*>(system_), &control_owner) ||
++          malloc_owner.dli_fbase != control_owner.dli_fbase) {
++        throw std::runtime_error("mallctl does not belong to the process malloc provider");
++      }
++      if (system_ == duckdb_) duckdb_ = nullptr;  // Never sum the same allocator twice.
++    } else if (system_allocator == "glibc") {
++#if defined(__GLIBC__)
++      Dl_info owner{};
++      if (!dladdr(dlsym(RTLD_DEFAULT, "malloc"), &owner) || !owner.dli_fname ||
++          !std::strstr(owner.dli_fname, "libc.so")) {
++        throw std::runtime_error("glibc statistics cannot describe the process malloc provider");
++      }
++      stream_ = fmemopen(xml_.data(), xml_.size(), "w+");
++      if (!stream_) throw std::runtime_error("cannot create allocator statistics buffer");
++      setvbuf(stream_, nullptr, _IONBF, 0);
++#else
++      throw std::runtime_error("glibc allocator statistics are unavailable");
++#endif
++    } else {
++      throw std::invalid_argument("SCAN_PLANNING_ALLOCATOR must be glibc or jemalloc");
++    }
++    // Initialize allocator statistics and stdio before any measured window.
++    if (!read().valid) {
++      if (stream_) std::fclose(stream_);
++      stream_ = nullptr;
++      throw std::runtime_error("allocator statistics are unavailable or incomplete");
++    }
++  }
++  ~process_allocator_reader() override
++  {
++    if (stream_) std::fclose(stream_);
++  }
++  bool has_duckdb_statistics() const noexcept { return duckdb_ != nullptr; }
++  allocator_reading read() noexcept override
++  {
++    allocator_reading result;
++    bool ok = false;
++    if (system_) {
++      ok = jemalloc_read(system_, result.system_bytes, result.system_active_bytes);
++    } else {
++#if defined(__GLIBC__)
++      std::rewind(stream_);
++      std::clearerr(stream_);
++      if (malloc_info(0, stream_) == 0 && std::fflush(stream_) == 0) {
++        auto length = std::ftell(stream_);
++        if (length > 0 && static_cast<size_t>(length) < xml_.size()) {
++          xml_[length]     = '\0';
++          uint64_t current = 0, fast = 0, rest = 0, mapped = 0;
++          ok = last_attribute("<system type=\"current\"", "size=\"", current) &&
++               (!std::strstr(xml_.data(), "<total type=\"fast\"") ||
++                last_attribute("<total type=\"fast\"", "size=\"", fast)) &&
++               last_attribute("<total type=\"rest\"", "size=\"", rest) &&
++               last_attribute("<total type=\"mmap\"", "size=\"", mapped) &&
++               current >= fast + rest && std::strstr(xml_.data(), "</malloc>");
++          if (ok) {
++            // glibc arena in-use estimate plus its mmap allocations; not requested bytes.
++            result.system_bytes        = current - fast - rest + mapped;
++            result.system_active_bytes = current + mapped;
++          }
++        }
++      }
++#endif
++    }
++    if (duckdb_) ok = jemalloc_read(duckdb_, result.duckdb_bytes, result.duckdb_active_bytes) && ok;
++    result.valid = ok;
++    return result;
++  }
++
++ private:
++  static bool jemalloc_read(mallctl_fn control, uint64_t& allocated, uint64_t& active) noexcept
++  {
++    uint64_t epoch    = 1;
++    size_t epoch_size = sizeof(epoch), allocated_value = 0, active_value = 0;
++    size_t length = sizeof(size_t);
++    if (control("epoch", &epoch, &epoch_size, &epoch, sizeof(epoch)) != 0 ||
++        control("stats.allocated", &allocated_value, &length, nullptr, 0) != 0)
++      return false;
++    length = sizeof(size_t);
++    if (control("stats.active", &active_value, &length, nullptr, 0) != 0) return false;
++    allocated = allocated_value;
++    active    = active_value;
++    return true;
++  }
++  bool last_attribute(char const* element, char const* attribute, uint64_t& value) noexcept
++  {
++    auto next        = std::strstr(xml_.data(), element);
++    char const* last = nullptr;
++    while (next) {
++      last = next;
++      next = std::strstr(next + 1, element);
++    }
++    if (!last) return false;
++    auto end   = std::strchr(last, '>');
++    auto found = std::strstr(last, attribute);
++    if (!found || !end || found >= end) return false;
++    char* parsed_end = nullptr;
++    value            = std::strtoull(found + std::strlen(attribute), &parsed_end, 10);
++    return parsed_end && parsed_end < end && *parsed_end == '"';
++  }
++  std::vector<char> xml_;
++  FILE* stream_      = nullptr;
++  mallctl_fn system_ = nullptr;
++  mallctl_fn duckdb_ = nullptr;
++};
++
++struct memory_result {
++  allocator_reading before, peak, after;
++  uint64_t samples        = 0;
++  uint64_t maximum_gap_us = 0;
++  bool valid              = true;
++  uint64_t peak_added_bytes() const noexcept { return peak.total() - before.total(); }
++  int64_t retained_delta_bytes() const noexcept
++  {
++    return static_cast<int64_t>(after.total()) - static_cast<int64_t>(before.total());
++  }
++};
++
++class planning_memory_sampler {
++ public:
++  // A zero interval selects boundary-only sampling for deterministic observer tests.
++  planning_memory_sampler(allocator_reader& reader, std::chrono::microseconds interval)
++    : reader_(reader), interval_(interval)
++  {
++    if (interval_.count() > 0) {
++      worker_ = std::thread([this] {
++        std::unique_lock<std::mutex> lock(mutex_);
++        (void)reader_.read();  // Warm statistics on the sampling thread before the baseline.
++        ready_ = true;
++        condition_.notify_all();
++        while (!quit_) {
++          condition_.wait(lock, [this] { return quit_ || running_; });
++          if (quit_) break;
++          sample_locked();
++          condition_.wait_for(lock, interval_, [this] { return quit_ || !running_; });
++        }
++      });
++      std::unique_lock<std::mutex> lock(mutex_);
++      condition_.wait(lock, [this] { return ready_; });
++    }
++  }
++  ~planning_memory_sampler()
++  {
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      quit_    = true;
++      running_ = false;
++    }
++    condition_.notify_all();
++    if (worker_.joinable()) worker_.join();
++  }
++  void start() noexcept
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    result_        = {};
++    result_.before = reader_.read();
++    result_.peak = result_.after = result_.before;
++    result_.valid                = result_.before.valid;
++    result_.samples              = 1;
++    last_                        = std::chrono::steady_clock::now();
++    running_                     = true;
++    condition_.notify_all();
++  }
++  void record_peak() noexcept
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (running_) sample_locked();
++  }
++  memory_result stop() noexcept
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (running_) sample_locked();
++    running_ = false;
++    condition_.notify_all();
++    return result_;
++  }
++
++ private:
++  void sample_locked() noexcept
++  {
++    auto reading = reader_.read();
++    auto now     = std::chrono::steady_clock::now();
++    auto gap     = std::chrono::duration_cast<std::chrono::microseconds>(now - last_).count();
++    result_.maximum_gap_us = std::max(result_.maximum_gap_us, static_cast<uint64_t>(gap));
++    last_                  = now;
++    ++result_.samples;
++    result_.valid = result_.valid && reading.valid;
++    if (reading.valid) {
++      if (reading.total() > result_.peak.total()) result_.peak = reading;
++      result_.after = reading;
++    }
++  }
++  allocator_reader& reader_;
++  std::chrono::microseconds interval_;
++  std::mutex mutex_;
++  std::condition_variable condition_;
++  std::thread worker_;
++  bool ready_ = false, quit_ = false, running_ = false;
++  memory_result result_;
++  std::chrono::steady_clock::time_point last_;
++};
++}  // namespace sirius::test
+diff --git a/test/cpp/utils/planning_file_system.hpp b/test/cpp/utils/planning_file_system.hpp
+new file mode 100644
+index 00000000..b9f03789
+--- /dev/null
++++ b/test/cpp/utils/planning_file_system.hpp
+@@ -0,0 +1,123 @@
++#pragma once
++
++#include <duckdb/common/local_file_system.hpp>
++#include <duckdb/common/virtual_file_system.hpp>
++
++#include <atomic>
++
++namespace sirius::test {
++struct planning_io_result {
++  uint64_t opens = 0, read_calls = 0, bytes_read = 0;
++  uint64_t metadata_requests = 0, directory_lists = 0, files_enumerated = 0, directory_entries = 0;
++};
++// Observe DuckDB local filesystem operations without forcing lazy file lists.
++// These are API requests (including cached operations), not physical disk or network I/O.
++class planning_file_system final : public duckdb::LocalFileSystem {
++ public:
++  void start() noexcept
++  {
++    opens_ = reads_ = bytes_ = metadata_ = lists_ = entries_ = files_ = 0;
++    enabled_.store(true);
++  }
++  planning_io_result stop() noexcept
++  {
++    enabled_.store(false);
++    return {opens_.load(),
++            reads_.load(),
++            bytes_.load(),
++            metadata_.load(),
++            lists_.load(),
++            files_.load(),
++            entries_.load()};
++  }
++  duckdb::unique_ptr<duckdb::FileHandle> OpenFile(
++    duckdb::string const& path,
++    duckdb::FileOpenFlags flags,
++    duckdb::optional_ptr<duckdb::FileOpener> opener) override
++  {
++    if (enabled_) ++opens_;
++    return LocalFileSystem::OpenFile(path, flags, opener);
++  }
++  void Read(duckdb::FileHandle& handle, void* buffer, int64_t bytes, duckdb::idx_t offset) override
++  {
++    bool count = enabled_.load();
++    if (count) ++reads_;
++    LocalFileSystem::Read(handle, buffer, bytes, offset);
++    if (count) bytes_ += bytes;
++  }
++  int64_t Read(duckdb::FileHandle& handle, void* buffer, int64_t bytes) override
++  {
++    bool count = enabled_.load();
++    if (count) ++reads_;
++    auto read = LocalFileSystem::Read(handle, buffer, bytes);
++    if (count && read > 0) bytes_ += read;
++    return read;
++  }
++  int64_t GetFileSize(duckdb::FileHandle& handle) override
++  {
++    if (enabled_) ++metadata_;
++    return LocalFileSystem::GetFileSize(handle);
++  }
++  duckdb::timestamp_t GetLastModifiedTime(duckdb::FileHandle& handle) override
++  {
++    if (enabled_) ++metadata_;
++    return LocalFileSystem::GetLastModifiedTime(handle);
++  }
++  duckdb::string GetVersionTag(duckdb::FileHandle& handle) override
++  {
++    if (enabled_) ++metadata_;
++    return LocalFileSystem::GetVersionTag(handle);
++  }
++  duckdb::FileType GetFileType(duckdb::FileHandle& handle) override
++  {
++    if (enabled_) ++metadata_;
++    return LocalFileSystem::GetFileType(handle);
++  }
++  duckdb::FileMetadata Stats(duckdb::FileHandle& handle) override
++  {
++    if (enabled_) ++metadata_;
++    return LocalFileSystem::Stats(handle);
++  }
++  bool FileExists(duckdb::string const& path,
++                  duckdb::optional_ptr<duckdb::FileOpener> opener) override
++  {
++    if (enabled_) ++metadata_;
++    return LocalFileSystem::FileExists(path, opener);
++  }
++  bool DirectoryExists(duckdb::string const& path,
++                       duckdb::optional_ptr<duckdb::FileOpener> opener) override
++  {
++    if (enabled_) ++metadata_;
++    return LocalFileSystem::DirectoryExists(path, opener);
++  }
++
++ protected:
++  bool ListFilesExtended(duckdb::string const& directory,
++                         std::function<void(duckdb::OpenFileInfo&)> const& callback,
++                         duckdb::optional_ptr<duckdb::FileOpener> opener) override
++  {
++    bool count = enabled_.load();
++    if (count) ++lists_;
++    return LocalFileSystem::ListFilesExtended(
++      directory,
++      [&](duckdb::OpenFileInfo& info) {
++        if (count) {
++          ++entries_;
++          if (info.extended_info) {
++            auto type = info.extended_info->options.find("type");
++            if (type != info.extended_info->options.end() &&
++                type->second.GetValue<std::string>() == "file")
++              ++files_;
++          }
++        }
++        callback(info);
++      },
++      opener);
++  }
++
++ private:
++  std::atomic<bool> enabled_{false};
++  std::atomic<uint64_t> opens_{0}, reads_{0}, bytes_{0}, metadata_{0}, lists_{0}, entries_{0},
++    files_{0};
++};
++}  // namespace sirius::test
+diff --git a/test/cpp/scan/test_planning_measurement_observers.cpp b/test/cpp/scan/test_planning_measurement_observers.cpp
+new file mode 100644
+index 00000000..a501344e
+--- /dev/null
++++ b/test/cpp/scan/test_planning_measurement_observers.cpp
+@@ -0,0 +1,148 @@
++#include <catch.hpp>
++#include <common/planning_measurement.hpp>
++#include <duckdb/common/multi_file/multi_file_list.hpp>
++#include <unistd.h>
++#include <utils/planning_file_system.hpp>
++#include <utils/planning_memory_sampler.hpp>
++
++#include <filesystem>
++#include <fstream>
++
++namespace {
++class scripted_allocator : public sirius::test::allocator_reader {
++ public:
++  sirius::test::allocator_reading current{100, 50, 0, 0, true};
++  sirius::test::allocator_reading read() noexcept override { return current; }
++};
++}  // namespace
++
++TEST_CASE("Planning memory observations preserve transient peaks and signed retention",
++          "[planning_observers]")
++{
++  scripted_allocator reader;
++  sirius::test::planning_memory_sampler sampler(reader, std::chrono::microseconds(0));
++  sampler.start();
++  reader.current = {400, 100, 0, 0, true};
++  sampler.record_peak();
++  reader.current = {50, 25, 0, 0, true};
++  auto result    = sampler.stop();
++  REQUIRE(result.valid);
++  CHECK(result.before.total() == 150);
++  CHECK(result.peak.total() == 500);
++  CHECK(result.after.total() == 75);
++  CHECK(result.peak_added_bytes() == 350);
++  CHECK(result.retained_delta_bytes() == -75);
++  CHECK(result.samples == 3);
++  // Window reset must not retain a prior attempt's peak.
++  sampler.start();
++  result = sampler.stop();
++  CHECK(result.peak.total() == 75);
++  reader.current.valid = false;
++  sampler.start();
++  CHECK_FALSE(sampler.stop().valid);
++}
++
++TEST_CASE("Planning phase observers restore nested windows after exceptions",
++          "[planning_observers]")
++{
++#ifdef SIRIUS_ENABLE_PLANNING_MEASUREMENTS
++  using namespace sirius::measurement;
++  observation outer, inner;
++  {
++    observation_scope observing(outer);
++    phase_scope hook(phase::optimizer_hook);
++    try {
++      observation_scope nested(inner);
++      phase_scope build(phase::candidate_build);
++      throw std::runtime_error("test failure");
++    } catch (std::runtime_error const&) {
++    }
++    CHECK(active_observation == &outer);
++  }
++  CHECK(active_observation == nullptr);
++  CHECK(outer.phases[static_cast<unsigned>(phase::optimizer_hook)].calls == 1);
++  CHECK(inner.phases[static_cast<unsigned>(phase::candidate_build)].calls == 1);
++#else
++  sirius::measurement::observation observation;
++  sirius::measurement::observation_scope observing(observation);
++  sirius::measurement::phase_scope phase(sirius::measurement::phase::finalize);
++  phase.finish();
++  CHECK(observation.phases[static_cast<unsigned>(sirius::measurement::phase::finalize)].calls == 0);
++#endif
++}
++
++TEST_CASE("Planning filesystem counts reads on existing handles without expanding globs early",
++          "[planning_observers]")
++{
++  struct temporary_directory {
++    std::filesystem::path path =
++      std::filesystem::temp_directory_path() / ("planning_observer_" + std::to_string(getpid()));
++    temporary_directory()
++    {
++      if (!std::filesystem::create_directory(path))
++        throw std::runtime_error("test directory exists");
++    }
++    ~temporary_directory() { std::filesystem::remove_all(path); }
++  } directory;
++  std::filesystem::create_directory(directory.path / "nested");
++  auto path = directory.path / "file.txt";
++  {
++    std::ofstream file(path);
++    file << "abcdef";
++  }
++  sirius::test::planning_file_system fs;
++  auto handle = fs.OpenFile(path.string(), duckdb::FileFlags::FILE_FLAGS_READ, nullptr);
++  // Negative control: adding reads after opening the handle must remain visible.
++  fs.start();
++  char data[4]{};
++  handle->Read(data, 2, 1);
++  CHECK(std::string(data, 2) == "bc");
++  handle->Read(data, 3);
++  auto result = fs.stop();
++  CHECK(result.opens == 0);
++  CHECK(result.read_calls == 2);
++  CHECK(result.bytes_read == 5);
++  fs.start();
++  auto files = fs.Glob((directory.path / "*.txt").string(),
++                       duckdb::FileGlobInput(duckdb::FileGlobOptions::ALLOW_EMPTY),
++                       nullptr);
++  result     = fs.stop();
++  CHECK(result.directory_lists == 0);
++  CHECK(result.files_enumerated == 0);
++  fs.start();
++  auto expanded = files->GetAllFiles();
++  result        = fs.stop();
++  CHECK(expanded.size() == 1);
++  CHECK(result.directory_lists > 0);
++  CHECK(result.files_enumerated == 1);
++  CHECK(result.directory_entries == 2);
++  fs.start();
++  CHECK(handle->GetFileSize() == 6);
++  CHECK(fs.stop().metadata_requests > 0);
++}
++
++TEST_CASE("Allocator statistics backend exposes available components", "[planning_observers]")
++{
++#if defined(__GLIBC__)
++  sirius::test::process_allocator_reader reader("glibc");
++  auto reading = reader.read();
++  REQUIRE(reading.valid);
++  CHECK(reading.system_bytes > 0);
++  if (reader.has_duckdb_statistics()) CHECK(reading.duckdb_active_bytes >= reading.duckdb_bytes);
++#endif
++}
++
++TEST_CASE("Datasource request observations include worker threads", "[planning_observers]")
++{
++#ifdef SIRIUS_ENABLE_PLANNING_MEASUREMENTS
++  using namespace sirius::measurement;
++  begin_datasource_io();
++  std::thread worker([] { record_datasource_io(io_request::read, 4096); });
++  worker.join();
++  auto result = end_datasource_io();
++  CHECK(result.read_calls == 1);
++  CHECK(result.requested_bytes == 4096);
++  record_datasource_io(io_request::read, 1);
++  CHECK(end_datasource_io().requested_bytes == 4096);
++#endif
++}
+diff --git a/test/cpp/scan/test_scan_planning_measurements.cpp b/test/cpp/scan/test_scan_planning_measurements.cpp
+new file mode 100644
+index 00000000..ca181a70
+--- /dev/null
++++ b/test/cpp/scan/test_scan_planning_measurements.cpp
+@@ -0,0 +1,485 @@
++#include <catch.hpp>
++#include <common/planning_measurement.hpp>
++#include <duckdb.hpp>
++#include <duckdb/catalog/catalog.hpp>
++#include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
++#include <duckdb/catalog/catalog_entry/schema_catalog_entry.hpp>
++#include <duckdb/main/prepared_statement_data.hpp>
++#include <duckdb/planner/operator/logical_get.hpp>
++#include <duckdb/storage/storage_manager.hpp>
++#include <op/scan/duckdb_native_gpu_ingestible.hpp>
++#include <sirius_context.hpp>
++#include <unistd.h>
++#include <utils/gpu_execution_fixture.hpp>
++#include <utils/planning_file_system.hpp>
++#include <utils/planning_memory_sampler.hpp>
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdlib>
++#include <filesystem>
++#include <iostream>
++#include <string>
++#include <vector>
++
++namespace {
++using clock_type = std::chrono::steady_clock;
++std::string env(std::string const& name, std::string fallback = {})
++{
++  auto const* value = std::getenv(name.c_str());
++  return value ? value : std::move(fallback);
++}
++
++void marker(std::string const& value)
++{
++  auto line = "SCAN_PLANNING_MARK " + value + "\n";
++  (void)::write(STDERR_FILENO, line.data(), line.size());
++}
++
++double percentile(std::vector<double> values, double fraction)
++{
++  std::sort(values.begin(), values.end());
++  auto index = static_cast<std::size_t>(std::ceil(values.size() * fraction));
++  index      = std::clamp<std::size_t>(index, 1, values.size()) - 1;
++  return values[index];
++}
++
++void require_ok(duckdb::unique_ptr<duckdb::QueryResult> const& result, std::string const& label)
++{
++  REQUIRE(result);
++  INFO(label << ": " << (result->HasError() ? result->GetError() : ""));
++  REQUIRE_FALSE(result->HasError());
++}
++
++duckdb::DataTable& table_storage(duckdb::Connection& connection, std::string const& table)
++{
++  auto& context = *connection.context;
++  auto& catalog = duckdb::Catalog::GetCatalog(context, "");
++  duckdb::CatalogTransaction transaction(catalog, context);
++  auto& schema = catalog.GetSchema(transaction, "main");
++  auto entry   = schema.GetEntry(transaction, duckdb::CatalogType::TABLE_ENTRY, table);
++  REQUIRE(entry);
++  return entry->Cast<duckdb::DuckTableEntry>().GetStorage();
++}
++
++std::unique_ptr<sirius::op::scan::duckdb_native_ingestible_table_info> native_info(
++  duckdb::Connection& connection, duckdb::DataTable& storage)
++{
++  using namespace sirius::op::scan;
++  auto info        = std::make_unique<duckdb_native_ingestible_table_info>();
++  info->storage    = &storage;
++  info->context    = connection.context.get();
++  info->db_path    = storage.GetAttached().GetStorageManager().GetDBPath();
++  info->table_name = "scan_bench_native";
++  projected_column column;
++  column.storage_idx = duckdb::StorageIndex(0);
++  info->projected_cols.push_back(column);
++  info->column_ids.push_back(duckdb::ColumnIndex(0));
++  info->names.push_back("i");
++  auto type = sirius::logical_type::make(sirius::type_id::BIGINT);
++  info->projected_types.push_back(type);
++  info->returned_types.push_back(type);
++  info->output_types.push_back(type);
++  return info;
++}
++
++class measurement_runtime_guard {
++ public:
++  measurement_runtime_guard()
++  {
++    auto const* value = std::getenv("SIRIUS_DISABLE");
++    if (value) previous_ = value;
++    unsetenv("SIRIUS_DISABLE");
++  }
++  ~measurement_runtime_guard()
++  {
++    if (previous_) setenv("SIRIUS_DISABLE", previous_->c_str(), 1);
++    else unsetenv("SIRIUS_DISABLE");
++  }
++ private:
++  std::optional<std::string> previous_;
++};
++
++class scan_planning_fixture : private measurement_runtime_guard,
++                              public sirius::test::GpuExecutionFixture {
++ public:
++  scan_planning_fixture()
++    : GpuExecutionFixture(env("SCAN_PLANNING_MODE", "latency") == "io"
++                            ? duckdb::make_uniq<duckdb::VirtualFileSystem>(
++                                duckdb::make_uniq<sirius::test::planning_file_system>())
++                            : nullptr)
++  {
++  }
++};
++
++struct added_inventory_file {
++  std::filesystem::path path;
++  bool created = false;
++  ~added_inventory_file()
++  {
++    if (created) {
++      std::error_code error;
++      std::filesystem::remove(path, error);
++    }
++  }
++  void create(std::string const& source, std::string const& destination)
++  {
++    path = destination;
++    std::filesystem::create_hard_link(source, path);
++    created = true;
++  }
++};
++
++struct measurement_boundaries {
++  sirius::test::planning_memory_sampler* sampler  = nullptr;
++  sirius::test::planning_file_system* file_system = nullptr;
++  bool rebuild_only                               = false;
++  bool started = false, completed = false;
++  sirius::test::memory_result result;
++  sirius::test::planning_io_result io;
++  sirius::measurement::datasource_io_result datasource_io;
++  static void observe(void* payload, sirius::measurement::phase value, bool entering) noexcept
++  {
++    auto& self = *static_cast<measurement_boundaries*>(payload);
++    if (self.rebuild_only && value == sirius::measurement::phase::execute_rebuild) {
++      if (entering) {
++        if (self.sampler) self.sampler->start();
++        if (self.file_system) {
++          self.file_system->start();
++          sirius::measurement::begin_datasource_io();
++        }
++        self.started = true;
++      } else {
++        if (self.file_system) {
++          self.datasource_io = sirius::measurement::end_datasource_io();
++          self.io            = self.file_system->stop();
++        }
++        if (self.sampler) self.result = self.sampler->stop();
++        self.completed = true;
++      }
++    } else if (self.sampler) {
++      self.sampler->record_peak();
++    }
++  }
++};
++}  // namespace
++
++TEST_CASE_METHOD(scan_planning_fixture,
++                 "Scan planning latency and memory usage",
++                 "[.][scan_planning_measurements][isolated_context][gpu_execution]")
++{
++  auto scenario               = env("SCAN_PLANNING_SCENARIO", "small");
++  auto const attempts         = std::max(1, std::stoi(env("SCAN_PLANNING_ATTEMPTS", "25")));
++  auto const trace            = env("SCAN_PLANNING_TRACE") == "1";
++  auto const measurement_mode = env("SCAN_PLANNING_MODE", "latency");
++  auto const operation        = env("SCAN_PLANNING_OPERATION", "fresh");
++  auto const memory           = measurement_mode == "memory";
++  REQUIRE((measurement_mode == "latency" || memory || measurement_mode == "io"));
++  REQUIRE((operation == "fresh" || operation == "rebind" || operation == "rebuild" ||
++           operation == "sharing" || operation == "mismatch" || operation == "exception"));
++#ifndef SIRIUS_ENABLE_PLANNING_MEASUREMENTS
++  FAIL("Configure SIRIUS_ENABLE_PLANNING_MEASUREMENTS=ON for this hidden benchmark");
++#endif
++  std::size_t scan_count = 1;
++  std::string query;
++
++  if (scenario == "small") {
++    auto const requested_scans = std::stoi(env("SCAN_PLANNING_SCANS", "4"));
++    REQUIRE(requested_scans > 0);
++    scan_count = static_cast<std::size_t>(requested_scans);
++    std::vector<std::string> tables;
++    for (std::size_t i = 0; i < scan_count; ++i) {
++      tables.push_back("scan_bench_" + std::to_string(i));
++      require_ok(con->Query("CREATE OR REPLACE TABLE " + tables.back() +
++                            " AS SELECT range AS id FROM range(16)"),
++                 "create small table");
++    }
++    require_ok(con->Query("CHECKPOINT"), "checkpoint small tables");
++    for (auto const& table : tables) {
++      require_ok(con->Query("CALL pin_table(format='duckdb', name='" + table + "', tier='gpu')"),
++                 "pin small table");
++    }
++    query = "SELECT sum(";
++    for (std::size_t i = 0; i < scan_count; ++i) {
++      if (i) query += "+";
++      query += "s" + std::to_string(i) + ".id";
++    }
++    query += ") FROM " + tables[0] + " s0";
++    for (std::size_t i = 1; i < scan_count; ++i) {
++      query += " JOIN " + tables[i] + " s" + std::to_string(i) + " USING(id)";
++    }
++  } else if (scenario == "glob") {
++    auto pattern = env("SCAN_PLANNING_GLOB");
++    REQUIRE_FALSE(pattern.empty());
++    query = "SELECT sum(id) FROM read_parquet('" + pattern + "')";
++  } else if (scenario == "iceberg") {
++    require_ok(con->Query("LOAD iceberg"), "load iceberg");
++    require_ok(con->Query("SET unsafe_enable_version_guessing=true"), "iceberg version guessing");
++    auto path = env("SCAN_PLANNING_ICEBERG");
++    REQUIRE_FALSE(path.empty());
++    query =
++      "SELECT sum(count) FROM iceberg_scan('" + path + "', snapshot_from_id=9400000000000002)";
++  } else if (scenario == "native") {
++    require_ok(con->Query("CREATE OR REPLACE TABLE scan_bench_native AS "
++                          "SELECT range::BIGINT AS i FROM range(300000)"),
++               "create native table");
++    require_ok(con->Query("CHECKPOINT"), "checkpoint native table");
++  } else {
++    FAIL("unknown SCAN_PLANNING_SCENARIO: " << scenario);
++  }
++
++  require_ok(con->Query("SET threads=1"), "keep planning observations on the calling thread");
++  require_ok(con->Query("SET gpu_execution=true"), "enable GPU execution");
++  require_ok(con->Query("SET enable_duckdb_fallback=false"), "disable fallback");
++  require_ok(con->Query("SET sirius_test_inject_pin_registry_change=false"), "clear epoch hook");
++  require_ok(con->Query("SET sirius_test_inject_transparent_gpu_error=''"), "clear error hook");
++  if (scenario == "native") {
++    REQUIRE(measurement_mode == "latency");
++    require_ok(con->Query("BEGIN TRANSACTION READ ONLY"), "begin native measurement snapshot");
++    auto& storage = table_storage(*con, "scan_bench_native");
++    auto context  = con->context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
++    REQUIRE(context);
++    std::vector<double> lock_us;
++    std::vector<double> walk_us;
++    for (int attempt = 0; attempt < attempts; ++attempt) {
++      sirius::measurement::observation observation;
++      {
++        sirius::measurement::observation_scope observing(observation);
++        sirius::op::scan::duckdb_native_gpu_ingestible ingestible(native_info(*con, storage));
++        ingestible.ensure_metadata_prepared();
++      }
++      auto const duration = observation.phases[static_cast<unsigned>(sirius::measurement::phase::native_walk)].nanoseconds / 1000.0;
++      REQUIRE(observation.phases[static_cast<unsigned>(sirius::measurement::phase::native_walk)].calls == 1);
++      lock_us.push_back(0);
++      walk_us.push_back(duration);
++      std::cout << "{\"record\":\"native_preparation\",\"attempt\":" << attempt
++                << ",\"checkpoint_acquire_available\":false,\"native_walk_us\":" << duration << "}\n";
++    }
++    require_ok(con->Query("ROLLBACK"), "end native measurement snapshot");
++    std::cout << "SCAN_PLANNING_NATIVE attempts=" << attempts
++              << " checkpoint_acquire_median_us=" << percentile(lock_us, 0.5)
++              << " checkpoint_acquire_p95_us=" << percentile(lock_us, 0.95)
++              << " walk_median_us=" << percentile(walk_us, 0.5)
++              << " walk_p95_us=" << percentile(walk_us, 0.95) << std::endl;
++    return;
++  }
++
++  sirius::test::planning_file_system* file_system = nullptr;
++  if (measurement_mode == "io") {
++    auto& fs  = *duckdb::DBConfig::GetConfig(*con->context).file_system;
++    auto* vfs = dynamic_cast<duckdb::VirtualFileSystem*>(&fs);
++    REQUIRE(vfs);
++    file_system = dynamic_cast<sirius::test::planning_file_system*>(&vfs->GetDefaultFileSystem());
++    REQUIRE(file_system);
++  }
++  std::unique_ptr<sirius::test::process_allocator_reader> allocator;
++  std::unique_ptr<sirius::test::planning_memory_sampler> sampler;
++  auto const interval_us = std::stoll(env("SCAN_PLANNING_SAMPLE_US", "100"));
++  REQUIRE(interval_us > 0);
++  auto allocator_name = env("SCAN_PLANNING_ALLOCATOR", "glibc");
++  if (memory) {
++    allocator = std::make_unique<sirius::test::process_allocator_reader>(allocator_name);
++    sampler   = std::make_unique<sirius::test::planning_memory_sampler>(
++      *allocator, std::chrono::microseconds(interval_us));
++  }
++  std::vector<double> api_us;
++  api_us.reserve(attempts);
++  for (int attempt = 0; attempt < attempts; ++attempt) {
++    bool const execute = operation == "rebuild" || operation == "exception";
++    bool const rebind  = operation == "rebind";
++    require_ok(con->Query(std::string("SET sirius_test_inject_pin_registry_change=") +
++                          (operation == "rebuild" ? "true" : "false")),
++               "configure rebuild");
++    require_ok(con->Query(std::string("SET sirius_test_inject_transparent_gpu_error='") +
++                          (execute ? "scan planning measurement" : "") + "'"),
++               "configure cleanup");
++
++    added_inventory_file added_file;
++    duckdb::unique_ptr<duckdb::PreparedStatement> prepared;
++    duckdb::shared_ptr<duckdb::PreparedStatementData> old_generation;
++    duckdb::unique_ptr<duckdb::PendingQueryResult> pending;
++    duckdb::unique_ptr<duckdb::QueryResult> result;
++    // Preserve the fresh origin as well as the immediate window baseline: subtracting
++    // the latter during rebind would exclude the already-live old generation.
++    auto const origin = allocator ? allocator->read() : sirius::test::allocator_reading{};
++    if (execute || rebind) {
++      prepared = con->Prepare(query);
++      REQUIRE(prepared);
++      INFO((prepared->HasError() ? prepared->GetError() : ""));
++      REQUIRE_FALSE(prepared->HasError());
++      if (rebind) {
++        if (scenario == "glob") {
++          auto const source      = env("SCAN_PLANNING_SOURCE");
++          auto const destination = env("SCAN_PLANNING_ADD_PATH");
++          REQUIRE_FALSE(source.empty());
++          REQUIRE_FALSE(destination.empty());
++          added_file.create(source, destination);
++        }
++        prepared->data->properties.always_require_rebind = true;
++        old_generation = prepared->data;
++      } else {
++        // DuckDB rebind and executor initialization finish outside the rebuild window.
++        pending = prepared->PendingQuery();
++        REQUIRE(pending);
++        REQUIRE_FALSE(pending->HasError());
++      }
++    }
++    auto const before_stats = sirius::test::get_transparent_execution_stats(*con);
++    sirius::measurement::observation observation;
++    measurement_boundaries boundaries{sampler.get(), file_system, operation == "rebuild"};
++    observation.boundary = (memory || file_system) ? &measurement_boundaries::observe : nullptr;
++    observation.payload  = &boundaries;
++    sirius::test::memory_result memory_result;
++    if (trace) marker("BEGIN " + operation + " " + scenario + " " + std::to_string(attempt));
++    if (sampler && !boundaries.rebuild_only) sampler->start();
++    if (file_system && !boundaries.rebuild_only) {
++      file_system->start();
++      sirius::measurement::begin_datasource_io();
++    }
++    auto begin = clock_type::now();
++    {
++      sirius::measurement::observation_scope observing(observation);
++      if (execute)
++        result = pending->Execute();
++      else if (rebind)
++        pending = prepared->PendingQuery();
++      else if (scenario == "iceberg" && operation != "mismatch")
++        pending = con->PendingQuery(query);
++      else
++        prepared = con->Prepare(query);
++    }
++    auto end           = clock_type::now();
++    auto datasource_io = boundaries.datasource_io;
++    auto io_result     = boundaries.io;
++    if (file_system && !boundaries.rebuild_only) {
++      datasource_io = sirius::measurement::end_datasource_io();
++      io_result     = file_system->stop();
++    }
++    if ((sampler || file_system) && boundaries.rebuild_only) {
++      REQUIRE(boundaries.started);
++      REQUIRE(boundaries.completed);
++    }
++    if (sampler) memory_result = boundaries.rebuild_only ? boundaries.result : sampler->stop();
++    if (trace) marker("END " + operation + " " + scenario + " " + std::to_string(attempt));
++    auto const after_stats = sirius::test::get_transparent_execution_stats(*con);
++    if (execute) {
++      REQUIRE(result);
++      REQUIRE(result->HasError());
++      REQUIRE(
++        result->GetError().find("injected transparent GPU failure: scan planning measurement") !=
++        std::string::npos);
++      REQUIRE(after_stats.successful_rebinds == before_stats.successful_rebinds);
++      REQUIRE(observation.phases[static_cast<unsigned>(sirius::measurement::phase::execute_rebuild)].calls ==
++              (operation == "rebuild" ? 1 : 0));
++    } else if (rebind) {
++      REQUIRE(pending);
++      INFO((pending->HasError() ? pending->GetError() : ""));
++      REQUIRE_FALSE(pending->HasError());
++      REQUIRE(after_stats.successful_rebinds == before_stats.successful_rebinds + 1);
++      REQUIRE(after_stats.executions == before_stats.executions);
++      REQUIRE(old_generation);
++      REQUIRE(old_generation == prepared->data);
++    } else if (scenario == "iceberg" && operation != "mismatch") {
++      REQUIRE(pending);
++      INFO((pending->HasError() ? pending->GetError() : ""));
++      REQUIRE_FALSE(pending->HasError());
++      REQUIRE(after_stats.successful_rebinds == before_stats.successful_rebinds + 1);
++      REQUIRE(observation.phases[static_cast<unsigned>(sirius::measurement::phase::publish)].calls == 1);
++    } else {
++      REQUIRE(prepared);
++      if (operation == "mismatch") {
++        REQUIRE(prepared->HasError());
++        FAIL("identity mismatch is not implemented in the baseline");
++      } else {
++        INFO((prepared->HasError() ? prepared->GetError() : ""));
++        REQUIRE_FALSE(prepared->HasError());
++        REQUIRE(after_stats.successful_rebinds == before_stats.successful_rebinds + 1);
++        REQUIRE(
++          observation.phases[static_cast<unsigned>(sirius::measurement::phase::publish)].calls ==
++          1);
++      }
++    }
++    auto elapsed = std::chrono::duration<double, std::micro>(end - begin).count();
++    api_us.push_back(elapsed);
++    std::cout << "{\"record\":\"planning_attempt\",\"mode\":\"" << measurement_mode
++              << "\",\"operation\":\"" << operation << "\",\"scenario\":\"" << scenario
++              << "\",\"scans\":" << scan_count << ",\"attempt\":" << attempt
++              << ",\"timing_valid\":" << (measurement_mode == "latency" ? "true" : "false")
++              << ",\"api_total_us\":" << elapsed << ",\"phases\":{";
++    for (unsigned i = 0; i < sirius::measurement::phase_count; ++i) {
++      if (i) std::cout << ',';
++      std::cout << '"'
++                << sirius::measurement::phase_name(static_cast<sirius::measurement::phase>(i))
++                << "\":{\"calls\":" << observation.phases[i].calls
++                << ",\"inclusive_us\":" << observation.phases[i].nanoseconds / 1000.0 << '}';
++    }
++    std::cout << "}}\n";
++    if (sampler) {
++      REQUIRE(memory_result.valid);
++      REQUIRE(origin.valid);
++      if (boundaries.rebuild_only) {
++        REQUIRE(boundaries.started);
++        REQUIRE(boundaries.completed);
++      }
++      std::cout << "{\"record\":\"planning_memory\",\"operation\":\"" << operation
++                << "\",\"attempt\":" << attempt << ",\"backend\":\"" << allocator_name
++                << "\",\"duckdb_jemalloc_observed\":"
++                << (allocator->has_duckdb_statistics() ? "true" : "false")
++                << ",\"peak_kind\":\"sampled_allocator_observed\",\"exact_peak_verified\":false"
++                << ",\"live_before_bytes\":" << memory_result.before.total()
++                << ",\"peak_live_bytes\":" << memory_result.peak.total()
++                << ",\"live_after_bytes\":" << memory_result.after.total()
++                << ",\"peak_added_bytes\":" << memory_result.peak_added_bytes()
++                << ",\"retained_delta_bytes\":" << memory_result.retained_delta_bytes()
++                << ",\"fresh_origin_bytes\":" << origin.total()
++                << ",\"peak_from_fresh_origin_bytes\":"
++                << static_cast<int64_t>(memory_result.peak.total()) -
++                     static_cast<int64_t>(origin.total())
++                << ",\"retained_from_fresh_origin_bytes\":"
++                << static_cast<int64_t>(memory_result.after.total()) -
++                     static_cast<int64_t>(origin.total())
++                << ",\"system_at_peak_bytes\":" << memory_result.peak.system_bytes
++                << ",\"duckdb_at_peak_bytes\":" << memory_result.peak.duckdb_bytes
++                << (allocator_name == "glibc" ? ",\"system_heap_at_peak_bytes\":"
++                                              : ",\"system_active_at_peak_bytes\":")
++                << memory_result.peak.system_active_bytes
++                << ",\"duckdb_active_at_peak_bytes\":" << memory_result.peak.duckdb_active_bytes
++                << ",\"sampling_sleep_us\":" << interval_us
++                << ",\"samples\":" << memory_result.samples
++                << ",\"maximum_sample_gap_us\":" << memory_result.maximum_gap_us << "}\n";
++    }
++    if (file_system) {
++      std::cout << "{\"record\":\"planning_io\",\"operation\":\"" << operation
++                << "\",\"attempt\":" << attempt
++                << ",\"coverage\":\"duckdb_local_filesystem_api\",\"opens\":" << io_result.opens
++                << ",\"read_calls\":" << io_result.read_calls
++                << ",\"bytes_read\":" << io_result.bytes_read
++                << ",\"metadata_requests\":" << io_result.metadata_requests
++                << ",\"directory_lists\":" << io_result.directory_lists
++                << ",\"files_enumerated\":" << io_result.files_enumerated
++                << ",\"directory_entries\":" << io_result.directory_entries
++                << ",\"sirius_datasource_opens\":" << datasource_io.opens
++                << ",\"sirius_datasource_read_calls\":" << datasource_io.read_calls
++                << ",\"sirius_datasource_requested_bytes\":" << datasource_io.requested_bytes
++                << ",\"sirius_datasource_metadata_requests\":" << datasource_io.metadata_requests
++                << "}\n";
++    }
++    // Retained memory above is read while PREPARE (and both generations for a
++    // pending rebind) is alive. Close only after taking the endpoint reading.
++    pending.reset();
++    result.reset();
++    prepared.reset();
++    old_generation.reset();
++    if (added_file.created) {
++      REQUIRE(std::filesystem::remove(added_file.path));
++      added_file.created = false;
++    }
++  }
++  require_ok(con->Query("SET sirius_test_inject_pin_registry_change=false"), "clear rebuild");
++  require_ok(con->Query("SET sirius_test_inject_transparent_gpu_error=''"), "clear error");
++  std::cout << "SCAN_PLANNING_RESULT mode=" << measurement_mode << " operation=" << operation
++            << " scenario=" << scenario << " scans=" << scan_count << " attempts=" << attempts
++            << " api_median_us=" << percentile(api_us, 0.5)
++            << " api_p95_us=" << percentile(api_us, 0.95) << std::endl;
++}

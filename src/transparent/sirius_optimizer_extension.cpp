@@ -16,6 +16,7 @@
 
 #include "transparent/sirius_optimizer_extension.hpp"
 
+#include "common/planning_measurement.hpp"
 #include "op/scan/table_scan/bound_read_view.hpp"
 #include "sirius_context.hpp"
 #include "transparent/connection_provenance.hpp"
@@ -261,6 +262,7 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   if (!ctx) { return; }
   auto conn_state = duckdb::get_sirius_connection_state(context);
   if (!conn_state || conn_state->is_internal_query_active()) { return; }
+  sirius::measurement::phase_scope hook_measurement(sirius::measurement::phase::optimizer_hook);
   // Preserve the pre-hook's decline; optimized plans may no longer contain the scans.
   if (should_use_duckdb(context, nullptr, nullptr) != decline_reason::none) { return; }
   if (!gpu_execution_enabled(context) || !ctx->is_initialized()) { return; }
@@ -277,10 +279,13 @@ void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
   // hooks must not throw, so log a readable message and decline the plan.
   try {
     // Capture the optimizer-hook original before Copy() or Sirius lowering can
-    // transform the scans. Commit C consumes these table-indexed views as the
-    // authoritative logical-original side of its equivalence check.
-    conn_state->set_captured_original_views(
-      sirius::op::scan::capture_bound_read_views(*plan, context));
+    // transform the scans. These table-indexed views provide the authoritative
+    // logical-original side of the equivalence check.
+    {
+      sirius::measurement::phase_scope capture(sirius::measurement::phase::capture_logical);
+      conn_state->set_captured_original_views(
+        sirius::op::scan::capture_bound_read_views(*plan, context));
+    }
     conn_state->set_captured_plan(copy_logical_plan(*plan, context));
   } catch (duckdb::NotImplementedException& e) {
     // Plan not serializable — skip GPU. Logged because a silent skip here is

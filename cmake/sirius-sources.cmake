@@ -1,5 +1,6 @@
 # cmake-format: off
 set(EXTENSION_SOURCES
+    src/common/planning_measurement.cpp
     src/transparent/read_view_registry.cpp
     src/transparent/plan_source_policy.cpp
     src/planner/connector_registry.cpp
@@ -282,3 +283,20 @@ set(SIRIUS_SUBSTRAIT_SOURCES
 set_source_files_properties(${SIRIUS_SUBSTRAIT_SOURCES}
                             PROPERTIES COMPILE_OPTIONS "-w")
 list(APPEND EXTENSION_SOURCES ${SIRIUS_SUBSTRAIT_SOURCES})
+
+option(SIRIUS_ENABLE_PLANNING_MEASUREMENTS
+       "Enable benchmark-only planning observations" OFF)
+if(SIRIUS_ENABLE_PLANNING_MEASUREMENTS)
+  set_property(
+    SOURCE src/common/planning_measurement.cpp
+           src/io/io_context.cpp
+           src/io/sirius_datasource.cpp
+           src/sirius_context.cpp
+           src/transparent/sirius_optimizer_extension.cpp
+           src/transparent/physical_sirius_execution.cpp
+           src/op/scan/duckdb_native_gpu_ingestible.cpp
+           test/cpp/scan/test_scan_planning_measurements.cpp
+           test/cpp/scan/test_planning_measurement_observers.cpp
+    APPEND
+    PROPERTY COMPILE_DEFINITIONS SIRIUS_ENABLE_PLANNING_MEASUREMENTS=1)
+endif()

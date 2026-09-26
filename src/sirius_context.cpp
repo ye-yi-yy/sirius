@@ -16,6 +16,7 @@
 
 #include "sirius_context.hpp"
 
+#include "common/planning_measurement.hpp"
 #include "config.hpp"
 #include "cucascade/memory/memory_reservation_manager.hpp"
 #include "data/sirius_converter_registry.hpp"
@@ -1493,6 +1494,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     reject_update_to_pinned_table(*this, context, prepared);
   }
   if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
+  sirius::measurement::phase_scope finalize_measurement(sirius::measurement::phase::finalize);
   auto conn_state = get_sirius_connection_state(context);
 
   // If the optimizer hook captured a plan FOR THIS planning attempt, use it.
@@ -1632,10 +1634,14 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // its nested bind never re-enters the slot, and inside this try so a
     // runtime-unavailable error takes the existing fallback split below.
     SlotGuard plan_window(*this, context);
+    sirius::measurement::phase_scope physical_capture(sirius::measurement::phase::capture_physical);
     auto physical_original_views =
       prepared.physical_plan
         ? sirius::op::scan::capture_bound_read_views(prepared.physical_plan->Root(), context)
         : std::vector<sirius::op::scan::bound_read_view>{};
+    physical_capture.finish();
+    sirius::measurement::phase_scope candidate_measurement(
+      sirius::measurement::phase::candidate_build);
     // Validate that the captured logical plan is GPU-translatable before we
     // install a reusable transparent execution operator for prepared statements.
     //
@@ -1672,6 +1678,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
     }
 
+    candidate_measurement.finish();
     duckdb::Value read_view_injection;
     if (context.TryGetCurrentSetting("sirius_test_inject_read_view_mismatch",
                                      read_view_injection) &&
@@ -1682,6 +1689,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       }
     }
 
+    sirius::measurement::phase_scope comparison_measurement(sirius::measurement::phase::comparison);
     auto comparison = sirius::transparent::compare_read_views(
       candidate_source,
       logical_original_views ? &*logical_original_views : nullptr,
@@ -1696,6 +1704,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
         message);
       throw NotImplementedException(message);
     }
+    comparison_measurement.finish();
+    sirius::measurement::phase_scope publish_measurement(sirius::measurement::phase::publish);
     sirius::transparent::share_equal_read_view_identities(
       logical_original_views ? &*logical_original_views : nullptr,
       physical_original_views,
@@ -1827,7 +1837,10 @@ void SiriusContext::acquire_query_lifecycle_slot(ClientContext* context)
   if (runtime_unavailable_.load(std::memory_order_acquire)) { throw_runtime_unavailable(); }
   if (context && context->IsInterrupted()) { throw InterruptException(); }
 
-  query_lifecycle_mutex_.lock();
+  {
+    sirius::measurement::phase_scope wait(sirius::measurement::phase::lifecycle_lock_wait);
+    query_lifecycle_mutex_.lock();
+  }
   holder_thread_hash_.store(my_hash, std::memory_order_relaxed);
   query_lifecycle_held_.store(true, std::memory_order_release);
 

@@ -16,6 +16,7 @@
 
 #include "io/sirius_datasource.hpp"
 
+#include "common/planning_measurement.hpp"
 #include "exec/semi_future.hpp"
 #include "exec/try.hpp"
 #include "io/cache/prefetching_cache.hpp"
@@ -83,7 +84,11 @@ std::shared_ptr<io_object_metadata> sirius_datasource::metadata() const
   return true;
 }
 
-size_t sirius_datasource::size() const { return _io_object->size(); }
+size_t sirius_datasource::size() const
+{
+  sirius::measurement::record_datasource_io(sirius::measurement::io_request::metadata);
+  return _io_object->size();
+}
 
 bool sirius_datasource::supports_device_read() const { return _io_ctx->supports_device_read(); }
 
@@ -99,6 +104,7 @@ bool sirius_datasource::is_device_read_preferred(size_t) const
 
 size_t sirius_datasource::host_read(size_t offset, size_t size, uint8_t* dst)
 {
+  sirius::measurement::record_datasource_io(sirius::measurement::io_request::read, size);
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
     return cache->host_read(*_io_object, offset, size, dst, &_cache_handle);
@@ -117,6 +123,7 @@ std::unique_ptr<cudf::io::datasource::buffer> sirius_datasource::host_read(size_
 
 std::future<size_t> sirius_datasource::host_read_async(size_t offset, size_t size, uint8_t* dst)
 {
+  sirius::measurement::record_datasource_io(sirius::measurement::io_request::read, size);
   exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
     auto* cache = _io_ctx->cache();
@@ -169,6 +176,7 @@ std::future<size_t> sirius_datasource::device_read_async(size_t offset,
                                                          uint8_t* dst,
                                                          cudf_datasource_stream_t stream_arg)
 {
+  sirius::measurement::record_datasource_io(sirius::measurement::io_request::read, size);
   ::cuda::stream_ref stream{stream_arg};
   exec::semi_future<size_t> semi;
   if (uses_prefetching_cache()) {
