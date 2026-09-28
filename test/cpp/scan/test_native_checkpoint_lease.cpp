@@ -677,8 +677,8 @@ TEST_CASE("native-first planning cannot deadlock a cold Iceberg metadata connect
     return scalar_or_error(std::move(result));
   });
 
-  // lower_native_scan has reached the c7 pause. Planning owns no key, so FORCE CHECKPOINT must
-  // finish before A continues into Iceberg's cold internal metadata query.
+  // Native lowering is paused before the metadata walk. Planning holds no checkpoint key, so
+  // FORCE CHECKPOINT can finish before the query enters Iceberg's cold metadata lookup.
   REQUIRE(native_leaf.wait());
   CHECK_FALSE(context->get_scan_manager().holds_any_checkpoint_key());
   auto checkpoint = std::async(std::launch::async, [&] {
