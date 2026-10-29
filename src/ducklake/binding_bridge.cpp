@@ -455,11 +455,20 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   scan_manager::charging_allocator& allocator,
   scan_manager::preparation_stop_token stop)
 {
+  return read_parquet_deletes(index, allocator, stop, dv_snapshot_policy::snapshot_free);
+}
+std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
+  uint64_t index,
+  scan_manager::charging_allocator& allocator,
+  scan_manager::preparation_stop_token stop,
+  dv_snapshot_policy snapshots)
+{
   validate_statement();
 #ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   auto unit = unit_at(index);
   if (!unit || unit->deletes != delete_format::parquet)
     throw std::invalid_argument("DuckLake ordinary delete reader requires a local original unit");
+  unit->snapshot_visibility_probe = snapshots == dv_snapshot_policy::bound_table_scan_probe;
   (void)parquet_unit_envelope(*unit);
   auto context    = impl_->context.lock();
   auto check_stop = [&] {
@@ -509,7 +518,10 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
       columns[1].type != duckdb::LogicalType::BIGINT)
     throw std::runtime_error(
       "DuckLake Parquet delete schema requires file name and BIGINT position");
-  if (columns.size() == 3 && columns[2].name == "_ducklake_internal_snapshot_id")
+  bool embedded = columns.size() == 3 && columns[2].name == "_ducklake_internal_snapshot_id";
+  if (embedded && columns[2].type != duckdb::LogicalType::BIGINT)
+    throw std::runtime_error("DuckLake Parquet delete snapshot requires BIGINT");
+  if (embedded && snapshots != dv_snapshot_policy::bound_table_scan_probe)
     throw std::runtime_error(
       "DuckLake snapshot-bearing Parquet deletes are outside the local scan profile");
   if (reader.NumRows() > dv_max_positions)
@@ -520,12 +532,20 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   auto* positions = reinterpret_cast<int64_t*>(result->merged.data());
   reader.column_indexes.emplace_back(1);
   reader.column_ids.emplace_back(1);
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::BIGINT};
+  if (embedded) {
+    reader.column_indexes.emplace_back(2);
+    reader.column_ids.emplace_back(2);
+    types.push_back(duckdb::LogicalType::BIGINT);
+  }
   ParquetReadGlobalState global(nullptr);
   ParquetReadLocalState local;
   DataChunk chunk;
-  chunk.Initialize(*context, {duckdb::LogicalType::BIGINT});
-  size_t count     = 0;
-  int64_t previous = -1;
+  chunk.Initialize(*context, types);
+  parquet_delete_accumulator accumulator({positions, static_cast<size_t>(reader.NumRows())},
+                                         embedded,
+                                         unit->bound_snapshot,
+                                         unit->transaction_local_delete);
   while (reader.TryInitializeScan(*context, global, local)) {
     check_stop();
     reader.PrepareScan(*context, global, local);
@@ -549,27 +569,28 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
         throw std::runtime_error("DuckLake Parquet deletes require synchronous native decoding");
       for (idx_t row = 0; row < chunk.size(); ++row) {
         auto value = chunk.GetValue(0, row);
-        if (value.IsNull())
-          throw std::runtime_error("DuckLake Parquet delete position cannot be NULL");
-        auto position = value.GetValue<int64_t>();
-        validate_delete_position(position, previous);
-        if (count >= reader.NumRows())
-          throw std::runtime_error("DuckLake Parquet deletes exceed footer coverage");
-        positions[count++] = position;
+        std::optional<int64_t> position, snapshot;
+        if (!value.IsNull()) position = value.GetValue<int64_t>();
+        if (embedded) {
+          auto value = chunk.GetValue(1, row);
+          if (!value.IsNull()) snapshot = value.GetValue<int64_t>();
+        }
+        accumulator.append(position, snapshot);
       }
       if (status == AsyncResultType::FINISHED) break;
     }
   }
   verify(opened);
   check_stop();
-  if (count != reader.NumRows())
+  if (accumulator.validated_count() != reader.NumRows())
     throw std::runtime_error("DuckLake Parquet deletes have incomplete footer coverage");
   result->delete_identity =
     "duckdb.local.parquet:" + std::to_string(identity.device_id.GetIndex()) + ":" +
     std::to_string(identity.file_id.GetIndex()) + ":" + std::to_string(identity.file_size) + ":" +
     std::to_string(identity.last_modification_time.value) + ":" + identity.version_tag;
-  result->positions         = {positions, count};
-  result->parquet_validated = true;
+  result->positions               = accumulator.positions();
+  result->last_validated_position = accumulator.last_position();
+  result->parquet_validated       = true;
   return result;
 #else
   throw std::runtime_error("DuckLake private binding bridge is not built");
@@ -589,6 +610,7 @@ std::shared_ptr<parquet_unit_ingestible> binding_handle::make_parquet_unit(
       "DuckLake count-only cannot request user columns or a filter projection");
   auto unit = unit_at(index);
   if (!unit) throw std::out_of_range("DuckLake original file index");
+  unit->snapshot_visibility_probe = options.snapshot_visibility_probe;
 #ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   auto const& info = dynamic_cast<DuckLakeFunctionInfo const&>(*impl_->function_info);
   std::vector<op::scan::field_requirement> fields;

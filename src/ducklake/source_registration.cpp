@@ -21,6 +21,7 @@
 #include "ducklake/inline_batch_producer.hpp"
 #include "ducklake/inline_varchar.hpp"
 #include "ducklake/scan_ingestible.hpp"
+#include "ducklake/snapshot_visibility_test_scope.hpp"
 #include "op/scan/dynamic_filter_merge.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_table_scan.hpp"
@@ -28,6 +29,7 @@
 
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/multi_file/multi_file_states.hpp>
+#include <duckdb/main/database.hpp>
 
 #include <algorithm>
 #include <numeric>
@@ -91,6 +93,8 @@ std::optional<scan_manager::preparation_request> prepare_scan(op::sirius_physica
     std::count_if(selected->selected.begin(), selected->selected.end(), [&](auto index) {
       return types[index] == duckdb::LogicalType::VARCHAR;
     });
+  selected->options.snapshot_visibility_probe =
+    testing::snapshot_visibility_probe_enabled(duckdb::DatabaseInstance::GetDatabase(context));
   return scan_manager::preparation_request{
     {{scan_ingestible::envelope(selected->selected.size(), strings)}, {}, true, 1},
     [](scan_manager::preparation_ledger&) {},
