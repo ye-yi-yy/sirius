@@ -455,20 +455,11 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   scan_manager::charging_allocator& allocator,
   scan_manager::preparation_stop_token stop)
 {
-  return read_parquet_deletes(index, allocator, stop, dv_snapshot_policy::snapshot_free);
-}
-std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
-  uint64_t index,
-  scan_manager::charging_allocator& allocator,
-  scan_manager::preparation_stop_token stop,
-  dv_snapshot_policy snapshots)
-{
   validate_statement();
 #ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   auto unit = unit_at(index);
   if (!unit || unit->deletes != delete_format::parquet)
     throw std::invalid_argument("DuckLake ordinary delete reader requires a local original unit");
-  unit->snapshot_visibility_probe = snapshots == dv_snapshot_policy::bound_table_scan_probe;
   (void)parquet_unit_envelope(*unit);
   auto context    = impl_->context.lock();
   auto check_stop = [&] {
@@ -521,9 +512,6 @@ std::shared_ptr<dv_visibility const> binding_handle::read_parquet_deletes(
   bool embedded = columns.size() == 3 && columns[2].name == "_ducklake_internal_snapshot_id";
   if (embedded && columns[2].type != duckdb::LogicalType::BIGINT)
     throw std::runtime_error("DuckLake Parquet delete snapshot requires BIGINT");
-  if (embedded && snapshots != dv_snapshot_policy::bound_table_scan_probe)
-    throw std::runtime_error(
-      "DuckLake snapshot-bearing Parquet deletes are outside the local scan profile");
   if (reader.NumRows() > dv_max_positions)
     throw scan_manager::preparation_resource_error("DuckLake Parquet delete positions exceed limit",
                                                    true);
@@ -610,7 +598,6 @@ std::shared_ptr<parquet_unit_ingestible> binding_handle::make_parquet_unit(
       "DuckLake count-only cannot request user columns or a filter projection");
   auto unit = unit_at(index);
   if (!unit) throw std::out_of_range("DuckLake original file index");
-  unit->snapshot_visibility_probe = options.snapshot_visibility_probe;
 #ifdef SIRIUS_DUCKLAKE_PRIVATE_BRIDGE
   auto const& info = dynamic_cast<DuckLakeFunctionInfo const&>(*impl_->function_info);
   std::vector<op::scan::field_requirement> fields;

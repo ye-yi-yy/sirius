@@ -452,12 +452,8 @@ parquet_unit_ingestible::make_preparation_sources(io::ioctx_resolver resolve)
         }
         if (unit_.deletes == delete_format::parquet) {
           try {
-            result->ordinary = binding_->read_parquet_deletes(
-              unit_.original_file_index,
-              allocator,
-              stop,
-              unit_.snapshot_visibility_probe ? dv_snapshot_policy::bound_table_scan_probe
-                                              : dv_snapshot_policy::snapshot_free);
+            result->ordinary =
+              binding_->read_parquet_deletes(unit_.original_file_index, allocator, stop);
           } catch (transparent::classified_execution_error const&) {
             throw;
           } catch (io::object_changed_error const& e) {
